@@ -78,7 +78,18 @@ jobs:
         # excluded here and run in their own step so a render failure
         # produces a downloadable PNG artefact.
         shell: pwsh
-        run: ctest --test-dir build/win-debug --output-on-failure -LE golden
+        run: ctest --test-dir build/win-debug --output-on-failure -LE "golden|nightly"
+
+      # Exhaustive planetary sweep -- the pt_planet_terrain_exhaustive
+      # registration (see tests/CMakeLists.txt + the pt_planet_terrain_test.cpp
+      # header). Split out of pt_planet_terrain to keep the per-PR gate fast;
+      # runs here on the scheduled / manually-dispatched nightly against the
+      # Debug tree built above, so the exhaustive half still runs in CI on the
+      # Windows lane (where the 600 s timeout was tripping) too.
+      - name: Exhaustive planetary sweep (ctest, nightly only)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: ctest --test-dir build/win-debug --output-on-failure -L nightly
 
       # Golden-image regression matrix (#45) -- software backend
       # only. The Windows runner has no usable Vulkan ICD beyond
