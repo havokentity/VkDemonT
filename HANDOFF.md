@@ -79,6 +79,44 @@ Vulkan build; each wants a compile/behaviour check as it lands):
   Frame); when the Metal shader blocks go, that expectation drops to `1`.
 - Assorted MoltenVK/Metal *comment* references in kept Vulkan/shader files.
 
+### Native-Vulkan bringup status (branch `fix/vulkan-native-bringup`, commit `5687583`, WIP — does NOT render yet)
+
+Step 2 above (native-Vulkan pixel correctness) was started on a real RTX
+5090. The backend had **never actually worked on native Vulkan** — it was
+only exercised through MoltenVK, which hid several bugs. Symptom: black
+screen for minutes, then a hang. Findings so far:
+
+- **Cold shader compile ~206 s.** The `PathTrace` megakernel is so large the
+  NVIDIA driver takes ~206 s to compile it on a cold pipeline cache
+  (`%LOCALAPPDATA%/demont/pipeline.cache`); warm it's ~2 s. A run killed
+  mid-compile never saves the cache, so it stays cold. This is the "black
+  screen for minutes" (a near-black loading frame the whole time).
+- **FIXED (committed, validated): descriptor binding-2 type collision.** One
+  shared `VkDescriptorSetLayout` served every kernel with per-kernel binding
+  *numbers* that mean different resource TYPES (binding 2 = scene TLAS for
+  PathTrace, storage image for the cloud kernels). Native Vulkan faulted;
+  fix = declare binding 2 `MUTABLE_EXT` + enable `VK_EXT_mutable_descriptor_type`.
+  `VUID-07990` 2→0.
+- **FIXED (committed): swapchain storage-image format mismatch.** Swapchain
+  outputs declared `rgba8` vs the BGRA8 view → switched to `Unknown` format
+  (relies on `shaderStorageImageWriteWithoutFormat`). Watch for the old
+  596.x silent-no-op-store regression.
+- **OPEN — the current blocker: a TDR / GPU hang in the PathTrace megakernel.**
+  Confirmed via Windows event **153 (nvlddmkm "GPU hung and reset")**. It is
+  workload-independent — a 160×120 gradient-sky frame with no planet/terrain/
+  CSG, bloom/clouds off, 1 bounce, 1 spp still hangs. GPU-AV reports no OOB;
+  standard validation is clean. So the megakernel hangs on something it runs
+  **unconditionally** (an always-compiled loop whose termination differs on
+  native Vulkan). **Next: an NVIDIA Nsight Aftermath GPU crash dump** (run
+  demont under Nsight Graphics, or integrate the Aftermath SDK into
+  `VulkanDevice` to dump on `DEVICE_LOST`) to name the hung shader/loop.
+  Slow fallback: compile-time bisect (`-DPT_WATER_ENABLED=OFF`,
+  `-DPT_LIGHT_TREE=OFF` compile; `PT_PLANET_ENABLED=OFF` does NOT until the
+  `atmo_ms_lut` gating bug — see below — is fixed).
+- **Latent bug found in passing:** `-DPT_PLANET_ENABLED=OFF` fails to compile
+  — `PathTrace.slang` ~line 6303 uses `ptMsLutReady`/`atmo_ms_lut` outside
+  the planet `#if` gate.
+
 ## Conventions (carried from the parent)
 
 - Real physics, metric units, real *cited* constants. No magic epsilons — derive every tolerance. No heuristic shortcuts dressed as physics.
