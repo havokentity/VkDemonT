@@ -692,9 +692,12 @@ TerrainVert loadTerrainVert(uint vertex_index) {
 // than free, and set 0 is one number space shared by buffers and images --
 // which is the same trap that put terrain_indices at 38 rather than 37
 // (GodRays' mask texture). #280 starts after them.
-[[vk::binding(46, 0)]] StructuredBuffer<float4> atmo_ms_lut;
-
-bool ptMsLutReady() { return atmo_ms_lut[0].w > 0.5; }
+//
+// NOTE: atmo_ms_lut (binding 46) + ptMsLutReady() are declared UNGATED just
+// after this block's #endif -- the atmosphere sky path (ptAtmoMultiScatter,
+// far below) reads them and is NOT PT_PLANET-gated, and the shared
+// descriptor layout binds slot 46 unconditionally. Declaring them inside
+// PT_PLANET_ENABLED broke -DPT_PLANET_ENABLED=OFF (undefined identifier).
 // The bilinear fetch itself is `ptAtmoMultiScatter`, next to
 // atmosphereBody() further down -- it needs PtAtmoBody, which arrives with
 // the PathTraceMath import below this declaration block.
@@ -1075,6 +1078,13 @@ float3 terrainSurfaceAlbedo(float height_m, float rock01, float3 p_world,
 }
 #endif  // PT_PLANET_ENABLED
 // --- end Planetary P4 -----------------------------------------------------
+
+// Atmosphere multiple-scattering LUT (#280). Declared UNGATED (hoisted out of
+// the PT_PLANET_ENABLED block above): the atmosphere sky path reads it and is
+// not planet-gated, and the engine's shared descriptor layout binds slot 46
+// unconditionally -- so -DPT_PLANET_ENABLED=OFF must still see it.
+[[vk::binding(46, 0)]] StructuredBuffer<float4> atmo_ms_lut;
+bool ptMsLutReady() { return atmo_ms_lut[0].w > 0.5; }
 
 struct BvhNode {
     float3 aabb_min;
