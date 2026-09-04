@@ -18,8 +18,8 @@
 // Linux note: code path is structured but untested as of v0.3.1 -- the
 // project is targeted at Windows + NVIDIA RTX today, with a Linux
 // validation pass planned once a Linux box is available. See
-// docs/LINUX_OPTIX.md when it lands. macOS has no NVIDIA driver path
-// and uses MetalFX instead, so this header is meaningfully Win+Linux only.
+// docs/LINUX_OPTIX.md when it lands. This header is Windows + Linux only
+// (OptiX is CUDA/NVIDIA, imported into Vulkan via external memory).
 
 #pragma once
 
@@ -73,7 +73,7 @@ struct HandleTypes {
     static constexpr cudaExternalSemaphoreHandleType        cuda_semaphore =
         cudaExternalSemaphoreHandleTypeTimelineSemaphoreFd;
 #else
-    #error "VulkanOptixDenoiser: only Windows and Linux are supported (macOS uses MetalFX)."
+    #error "VulkanOptixDenoiser: only Windows and Linux are supported."
 #endif
 };
 

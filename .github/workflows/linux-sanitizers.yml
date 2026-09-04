@@ -6,10 +6,8 @@
 # instrumentation.  Catches: heap OOB, use-after-free, double-free,
 # signed-integer overflow, alignment violations, unreachable-code UB,
 # null-pointer deref through misaligned cast.  Linux runner because
-# clang's ASan is more reliable on Linux than on macOS-arm64 (where
-# Apple's clang ships a slightly older ASan runtime + the Apple
-# Silicon shadow-memory layout occasionally produces false-positive
-# stack-overflow reports).
+# clang's ASan is well-supported there and the hosted x86_64 image is
+# the cheapest place to run a CPU-only sanitizer pass.
 #
 # Scope intentionally narrower than build.yml's main matrix:
 #   - No Vulkan backend (PT_ENABLE_VULKAN_BACKEND=OFF in the preset):
@@ -22,7 +20,7 @@
 #     with a real GPU shows up (or GitHub opens the Tesla-T4 tier to
 #     OSS), wire it back in here under the sanitizer env.
 #   - Linux software backend doesn't exist yet either (src/CMakeLists.txt
-#     gates rhi_software to APPLE OR WIN32; Linux has no SetDIBitsToDevice
+#     gates rhi_software to WIN32; Linux has no SetDIBitsToDevice
 #     analog implemented).  Adding one is a separate work item.
 #
 # What WE do run:

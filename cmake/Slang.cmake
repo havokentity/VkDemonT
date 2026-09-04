@@ -13,8 +13,8 @@
 # Builds that need procedural SDFs flip PT_SDF_PROCEDURAL_OPS to ON; if
 # they also want the cheaper forward-AD normal path, flip
 # PT_SDF_AUTODIFF on top of that. Flags are CACHE variables so they
-# show up in cmake-gui / ccmake and survive across configures. Both
-# rhi_metal and rhi_vulkan pick them up by way of pt_compile_slang
+# show up in cmake-gui / ccmake and survive across configures.
+# rhi_vulkan picks them up by way of pt_compile_slang
 # auto-appending them to every Slang invocation -- the module compile
 # and the entry-point compile share the same preprocessor state, which
 # Slang's IR linker depends on.
@@ -56,15 +56,15 @@ endfunction()
 #   compiles, so the helpers no longer get re-parsed every time the
 #   entry-point shader rebuilds.
 #
-#   Idempotent: safe to call from multiple shader trees (vulkan +
-#   metal). The custom-command output is keyed on the module path so
-#   ninja deduplicates.
+#   Idempotent: safe to call from multiple shader trees. The
+#   custom-command output is keyed on the module path so ninja
+#   deduplicates.
 #
 # pt_compile_slang(TARGET <tgt>
 #                  SOURCE <file.slang>
 #                  STAGE  <compute|vertex|fragment>   default: compute
 #                  ENTRY  <entry_point>               default: main
-#                  TARGETS metal [spirv ...]
+#                  TARGETS spirv [cpp ...]
 #                  MODULE_DEPS <name1> [<name2> ...]
 #                  EXTRA_DEFINES <-DFOO> [-DBAR ...]
 #                  VARIANT  <suffix>)
@@ -73,21 +73,17 @@ endfunction()
 # slangc and embeds the result as a binary blob into <tgt>. Symbol names
 # follow the pattern shader_<name>_<format>{_data,_size}, OR --
 # when VARIANT is supplied -- shader_<name>_<variant>_<format>{_data,_size},
-# letting one .slang file produce multiple SPIR-V/MSL outputs with
+# letting one .slang file produce multiple SPIR-V outputs with
 # different preprocessor states (e.g. RT-on vs RT-off PathTrace builds
 # for backends that lack VK_KHR_ray_query).
 #
 # EXTRA_DEFINES lets the caller append -D flags on top of the
-# target-specific defaults (-DPT_TARGET_METAL / -DPT_TARGET_SPIRV).
+# target-specific defaults (-DPT_TARGET_SPIRV).
 #
 # MODULE_DEPS lists Slang modules (without extension) that the entry
 # point imports. Each `<name>` resolves to `<binary>/shaders/<name>.slang-module`
 # and gets added to the slangc invocation's DEPENDS so ninja waits
 # for the module compile before building the entry-point shader.
-#
-# We deliberately compile Slang -> MSL *source* (not .metallib) on macOS,
-# so we don't need Apple's separate Metal Toolchain installed; Metal does
-# the source -> library compile at runtime via newLibrary().
 
 # MODULE_DEPS (planetary P3, #257): a module may now import another
 # module -- PathTraceCloud imports PathTraceMath for the cancellation-free
@@ -170,11 +166,7 @@ function(pt_compile_slang)
 
     foreach(t ${SLG_TARGETS})
         set(slang_defs "")
-        if(t STREQUAL "metal")
-            set(ext "metal")
-            set(slang_target "metal")
-            list(APPEND slang_defs "-DPT_TARGET_METAL")
-        elseif(t STREQUAL "spirv")
+        if(t STREQUAL "spirv")
             set(ext "spv")
             set(slang_target "spirv")
             # Path tracer's push-constant block is too large for native
@@ -190,7 +182,7 @@ function(pt_compile_slang)
 
         # When VARIANT is supplied the output filename and embedded
         # symbol both gain the suffix so a single .slang source can
-        # produce multiple SPIR-V/MSL blobs that coexist in the same
+        # produce multiple SPIR-V blobs that coexist in the same
         # binary (see PathTrace's rq / norq pair).
         if(SLG_VARIANT)
             set(out "${out_dir}/${slg_name}_${SLG_VARIANT}.${ext}")

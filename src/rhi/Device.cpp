@@ -10,9 +10,6 @@ namespace pt::rhi {
 #if defined(PT_HAS_SOFTWARE_BACKEND)
 extern std::unique_ptr<Device> CreateSoftwareDevice(const NativeWindowHandle&);
 #endif
-#if defined(PT_HAS_METAL_BACKEND)
-extern std::unique_ptr<Device> CreateMetalDevice(const NativeWindowHandle&);
-#endif
 #if defined(PT_HAS_VULKAN_BACKEND)
 extern std::unique_ptr<Device> CreateVulkanDevice(const NativeWindowHandle&);
 #endif
@@ -27,13 +24,6 @@ std::unique_ptr<Device> Device::Create(BackendType type,
             return CreateSoftwareDevice(w);
 #else
             LOG_ERROR("Software backend not built into this binary");
-            return nullptr;
-#endif
-        case BackendType::Metal:
-#if defined(PT_HAS_METAL_BACKEND)
-            return CreateMetalDevice(w);
-#else
-            LOG_ERROR("Metal backend not built into this binary");
             return nullptr;
 #endif
         case BackendType::Vulkan:

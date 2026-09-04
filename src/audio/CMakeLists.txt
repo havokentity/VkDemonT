@@ -19,20 +19,11 @@ target_link_libraries(pt_audio
 )
 
 # Platform audio backends:
-#   - macOS:  -framework CoreAudio / AudioToolbox / AudioUnit / CoreFoundation
-#             (miniaudio picks CoreAudio at runtime via MA_BACKEND_COREAUDIO).
 #   - Linux:  libdl (miniaudio loads ALSA / PulseAudio symbols dynamically).
 #   - Win32:  WASAPI is header-only via <mmdeviceapi.h>; no extra libs needed.
 #             (`ole32` is already linked by other engine TUs via Win32 default;
 #             explicit add here keeps this CMakeLists self-contained.)
-if(APPLE)
-    target_link_libraries(pt_audio
-        PUBLIC  "-framework CoreFoundation"
-        PUBLIC  "-framework CoreAudio"
-        PUBLIC  "-framework AudioToolbox"
-        PUBLIC  "-framework AudioUnit"
-    )
-elseif(UNIX)
+if(UNIX)
     # Threads::Threads is the idiomatic CMake imported target for
     # pthread (works across GCC/Clang/Intel and avoids hard-coding
     # `-lpthread`). libm is implicitly satisfied by the C++ stdlib on

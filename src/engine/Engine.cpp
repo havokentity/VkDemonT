@@ -183,17 +183,16 @@ namespace cvar {
             "exit cleanly (exit code 0). 0 = run normally until the user "
             "quits. Typically set via the --smoke-frames=N CLI override "
             "so a developer can run "
-            "`demont --smoke-frames=8 --r-backend=metal` on real "
+            "`demont --smoke-frames=8 --r-backend=vulkan` on real "
             "hardware to validate that a backend boots + renders + "
             "tears down without crashing -- the exit code (0 success, "
             "2 = backend init failed) plus the log output give a "
             "useful smoke signal without needing a full screenshot "
             "regression matrix. NOT wired into GitHub Actions CI "
-            "because the public-tier runners have no GPU (Mac has "
-            "only a paravirtualized GPU; Windows-latest has no GPU "
-            "at all; the paid `gpu-t4-4-core` is Team/Enterprise-only "
-            "and not available to open-source repos). When/if "
-            "self-hosted runners on real M-series / RTX hardware "
+            "because the public-tier runners have no GPU (Windows-latest "
+            "has no GPU at all; the paid `gpu-t4-4-core` is "
+            "Team/Enterprise-only and not available to open-source "
+            "repos). When/if self-hosted runners on real RTX hardware "
             "appear, wire this back into build.yml -- the engine side "
             "is ready. NOT CVAR_ARCHIVE -- per-invocation knob, never "
             "persisted to demont.cfg.",
@@ -299,34 +298,32 @@ namespace cvar {
     // --- end SDF Phase 1 -------------------------------------------------------
     PT_CVAR(con_font_scale, "1.0",
             "Console overlay font scale. 1.0 = baseline (14 logical-unit "
-            "CreateFontW height on Win32; 13/12/9 pt input/output/status "
-            "NSFont on Mac). Effective range 0.5..3.0; values outside "
-            "are clamped at render time. Honored by both the Win32 and "
-            "Cocoa overlays.",
+            "CreateFontW height on Win32). Effective range 0.5..3.0; "
+            "values outside are clamped at render time. Honored by the "
+            "Win32 overlay.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay,    "0",
             "Tiered in-game performance overlay. 0 = off, 1 = fps + frame_ms, "
             "2 = + backend / resolution / GPU memory / spp / bounces / primitives, "
             "3 = + frame-time sparkline, 4 = + per-pass GPU timing (#320). Tier 4 "
-            "turns on GPU timestamp queries (MTLCounterSampleBuffer on Metal, "
-            "VK_QUERY_TYPE_TIMESTAMP on Vulkan) and lists the real GPU time of "
+            "turns on GPU timestamp queries (VK_QUERY_TYPE_TIMESTAMP on Vulkan) "
+            "and lists the real GPU time of "
             "each render pass -- PathTrace, the sky/cloud march, the composites, "
-            "tonemap. The queries have a real cost (each timed pass is its own "
-            "encoder on Metal), so it is off by default and zero-overhead below "
+            "tonemap. The queries have a real cost, so it is off by default and "
+            "zero-overhead below "
             "tier 4. Degrades to '(gpu timing unavailable)' on a backend/queue "
             "that cannot timestamp rather than printing a wrong number.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_scale, "1.0",
             "Perf overlay scale. 1.0 = baseline (13 logical-unit "
-            "CreateFontW height on Win32; 11 pt monospaced NSFont on Mac). "
-            "Both backends scale the 296px panel width, 44px sparkline "
-            "height, line height and paddings by the same factor. "
-            "Effective range 0.5..3.0; values outside are clamped at "
-            "render time. Honored by both the Win32 and Cocoa overlays.",
+            "CreateFontW height on Win32). Scales the 296px panel width, "
+            "44px sparkline height, line height and paddings by the same "
+            "factor. Effective range 0.5..3.0; values outside are clamped "
+            "at render time. Honored by the Win32 overlay.",
             CVAR_ARCHIVE);
     PT_CVAR(r_perf_overlay_mode, "native",
             "Backend for the perf overlay. 'native' = OS-native child window "
-            "(GDI on Win, NSPanel on Mac) -- has full text readout but can "
+            "(GDI on Win) -- has full text readout but can "
             "leave compositing artifacts over Vulkan swapchains. 'rhi' = final "
             "compute pass on the swapchain -- artifact-free, captured in "
             "screenshots, currently visual-only (panel + sparkline, no text).",
@@ -342,19 +339,13 @@ namespace cvar {
     // (legacy behaviour).
     PT_CVAR(r_console_smart_resolve, "1",
             "Console UX: 1 (default) = auto-resolve a typed prefix to "
-            "the unique canonical command/cvar name (e.g. `deno metalfx` "
-            "-> `r_denoiser metalfx`) when there's exactly one prefix "
+            "the unique canonical command/cvar name (e.g. `deno svgf_atrous` "
+            "-> `r_denoiser svgf_atrous`) when there's exactly one prefix "
             "match. Ambiguous prefixes still error with the candidate "
             "list. 0 = strict exact-match like before.",
             CVAR_ARCHIVE);
-    // Default backend: Metal on Apple Silicon, Vulkan everywhere else
-    // (Windows + Linux use native Vulkan + RT extensions; the Metal
-    // backend doesn't compile off Apple).
-#if defined(__APPLE__)
-    PT_CVAR(r_backend,         "metal",    "One of none|software|metal (vulkan is Windows/Linux only)",CVAR_ARCHIVE);
-#else
+    // Default backend: native Vulkan + RT extensions on Windows/Linux.
     PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
-#endif
     // Software backend's present path on Windows. Default 'vulkan' uses
     // a minimal VkInstance/VkSurface/VkSwapchain owned by SoftwareDevice
     // so the window stays in DXGI flip-model presentation throughout
@@ -717,19 +708,15 @@ namespace cvar {
     // --- end Planetary P5 ----------------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
-            "metalfx = Mac MetalFX TemporalDenoisedScaler (Apple Silicon "
-            "only). svgf_basic = in-house temporal accumulation only "
+            "svgf_basic = in-house temporal accumulation only "
             "(no spatial filter, ~1.5 ms at 1080p; cleaner under fast "
-            "motion, slightly noisier on disocclusions). Supported on "
-            "Vulkan and Metal -- same Slang sources cross-compiled to "
-            "each target. svgf_atrous = svgf_basic + 3-pass a-trous "
-            "edge-aware spatial filter (~5 ms; cleaner on disocclusions, "
-            "mild softening of micro detail). Supported on Vulkan and "
-            "Metal. nrd = same dispatch chain as svgf_atrous today on "
-            "both backends; reserved for the proper NVIDIA "
-            "RayTracingDenoiser library integration once that's wired "
-            "up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). optix_hdr "
-            "= NVIDIA OptiX HDR denoiser "
+            "motion, slightly noisier on disocclusions). svgf_atrous = "
+            "svgf_basic + 3-pass a-trous edge-aware spatial filter (~5 ms; "
+            "cleaner on disocclusions, mild softening of micro detail). "
+            "nrd = same dispatch chain as svgf_atrous today; reserved for "
+            "the proper NVIDIA RayTracingDenoiser library integration once "
+            "that's wired up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). "
+            "optix_hdr = NVIDIA OptiX HDR denoiser "
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
             "found; runtime gracefully falls back to off if the GPU/driver "
@@ -741,15 +728,8 @@ namespace cvar {
             "history; closes the per-frame flicker gap vs SVGF on static "
             "scenes while keeping OptiX's no-ghosting motion behaviour. "
             "optix_temporal_hdr_aov = optix_temporal_hdr + albedo+normal "
-            "AOV guides; the strongest OptiX variant. "
-            "svgf_basic_metalfx / svgf_atrous_metalfx = SVGF on Metal "
-            "followed by MetalFX TemporalDenoisedScaler as a finalizer "
-            "(ML TAA on top of SVGF-denoised input -- cleanest edge AA "
-            "available; Mac only). Mac builds accept "
-            "svgf_basic / svgf_atrous / svgf_basic_metalfx / "
-            "svgf_atrous_metalfx / nrd / metalfx; they ignore optix_*. "
-            "Non-NVIDIA Vulkan builds ignore optix_*; Vulkan builds "
-            "ignore metalfx / *_metalfx.",
+            "AOV guides; the strongest OptiX variant. Non-NVIDIA Vulkan "
+            "builds ignore optix_* and fall back to off.",
             CVAR_ARCHIVE);
     PT_CVAR(r_svgf_atrous_passes, "1",
             "Number of A-Trous wavelet passes the in-house SVGF denoiser "
@@ -774,13 +754,12 @@ namespace cvar {
             "fighting surface texture detail, and multiply albedo back "
             "on the way out. 0 = legacy pre-demod path (full radiance "
             "through the chain). Affects r_denoiser = svgf_basic / "
-            "svgf_atrous / svgf_basic_metalfx / svgf_atrous_metalfx / "
-            "nrd; non-SVGF denoisers ignore this flag. Sky pixels "
+            "svgf_atrous / nrd; non-SVGF denoisers ignore this flag. Sky pixels "
             "(albedo = 0 sentinel) skip the divide AND the multiply-"
             "back so emissive radiance from the path tracer's miss "
             "shader is forwarded unchanged.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR pipeline through MetalFX. 1 = path tracer writes raw HDR, MetalFX denoises in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, MetalFX denoises LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
+    PT_CVAR(r_hdr_pipeline,    "1",  "Linear-HDR denoiser pipeline. 1 = path tracer writes raw HDR, the denoiser runs in HDR, post-pass applies exposure+ACES (recommended). 0 = path tracer pre-applies exposure+ACES, the denoiser runs in LDR, tonemap pass is a passthrough copy. Only affects the denoiser-on path.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom,           "1",  "HDR bloom (downsample/upsample pyramid, additive composite before ACES). 0 disables; tonemap then samples a 1x1 zero buffer.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_threshold, "1.0","Linear-HDR luminance gate for the bloom extract: a smoothstep across [threshold-0.5, threshold+0.5] scales each pixel's FULL colour (a pixel past the knee contributes its entire radiance -- this is a soft gate, not a (lum - threshold) extract). The path tracer's pixels are in tonemap-relative units (sun ~30, env ~3) so a threshold of 1.0 picks up only HDR highlights.", CVAR_ARCHIVE);
     PT_CVAR(r_bloom_intensity, "0.05","Linear blend factor of the bloom layer added on top of the HDR image before tonemap. 0 disables, 1 makes the bloom layer dominate. Realistic camera lens flare is in the 0.02-0.10 range.", CVAR_ARCHIVE);
@@ -3032,19 +3011,17 @@ bool Engine::Init() {
     // Boot the requested backend so the window renders something on
     // startup (defaults to "software" -- the only one online today).
     if (auto* v = C.FindCVar("r_backend")) {
-        // Shared configs can still contain r_backend=vulkan from a
-        // Windows/Linux run. On macOS the Vulkan backend is intentionally
-        // not built; normalize to Metal before the direct boot path below
-        // would otherwise bypass the console's per-value platform gate.
-#if defined(__APPLE__)
-        if (v->value == "vulkan") {
-            LOG_WARN("r_backend=vulkan is Windows/Linux-only; starting Metal on macOS.");
-            v->value = "metal";
+        // Shared configs carried over from the retired macOS build can
+        // still contain r_backend=metal. The Metal backend no longer
+        // exists here; normalize to Vulkan before the direct boot path
+        // below so the window still renders instead of falling through
+        // to no backend at all.
+        if (v->value == "metal") {
+            LOG_WARN("r_backend=metal is from a retired macOS build; starting Vulkan instead.");
+            v->value = "vulkan";
         }
-#endif
         BackendType t = BackendType::None;
         if      (v->value == "software") t = BackendType::Software;
-        else if (v->value == "metal")    t = BackendType::Metal;
         else if (v->value == "vulkan")   t = BackendType::Vulkan;
         if (t != BackendType::None) RequestBackendSwitch(t);
     }
@@ -3303,16 +3280,11 @@ int OpenUrlInBrowser(const std::string& url) {
             ::dup2(devnull, STDERR_FILENO);
             if (devnull > STDERR_FILENO) ::close(devnull);
         }
-#if defined(__APPLE__)
-        ::execl("/usr/bin/open", "open", url.c_str(), (char*)nullptr);
-        std::_Exit(127);  // exec failed
-#else
         // xdg-open on desktop-less setups can fall back to exec'ing
         // $BROWSER SYNCHRONOUSLY and only exit when the browser does.
-        // macOS `open` returns in milliseconds so the parent can wait
-        // for its real exit status; here we double-fork instead so a
-        // long-lived launcher can never block the engine thread, and
-        // the grandchild is reparented to init (no zombie).
+        // Double-fork so a long-lived launcher can never block the
+        // engine thread, and the grandchild is reparented to init (no
+        // zombie).
         ::setsid();
         const pid_t grandchild = ::fork();
         if (grandchild == 0) {
@@ -3320,7 +3292,6 @@ int OpenUrlInBrowser(const std::string& url) {
             std::_Exit(127);
         }
         std::_Exit(grandchild > 0 ? 0 : 126);
-#endif
     }
     int status = 0;
     if (::waitpid(pid, &status, 0) != pid) return -1;
@@ -7827,38 +7798,21 @@ void Engine::RenderFrame() {
 
     // P10/P12 denoiser state. Resolved before BeginFrame so we know
     // whether to allocate the G-buffer textures this frame. The cvar
-    // value chooses the kind (off / metalfx / svgf / nrd / optix_*);
-    // per-backend gating then drops it to off if the active device
-    // doesn't support the chosen kind. metalfx is Mac-only; svgf, nrd,
-    // and optix_* are Vulkan-only; optix_* additionally requires the
-    // build-time PT_ENABLE_OPTIX (CUDA Toolkit + OptiX SDK detected)
-    // and a runtime CUDA-capable NVIDIA GPU. The no-op "off" value
-    // short-circuits all G-buffer allocation.
+    // value chooses the kind (off / svgf / nrd / optix_*); per-backend
+    // gating then drops it to off if the active device doesn't support
+    // the chosen kind. svgf, nrd, and optix_* are Vulkan-only; optix_*
+    // additionally requires the build-time PT_ENABLE_OPTIX (CUDA Toolkit
+    // + OptiX SDK detected) and a runtime CUDA-capable NVIDIA GPU. The
+    // no-op "off" value short-circuits all G-buffer allocation.
     DenoiserKind want_kind = DenoiserKind::Off;
     if (auto* v = C.FindCVar("r_denoiser")) {
         const auto& s = v->value;
-        if (s == "metalfx" && current_backend_ == BackendType::Metal) {
-            want_kind = DenoiserKind::MetalFX;
-        } else if (current_backend_ == BackendType::Metal) {
-            // SVGF on Metal: same in-house SVGF chain as Vulkan, same
-            // Slang sources cross-compiled to MSL. svgf_basic = temporal
-            // only; svgf_atrous = temporal + a-trous (passes set by
-            // r_svgf_atrous_passes). The `nrd` alias falls through to
-            // svgf_atrous today (placeholder for the NVIDIA RayTracingDenoiser
-            // library). The *_metalfx variants chain MetalFX
-            // TemporalDenoisedScaler as a finalizer (ML TAA on top of
-            // SVGF-denoised input) -- highest quality but Mac-only.
-            if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasicMetalFx;
-            else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrousMetalFx;
-            else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
-        } else if (current_backend_ == BackendType::Vulkan) {
-            // The *_metalfx variants chain MetalFX as a finalizer (Mac
-            // only). On Vulkan we silently degrade to the corresponding
-            // plain SVGF mode so a user's demont.cfg / preset value
-            // works across both backends -- they just lose the MetalFX
-            // finalizer on Vulkan, matching the cvar help text.
+        if (current_backend_ == BackendType::Vulkan) {
+            // The *_metalfx variants chained MetalFX as a finalizer on the
+            // retired Mac backend. Here they silently degrade to the
+            // corresponding plain SVGF mode so a demont.cfg / preset value
+            // carried over from macOS still works -- it just loses the
+            // (now-removed) MetalFX finalizer, matching the cvar help text.
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
             else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasic;
@@ -12911,8 +12865,12 @@ void Engine::RenderFrame() {
              denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
              denoiser_kind_ == DenoiserKind::OptixTemporalHdr    ||
              denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
-        const bool backend_is_metal =
-            (current_backend_ == pt::rhi::BackendType::Metal);
+        // The Metal backend has been retired; this stays as a named flag
+        // (always false now) so the Vulkan-only render-pass gates below
+        // read exactly as they did before. The dead Metal-only branches
+        // it guards (the engine Tonemap.slang path etc.) are pruned in a
+        // follow-up cleanup.
+        const bool backend_is_metal = false;
         // Metal-only: Tonemap.slang produces black on Vulkan
         // regardless of denoiser state (see comment block above).
         const bool use_engine_tonemap =
@@ -17849,28 +17807,26 @@ void Engine::RegisterCommands() {
         };
     }
     // r_backend: full canonical value set with per-value platform
-    // tags (issue #161). metal is Mac-only; vulkan is Windows/Linux
-    // only; software is available where the software present path is
-    // built. Listing the full set means a shared demont.cfg with
-    // `r_backend metal` or `r_backend vulkan` round-trips cleanly on
-    // the other OSes, just no-ops with a clear platform-mismatch error
-    // instead of the older "invalid value" message.
+    // tags (issue #161). vulkan is Windows/Linux only; software is
+    // available where the software present path is built. Listing the
+    // full set means a shared demont.cfg with `r_backend vulkan`
+    // round-trips cleanly on the other OSes, just no-ops with a clear
+    // platform-mismatch error instead of the older "invalid value"
+    // message. (A retired `r_backend metal` from an old macOS cfg is
+    // normalized to vulkan at boot; see Engine::Init.)
     if (auto* v = C.FindCVar("r_backend")) {
         constexpr auto kAny      = pt::console::CVAR_VALUE_ANY;
-        constexpr auto kMac      = pt::console::CVAR_VALUE_MAC;
         constexpr auto kWinLinux = pt::console::CVAR_VALUE_WIN |
                                    pt::console::CVAR_VALUE_LINUX;
-        v->allowed_values        = {"none", "software", "metal", "vulkan"};
+        v->allowed_values        = {"none", "software", "vulkan"};
         v->allowed_value_flags   = {
             kAny,       // none
             kAny,       // software
-            kMac,       // metal
             kWinLinux,  // vulkan
         };
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
             if      (cv.value == "software") t = BackendType::Software;
-            else if (cv.value == "metal")    t = BackendType::Metal;
             else if (cv.value == "vulkan")   t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
@@ -18113,28 +18069,22 @@ void Engine::RegisterCommands() {
         // the AOV variant lands in Phase 1a step 3 alongside the path
         // tracer's primary_albedo output (the underlying OptiX path
         // logs a one-time INFO at Init noting the fallback).
-        v->allowed_values = {"off", "metalfx",
+        v->allowed_values = {"off",
                               "svgf_basic", "svgf_atrous", "nrd",
-                              "svgf_basic_metalfx", "svgf_atrous_metalfx",
                               "optix_hdr", "optix_hdr_aov",
                               "optix_temporal_hdr", "optix_temporal_hdr_aov"};
-        // Per-value platform tags (issue #161). Mac path is metalfx +
-        // its SVGF composites; Win/Linux path is nrd + the optix
-        // family. SVGF (basic/atrous) is cross-platform. A user with
-        // `r_denoiser nrd` in their demont.cfg on Mac sees a clear
-        // platform-mismatch error listing Mac-only values instead
-        // of getting silently downgraded at RenderFrame time.
+        // Per-value platform tags (issue #161). SVGF (basic/atrous) is
+        // cross-platform; nrd + the optix family are Win/Linux (NVIDIA).
+        // A user with a retired Mac-only value (metalfx / *_metalfx) in
+        // their demont.cfg now hits a plain "invalid value" -- those
+        // went with the Metal backend.
         constexpr auto kAny = pt::console::CVAR_VALUE_ANY;
-        constexpr auto kMac = pt::console::CVAR_VALUE_MAC;
         constexpr auto kWL  = pt::console::CVAR_VALUE_WIN | pt::console::CVAR_VALUE_LINUX;
         v->allowed_value_flags = {
             kAny,   // off
-            kMac,   // metalfx
             kAny,   // svgf_basic
             kAny,   // svgf_atrous
             kWL,    // nrd
-            kMac,   // svgf_basic_metalfx
-            kMac,   // svgf_atrous_metalfx
             kWL,    // optix_hdr
             kWL,    // optix_hdr_aov
             kWL,    // optix_temporal_hdr
@@ -25240,8 +25190,14 @@ bool Engine::OceanGpuAvailable() const {
     // solver. Vulkan builds the SPIR-V but registers no pipeline (its
     // shared descriptor-set layout does not declare bindings 40..45), so
     // its id is 0 and it takes the CPU path through the test above; the
-    // backend test here is what makes Software's stub honest.
-    if (current_backend_ != BackendType::Metal) return false;
+    // software exclusion here is what makes that stub honest.
+    //
+    // The GPU ocean compute pre-pass only ever ran on the now-retired
+    // Metal backend; no live backend registers a real pipeline today, so
+    // in practice this returns false via the id==0 test above until a
+    // Vulkan ocean pipeline lands. The software guard remains so that if
+    // one does, Software still correctly falls back to the CPU solver.
+    if (current_backend_ == BackendType::Software) return false;
     auto& C = pt::console::Console::Get();
     if (auto* v = C.FindCVar("r_ocean_gpu")) {
         if (v->GetInt() == 0) return false;
@@ -25964,135 +25920,7 @@ std::vector<std::string> SplitCsv(std::string_view s) {
 int Engine::SpawnPanelBrowser(const std::string& panel_name,
                               const std::string& url,
                               std::string* out_diag) {
-#if defined(__APPLE__)
-    // macOS: `open -na 'Google Chrome' --args --app=<url>` spawns a
-    // detached Chrome --app window. On chrome-missing, fall back to
-    // Edge then Safari (Safari can't do --app mode but at least opens
-    // the URL).
-    //
-    // We need a PID to track for later panel_close. `open` itself
-    // exits as soon as it asks LaunchServices to spawn the target,
-    // so its PID isn't useful. Use posix_spawn -> /usr/bin/open with
-    // a wait-for-the-target hint? No -- the cleanest path on macOS is
-    // to run Chrome directly:
-    //   `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --app=<url>`
-    // because then we own the child PID directly.
-    const char* kChromiumPaths[] = {
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        nullptr,
-    };
-    const char* chosen = nullptr;
-    for (int i = 0; kChromiumPaths[i] != nullptr; ++i) {
-        if (::access(kChromiumPaths[i], X_OK) == 0) {
-            chosen = kChromiumPaths[i];
-            break;
-        }
-    }
-    if (chosen != nullptr) {
-        // Double-fork: the intermediate child forks the browser and
-        // exits immediately, so the browser is reparented to launchd
-        // and can never sit as a zombie inside the long-running engine
-        // (a single fork left one unreaped zombie per closed panel).
-        // A pipe carries the browser's real PID back to the parent for
-        // panel_close tracking; the parent reaps only the short-lived
-        // intermediate.
-        int pidpipe[2] = {-1, -1};
-        if (::pipe(pidpipe) != 0) { pidpipe[0] = pidpipe[1] = -1; }
-        pid_t pid = ::fork();
-        if (pid == 0) {
-            // Intermediate child: detach from terminal, spawn browser.
-            // setsid() so the browser survives if the parent dies.
-            ::setsid();
-            if (pidpipe[0] >= 0) ::close(pidpipe[0]);
-            pid_t browser = ::fork();
-            if (browser == 0) {
-                if (pidpipe[1] >= 0) ::close(pidpipe[1]);
-                std::string app_arg = "--app=" + url;
-                // Pass a per-panel user-data-dir argument so multiple
-                // `panel_open` invocations don't fall through to a single
-                // existing Chrome window (Chrome refuses to spawn a new
-                // PID when an existing instance can satisfy the URL). The
-                // dir is ephemeral but persistent across runs so the
-                // window remembers its size.
-                const char* home_env = std::getenv("HOME");
-                std::string udd_arg = "--user-data-dir=" +
-                    std::string(home_env != nullptr ? home_env : "/tmp") +
-                    "/.demont_editor/" + panel_name;
-                execl(chosen, chosen,
-                      app_arg.c_str(),
-                      udd_arg.c_str(),
-                      "--no-first-run",
-                      "--no-default-browser-check",
-                      (char*)nullptr);
-                // execl returned -- failure; bail loud.
-                std::_Exit(127);
-            }
-            if (pidpipe[1] >= 0) {
-                (void)!::write(pidpipe[1], &browser, sizeof(browser));
-                ::close(pidpipe[1]);
-            }
-            std::_Exit(browser > 0 ? 0 : 126);
-        }
-        if (pidpipe[1] >= 0) ::close(pidpipe[1]);
-        pid_t browser_pid = -1;
-        if (pid > 0) {
-            if (pidpipe[0] >= 0 &&
-                ::read(pidpipe[0], &browser_pid, sizeof(browser_pid))
-                    != static_cast<ssize_t>(sizeof(browser_pid))) {
-                browser_pid = -1;
-            }
-            // The intermediate exits immediately -- reap it now so it
-            // never lingers.
-            int status = 0;
-            (void)::waitpid(pid, &status, 0);
-        }
-        if (pidpipe[0] >= 0) ::close(pidpipe[0]);
-        if (browser_pid > 0) {
-            if (out_diag) {
-                *out_diag = fmt::format("spawned {} via {} (pid {})",
-                                        panel_name, chosen, browser_pid);
-            }
-            return static_cast<int>(browser_pid);
-        }
-        if (pid > 0) {
-            // The intermediate forked -- the browser is very likely up
-            // even though the pid read came back short (pipe failure /
-            // EINTR / intermediate killed). Falling through to the
-            // default-browser fallback here opened the panel TWICE.
-            // Report the spawn with an untracked PID instead.
-            if (out_diag) {
-                *out_diag = fmt::format(
-                    "spawned {} via {} but its PID could not be read -- "
-                    "panel_close won't track this window",
-                    panel_name, chosen);
-            }
-            return 0;
-        }
-        // fork() itself failed; fall through to the `open` fallback.
-    }
-
-    // Final fallback: `open` the URL in the default browser. We can't
-    // track the resulting PID -- so panel_close on this panel will
-    // print a "no tracked PID" diagnostic. Better than nothing.
-    int rc = OpenUrlInBrowser(url);
-    if (out_diag) {
-        if (rc == 0) {
-            *out_diag = fmt::format(
-                "opened {} in default browser (no Chromium found; close "
-                "manually -- panel_close won't track this window)",
-                panel_name);
-        } else {
-            *out_diag = fmt::format(
-                "failed to open {} ({}). No Chromium browser detected "
-                "and `/usr/bin/open` returned {}.",
-                panel_name, url, rc);
-        }
-    }
-    return 0;
-#elif defined(_WIN32)
+#if defined(_WIN32)
     // Windows: try chrome.exe / msedge.exe in standard install paths.
     // CreateProcessA gives us a PROCESS_INFORMATION with a real PID
     // we can hold onto for panel_close (TerminateProcess on the

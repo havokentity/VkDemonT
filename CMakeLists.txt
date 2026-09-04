@@ -9,12 +9,12 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
     message(FATAL_ERROR
-        "Configure out of source. Use a preset, e.g. `cmake --preset mac-debug`.")
+        "Configure out of source. Use a preset, e.g. `cmake --preset win-clang-release`.")
 endif()
 
 project(demont
     VERSION 0.3.30
-    DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Metal + MetalFX denoiser on Apple Silicon, Vulkan + SVGF compute denoiser on NVIDIA RTX."
+    DESCRIPTION "DeMonT Engine -- non-rasterized real-time game engine. Path-traced every pixel, mesh CSG via Manifold. Vulkan + SVGF compute denoiser on NVIDIA RTX (Windows)."
     LANGUAGES C CXX
 )
 
@@ -28,15 +28,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # --- Project options --------------------------------------------------------
-set(_PT_ENABLE_VULKAN_BACKEND_DEFAULT ON)
-if(APPLE)
-    set(_PT_ENABLE_VULKAN_BACKEND_DEFAULT OFF)
-endif()
-option(PT_ENABLE_VULKAN_BACKEND "Build native Vulkan backend (Windows/Linux)" ${_PT_ENABLE_VULKAN_BACKEND_DEFAULT})
-if(APPLE AND PT_ENABLE_VULKAN_BACKEND)
-    message(STATUS "PT_ENABLE_VULKAN_BACKEND is disabled on Apple; macOS uses the Metal backend.")
-    set(PT_ENABLE_VULKAN_BACKEND OFF CACHE BOOL "Build native Vulkan backend (Windows/Linux)" FORCE)
-endif()
+option(PT_ENABLE_VULKAN_BACKEND "Build native Vulkan backend (Windows/Linux)" ON)
 option(PT_ENABLE_OPTIX
     "Build OptiX denoiser (NVIDIA only; needs CUDA Toolkit + OptiX SDK installed)" ON)
 # NVIDIA RayTracingDenoiser (NRD) library integration -- issue #50.
@@ -46,28 +38,25 @@ option(PT_ENABLE_OPTIX
 # When OFF (default), neither the fetch nor the link happens -- the engine
 # still compiles + runs, the `r_denoiser nrd` cvar value keeps aliasing the
 # in-house SVGF chain (its long-standing behaviour). Default OFF because:
-#   1. NRD is Vulkan-only and Apple Silicon (the project's primary platform)
-#      can never use it -- forcing a 4 MB+ dep on every configure would be
-#      pure overhead for those users.
-#   2. NRD's CMake spawns a custom_target that invokes its `ShaderMake` /
+#   1. NRD's CMake spawns a custom_target that invokes its `ShaderMake` /
 #      `dxc-spirv` toolchain to compile HLSL -> SPIR-V at configure time.
 #      That's a non-trivial transitive-dep chain that platform packagers
 #      may not have set up; opt-in keeps the default `cmake --preset
-#      mac-release` configure path identical to before this PR.
-#   3. The integration is staged -- v0.3.30 lands the scaffolding (CMake
+#      win-clang-release` configure path identical to before this PR.
+#   2. The integration is staged -- v0.3.30 lands the scaffolding (CMake
 #      gates + VulkanNrdLibDenoiser stub) so a follow-up PR can land the
 #      actual per-frame Dispatch translation without re-touching CMake.
 #
-# Hard-gated to non-Apple in Dependencies.cmake (NRD is Vulkan-only and the
-# Mac path uses Metal + MetalFX); a user passing -DPT_ENABLE_NRD=ON on Mac
-# gets a single warning and the *active* gate PT_NRD_ACTIVE stays OFF for
-# that configure. The PT_ENABLE_NRD cache value itself is left as the user
-# set it -- every consumer in src/rhi_vulkan/ checks PT_NRD_ACTIVE rather
-# than PT_ENABLE_NRD directly, so a stale =ON in the cache on Apple is
-# harmless: the FetchContent of NRD doesn't run, no target is linked, and
-# the source-side PT_ENABLE_NRD compile-definition stays undefined.
+# Gated on PT_ENABLE_VULKAN_BACKEND in Dependencies.cmake; a user passing
+# -DPT_ENABLE_NRD=ON with the Vulkan backend off gets a single status line
+# and the *active* gate PT_NRD_ACTIVE stays OFF for that configure. The
+# PT_ENABLE_NRD cache value itself is left as the user set it -- every
+# consumer in src/rhi_vulkan/ checks PT_NRD_ACTIVE rather than
+# PT_ENABLE_NRD directly, so a stale =ON in the cache is harmless: the
+# FetchContent of NRD doesn't run, no target is linked, and the
+# source-side PT_ENABLE_NRD compile-definition stays undefined.
 option(PT_ENABLE_NRD
-    "Build NVIDIA NRD denoiser (Vulkan-only; non-Apple platforms; needs ShaderMake/dxc-spirv toolchain)" OFF)
+    "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" OFF)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 # Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;
@@ -97,7 +86,7 @@ option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatc
 option(PT_BUILD_TESTS           "Build unit tests via doctest"          ON)
 # Developer tooling (imgdiff, future golden-image helpers, etc.).
 # Each tool target is standalone -- no link deps on pt_engine /
-# pt_rhi_vulkan / pt_rhi_metal, so cmake --build --target <tool>
+# pt_rhi_vulkan, so cmake --build --target <tool>
 # stays fast and doesn't pull in the GPU backends.
 #
 # Caveat: this gates *building* tools/, not project configure. The
@@ -120,7 +109,7 @@ option(PT_BUILD_TOOLS           "Build developer tooling under tools/"  ON)
 # compile-time gate matters more than the runtime cost: leaving an unused
 # subsystem in the megakernel inflates per-thread register pressure of the
 # dispatch, dropping wavefront occupancy across every pixel + thrashing
-# Apple Silicon's SIMD instruction cache. (Sibling SDF Phase 2 gate lives
+# the GPU's SIMD instruction cache. (Sibling SDF Phase 2 gate lives
 # in cmake/Slang.cmake -- it gates a Slang module rather than a megakernel
 # branch, so the option is registered closer to the shader-compile glue.)
 #

@@ -13,7 +13,7 @@ Smooth planet-scale terrain streaming (fly in/out of orbit like MSFS / Star Citi
 - **Terrain**: cubed-sphere quadtree, ETOPO 2022 DEM (`assets/planet/earth_lite.ptdem`, PTDEM002 with a relief plane), fractal continuation broken at the 106 m hillslope scale, per-scale angle-of-repose slope cap, real MODIS land cover, chunk BLAS streamed into the ray query, retire-on-cover + whole-cut retention residency, from-orbit sub-pixel cull.
 - **Sky/atmosphere**: Hillaire 2020 physical marched atmosphere (transmittance + multi-scatter LUTs), Bodhaine 1999 Rayleigh, ozone/Chappuis, Kopp & Lean solar irradiance, physical stars extinguished by the air column (Beer–Lambert to space), real default sky (no skybox), black space.
 - **Ocean**: Tessendorf FFT cascades, Cox–Munk slope→GGX, Pope & Fry / Morel / Petzold water optics, water-leaving radiance from outside the medium.
-- **Renderer**: megakernel path tracer, ReSTIR/NEE, MetalFX + SVGF denoisers, per-pass GPU timing (perf overlay tier 4).
+- **Renderer**: megakernel path tracer, ReSTIR/NEE, in-house SVGF denoiser (+ OptiX HDR/temporal on NVIDIA), per-pass GPU timing (perf overlay tier 4). (The MetalFX denoiser finalizer went with the Metal backend — see the strip note below.)
 
 ## Pending branches (unfinished polish, reviewed, NOT merged)
 
@@ -40,10 +40,44 @@ Plan (path-tracer-appropriate — no per-frame BLAS rebuild, so no vertex geomor
 
 ## First steps on Windows
 
-1. Build with the Vulkan preset (`win-clang-release` / native Vulkan; drop the Metal/`rhi_metal` backend and Mac presets — "strip all Mac support").
-2. Verify the Vulkan backend renders correctly on a real NVIDIA GPU (it was only exercised via MoltenVK on Mac before, which had latent regressions — pixel correctness on native Vulkan is unverified).
+1. ~~Build with the Vulkan preset (`win-clang-release` / native Vulkan; drop the Metal/`rhi_metal` backend and Mac presets — "strip all Mac support").~~ **DONE** — see the strip note below; the tree configures, compiles, and links Vulkan-only on this box.
+2. Verify the Vulkan backend renders correctly on a real NVIDIA GPU (it was only exercised via MoltenVK on Mac before, which had latent regressions — pixel correctness on native Vulkan is unverified). **← next; needs a live look.**
 3. Merge the pending polish branches after a live check.
 4. Start P1 of the streaming plan.
+
+### Mac-strip status (branch `chore/strip-mac-vulkan-only`)
+
+All macOS/Metal *support* has been removed and the Vulkan-only tree
+builds clean (`demont.exe` + all targets, `win-clang-release`):
+
+- Deleted `src/rhi_metal/`, the 4 Cocoa `.mm` files, the Metal ocean GPU
+  test, the Mac CMake presets, and the metal-cpp / MSL toolchain wiring.
+- `BackendType::Metal` removed; `r_backend` defaults to `vulkan` and its
+  allowed set is `none|software|vulkan` (a retired `r_backend metal` from
+  an old macOS cfg is normalized to `vulkan` at boot).
+- The Metal denoiser-selection branches and every `#if defined(__APPLE__)`
+  block in the kept sources were removed; `OceanGpuActive()` (Metal-only)
+  now returns via the software-exclusion guard, behavior-identical.
+
+Also done since: the macOS CI jobs were removed from all three workflows
+(the nightly release now builds/packages on Windows), the
+`tests/goldens/Darwin/` tree (79 PNGs / 14 MB) was deleted, and all 55
+`--backend metal` golden cells + the two `if(APPLE)` manual metal blocks
+were stripped from `tests/CMakeLists.txt` (configure clean, 91 tests, 0
+metal cells).
+
+Deliberately **left as verified follow-ups** (dead but harmless on the
+Vulkan build; each wants a compile/behaviour check as it lands):
+- The dead `DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx`
+  enum members and the ~1000-line Metal-only engine tonemap block they
+  gate (`backend_is_metal` is now a compile-time `false`, so the block
+  never runs). Purging it should stay red/green — it threads the render
+  loop.
+- The `#ifdef PT_TARGET_METAL` MSL blocks in `shaders/*.slang` (no `metal`
+  Slang target is compiled any more). NOTE: `pt_planet_albedo_test.cpp`
+  pins `land_basis_* == 2` in PathTrace.slang (Metal Push cbuffer + SPIR-V
+  Frame); when the Metal shader blocks go, that expectation drops to `1`.
+- Assorted MoltenVK/Metal *comment* references in kept Vulkan/shader files.
 
 ## Conventions (carried from the parent)
 

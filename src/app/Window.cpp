@@ -143,21 +143,15 @@ void Window::Hide() {
     if (handle_ != nullptr) glfwHideWindow(handle_);
 }
 
-// Signature is `void*(void*)` everywhere -- the implementation in
-// Window_Cocoa.mm casts back to GLFWwindow* internally.  Standardising
-// on void* avoids an ODR violation across translation units that
-// don't include GLFW headers (ConsoleOverlay_Win32, ConsoleOverlay_Stub,
-// MetalDevice, SoftwareDevice all declare it as void*(void*)).
-extern "C" void* pt_window_native_cocoa(void*);
-
 #if defined(_WIN32)
 #  define GLFW_EXPOSE_NATIVE_WIN32
 #  include <GLFW/glfw3native.h>
 
-// Win32 symmetric counterpart to pt_window_native_cocoa: takes a
-// GLFWwindow* (as void*) and returns the underlying HWND (as void*).
-// Used by SoftwareDevice's GDI present path -- same call shape as the
-// Mac side so the backend doesn't need to drag GLFW headers in.
+// Takes a GLFWwindow* (as void*) and returns the underlying HWND (as
+// void*). Used by SoftwareDevice's GDI present path; the void*(void*)
+// shape keeps the backend from having to drag GLFW headers in, and
+// avoids an ODR clash across TUs (ConsoleOverlay_Win32,
+// ConsoleOverlay_Stub, SoftwareDevice) that declare it identically.
 extern "C" void* pt_window_native_win32(void* glfw_window) {
     return glfw_window
         ? static_cast<void*>(glfwGetWin32Window(
@@ -167,9 +161,7 @@ extern "C" void* pt_window_native_win32(void* glfw_window) {
 #endif
 
 void* Window::NativeHandle() const {
-#if defined(__APPLE__)
-    return pt_window_native_cocoa(handle_);
-#elif defined(_WIN32)
+#if defined(_WIN32)
     // Returns HWND. ConsoleOverlay_Win32 attaches a child window
     // here for the in-game console. Cast to HWND on the consumer
     // side; void* keeps Window.h free of <Windows.h>.

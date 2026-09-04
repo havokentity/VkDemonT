@@ -14,21 +14,15 @@ add_subdirectory(core)
 add_subdirectory(editor)
 add_subdirectory(console)
 add_subdirectory(audio)
-# Software backend supports Mac (CAMetalLayer present) and Windows
-# (SetDIBitsToDevice present).  Linux/Wayland/X11 would need its own
-# present path -- not implemented, so we gate the subdirectory to
-# the two platforms that actually have a working SoftwareDevice
-# EndFrame.  Future r_software_blit cvar will add a Vulkan-blit
-# alternative on Windows that shares the engine's VkDevice; until
-# then Windows uses GDI, Mac uses Metal.
-if(APPLE OR WIN32)
+# Software backend uses the Win32 SetDIBitsToDevice present path.
+# Linux/Wayland/X11 would need its own EndFrame branch -- not
+# implemented, so we gate the subdirectory to WIN32.  Future
+# r_software_blit cvar will add a Vulkan-blit alternative on Windows
+# that shares the engine's VkDevice; until then Windows uses GDI.
+if(WIN32)
     add_subdirectory(rhi_software)
 endif()
-# Metal backend is Apple-only by definition.
-if(APPLE)
-    add_subdirectory(rhi_metal)
-endif()
-if(PT_ENABLE_VULKAN_BACKEND AND NOT APPLE)
+if(PT_ENABLE_VULKAN_BACKEND)
     add_subdirectory(rhi_vulkan)
 endif()
 add_subdirectory(rhi)

@@ -179,20 +179,12 @@ FetchContent_Declare(manifold
     SYSTEM
 )
 
-# --- NRD: NVIDIA RayTracingDenoiser (Vulkan-only, opt-in, non-Apple) -------
+# --- NRD: NVIDIA RayTracingDenoiser (Vulkan-only, opt-in) ------------------
 # Issue #50 -- stage 1 (scaffolding). Activated only when:
 #   - PT_ENABLE_NRD = ON               (user opt-in; default OFF)
 #   - PT_ENABLE_VULKAN_BACKEND = ON    (NRD's only supported backend in this
 #                                        repo; the DX12 path isn't wired in)
-#   - NOT APPLE                        (NRD doesn't target MoltenVK -- shaders
-#                                        compile via dxc-spirv with HLSL 6.x
-#                                        features MoltenVK's SPIRV-Cross
-#                                        translation layer can't always
-#                                        round-trip; and the Mac path uses
-#                                        Metal + MetalFX anyway, so NRD adds
-#                                        zero value on the user's primary
-#                                        platform).
-# We set PT_NRD_ACTIVE based on the AND of those three; the Vulkan backend's
+# We set PT_NRD_ACTIVE based on the AND of those two; the Vulkan backend's
 # CMakeLists checks PT_NRD_ACTIVE (not PT_ENABLE_NRD directly) so a stale
 # PT_ENABLE_NRD=ON in the cache on Mac doesn't try to link a missing target.
 #
@@ -217,11 +209,7 @@ set(PT_NRD_ACTIVE OFF)
 if(PT_ENABLE_NRD AND NOT PT_ENABLE_VULKAN_BACKEND)
     message(STATUS "PT_ENABLE_NRD requires PT_ENABLE_VULKAN_BACKEND; NRD denoiser inactive.")
 endif()
-if(PT_ENABLE_NRD AND APPLE)
-    message(WARNING "PT_ENABLE_NRD is Vulkan-only and the Mac path uses Metal + MetalFX; "
-                    "NRD denoiser inactive on Apple. Use the Vulkan backend on Windows/Linux.")
-endif()
-if(PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND AND NOT APPLE)
+if(PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND)
     set(NRD_STATIC_LIBRARY        ON  CACHE BOOL "" FORCE)
     set(NRD_EMBEDS_SPIRV_SHADERS  ON  CACHE BOOL "" FORCE)
     set(NRD_EMBEDS_DXIL_SHADERS   OFF CACHE BOOL "" FORCE)

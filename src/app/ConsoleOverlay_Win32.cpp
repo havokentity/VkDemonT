@@ -2096,10 +2096,3 @@ void ConsoleOverlay::SetGlobalInstance(ConsoleOverlay* /*o*/) {
 }
 
 }  // namespace pt::app
-
-// C-extern shims expected by Window.cpp / SoftwareDevice.cpp / MetalDevice.cpp.
-// On Apple they come from Window_Cocoa.mm and MetalLayerAttach.mm. On Win32
-// the Vulkan/software backends create their surface natively, so these are
-// no-ops -- same as ConsoleOverlay_Stub.cpp on other non-Apple platforms.
-extern "C" void* pt_window_native_cocoa(void*) { return nullptr; }
-extern "C" void  pt_metal_attach_layer(void*, void*) {}

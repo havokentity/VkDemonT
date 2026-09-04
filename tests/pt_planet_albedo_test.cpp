@@ -755,22 +755,19 @@ TEST_CASE("the Vulkan layout declares binding 47 and still omits 40..45") {
 }
 
 TEST_CASE("the push-constant budget is one shared number, guarded at compile time") {
-    // The bug this phase tripped: MetalDevice.h and VulkanDevice.h each had
-    // a bare 2048-byte staging array, sizeof(PtPush) reached 2064, and BOTH
-    // silently dropped the last 16 bytes -- so the terrain ignored its new
-    // raster, on two backends, with no error anywhere.
+    // The bug this phase tripped: the backend's device header had a bare
+    // 2048-byte staging array, sizeof(PtPush) reached 2064, and it silently
+    // dropped the last 16 bytes -- so the terrain ignored its new raster
+    // with no error anywhere. (Originally shipped on both the Metal and
+    // Vulkan backends at once; the Metal backend has since been retired.)
     const std::string types = Slurp(PT_RHI_TYPES_PATH);
     CHECK(CountOccurrences(types,
         "inline constexpr std::size_t kMaxPushConstantBytes = 4096;") == 1);
 
-    const std::string metal = Slurp(PT_METAL_DEVICE_PATH);
     const std::string vulkan = Slurp(PT_VULKAN_DEVICE_H_PATH);
-    CHECK(CountOccurrences(metal,
-        "push_buf_[pt::rhi::kMaxPushConstantBytes]") == 1);
     CHECK(CountOccurrences(vulkan,
         "push_buf_[pt::rhi::kMaxPushConstantBytes]") == 1);
-    // The bare literals must be GONE from both, or one backend can drift.
-    CHECK(CountOccurrences(metal, "push_buf_[2048]") == 0);
+    // The bare literal must be GONE, or the backend can drift.
     CHECK(CountOccurrences(vulkan, "push_buf_[2048]") == 0);
 
     // And the compile-time guard that makes the next overflow a build error
