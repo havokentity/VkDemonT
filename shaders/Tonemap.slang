@@ -47,7 +47,7 @@
 // PR for the chain of upstream bugs (DXC #6153 / Slang #5969 /
 // NVIDIA driver 596.x).
 [[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_in;
-[[vk::binding(1, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> ldr_out;
+[[vk::binding(1, 0)]]                              RWTexture2D<float4> ldr_out;
 // Half-res linear HDR bloom layer. The engine builds this each frame
 // via a downsample/upsample pyramid (BloomDown.slang + BloomUp.slang)
 // from the bright pixels of hdr_in. Sampled here with bilinear and

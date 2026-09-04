@@ -29,7 +29,14 @@
 // `src/engine/Engine.cpp` `CreateTexture` calls -- see the bug-fix
 // PR for the full mapping table. (See DXC #6153, Slang #5969,
 // NVIDIA bug #1080 family.)
-[[vk::binding(0, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> output;
+// swap-out (binding 0) is the BGRA8 swapchain -- there is NO SPIR-V storage
+// format for BGRA8, and declaring rgba8 against a BGRA8 view is a format
+// mismatch the native NVIDIA driver faults on (DEVICE_LOST). Use Unknown +
+// StorageImageWriteWithoutFormat (feature enabled by the device). The old
+// 596.x silent-no-op-store bug that motivated the explicit format is being
+// re-evaluated on the current driver; if it recurs, switch the swapchain to
+// a mutable RGBA8 view + shader swizzle instead.
+[[vk::binding(0, 0)]]                              RWTexture2D<float4> output;
 [[vk::binding(1, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> accum_hdr;
 // scene_tlas is omitted from the SPIR-V variant when the build defines
 // PT_SPIRV_NO_RAYQUERY (issue #44 fallback for backends without
