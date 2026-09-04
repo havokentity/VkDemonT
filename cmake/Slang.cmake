@@ -45,6 +45,27 @@ function(_pt_sdf_defines outVar)
     set(${outVar} "${_d}" PARENT_SCOPE)
 endfunction()
 
+# slangc optimisation level for the SPIR-V (native-Vulkan) path.
+#
+# MUST STAY -O0. At -O1 and above, Slang INLINES the entire PathTrace
+# megakernel into a single ~6.6 MB SPIR-V `main`, and the NVIDIA driver
+# (verified 32.0.16.1656 on an RTX 5090) MISCOMPILES that blob into a
+# non-terminating loop on the primary-ray-miss path -> the GPU TDR-hangs
+# (Windows event 153, VK_ERROR_DEVICE_LOST) on the first frame, at any
+# resolution down to 16x16. -O0 keeps the shader's functions out-of-line
+# (PathTrace.spv drops to ~336 KB) and the driver then compiles it
+# correctly and renders. This was bisected exhaustively: it is the driver's
+# codegen for the fully-inlined megakernel, not a source bug (the executed
+# miss-path code is loop-free), and `[noinline]` on individual functions did
+# not help. The proper long-term fix is to split the megakernel so it can run
+# optimised; until then -O0 is what makes native Vulkan render. Applied to
+# every entry point (the small shaders lose nothing measurable; the
+# megakernel is the one that must stay un-inlined). See the repo's
+# HANDOFF.md "Native-Vulkan bringup" note.
+set(PT_SLANGC_OPT "-O0" CACHE STRING
+    "slangc optimisation level for SPIR-V shaders (see cmake/Slang.cmake -- \
+-O0 is REQUIRED to avoid the NVIDIA megakernel-inlining TDR hang).")
+
 # pt_compile_slang_module(SOURCE <file.slang>)
 #
 #   Compiles a Slang source file to a target-agnostic IR module
@@ -126,6 +147,7 @@ function(pt_compile_slang_module)
                     ${M_EXTRA_DEFINES}
                     -I       "${out_dir}"
                     -Wno-40100
+                    ${PT_SLANGC_OPT}
                     -o       "${out}"
             DEPENDS "${full}" "${PT_SLANGC_BIN}" ${dep_outputs}
             VERBATIM
@@ -214,6 +236,7 @@ function(pt_compile_slang)
                     ${SLG_EXTRA_DEFINES}
                     -I       "${out_dir}"
                     -Wno-40100
+                    ${PT_SLANGC_OPT}
                     -o       "${out}"
             DEPENDS "${slg_full}" "${PT_SLANGC_BIN}" ${module_outputs}
             VERBATIM
