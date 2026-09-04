@@ -41,7 +41,7 @@
 // the BGRA8 swapchain (SPIR-V "rgba8" covers BGRA8 too). See
 // PathTrace.slang for the NVIDIA Format=Unknown rationale.
 [[vk::binding(0, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> hdr_in;
-[[vk::binding(1, 0)]]                              RWTexture2D<float4> swap_out;
+[[vk::binding(1, 0), vk::image_format("rgba8")]]   RWTexture2D<float4> swap_out;
 [[vk::binding(2, 0)]] RWStructuredBuffer<float> exposure_state;
 // Bloom mip 0 (half-res linear HDR). When Vulkan bloom is disabled / not
 // built, the host binds a safe valid fallback view here and pushes

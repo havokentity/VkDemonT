@@ -36,7 +36,7 @@
 // 596.x silent-no-op-store bug that motivated the explicit format is being
 // re-evaluated on the current driver; if it recurs, switch the swapchain to
 // a mutable RGBA8 view + shader swizzle instead.
-[[vk::binding(0, 0)]]                              RWTexture2D<float4> output;
+[[vk::binding(0, 0), vk::image_format("rgba8")]]    RWTexture2D<float4> output;
 [[vk::binding(1, 0), vk::image_format("rgba32f")]] RWTexture2D<float4> accum_hdr;
 // scene_tlas is omitted from the SPIR-V variant when the build defines
 // PT_SPIRV_NO_RAYQUERY (issue #44 fallback for backends without

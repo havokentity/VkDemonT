@@ -44,7 +44,7 @@
 // vk::image_format("rgba8") -- swapchain is BGRA8_UNORM on both
 // Win/Mac; matches PerfOverlay.slang's reasoning. Without the
 // format hint NVIDIA's compiler can silently drop the store.
-[[vk::binding(0, 0)]]
+[[vk::binding(0, 0), vk::image_format("rgba8")]]
 RWTexture2D<float4> out_image;
 
 // Dummy at vk::binding(4) (mesh_indices in the shared PathTrace
