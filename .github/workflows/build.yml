@@ -85,11 +85,17 @@ jobs:
       # header). Split out of pt_planet_terrain to keep the per-PR gate fast;
       # runs here on the scheduled / manually-dispatched nightly against the
       # Debug tree built above, so the exhaustive half still runs in CI on the
-      # Windows lane (where the 600 s timeout was tripping) too.
+      # Windows lane (where the 600 s timeout was tripping) too. A failure
+      # fails this job and therefore skips `nightly-release` (needs: windows).
+      #
+      # --no-tests=error: ctest's default when a label matches nothing is to
+      # log "No tests were found!!!" and exit 0, so a renamed label or a
+      # dropped registration would turn this step into a green no-op -- the
+      # "labelled test nobody executes" that tests/CMakeLists.txt warns about.
       - name: Exhaustive planetary sweep (ctest, nightly only)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         shell: pwsh
-        run: ctest --test-dir build/win-debug --output-on-failure -L nightly
+        run: ctest --test-dir build/win-debug --output-on-failure --no-tests=error -L nightly
 
       # Golden-image regression matrix (#45) -- software backend
       # only. The Windows runner has no usable Vulkan ICD beyond

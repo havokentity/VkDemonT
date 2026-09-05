@@ -37,21 +37,30 @@
 //
 // This one binary is registered with ctest TWICE (see tests/CMakeLists.txt):
 //   * pt_planet_terrain            -- runs everything OUTSIDE the "exhaustive"
-//     suite. The per-PR gate, a few seconds; excluded from nothing.
+//     suite. The per-PR gate; excluded from nothing.
 //   * pt_planet_terrain_exhaustive -- runs ONLY the "exhaustive" suite,
-//     carries the `nightly` ctest label, is excluded from the per-PR set
-//     (`ctest -LE nightly`) and is run by the scheduled Nightly workflow
-//     (`ctest -L nightly`).
+//     carries the `nightly` ctest label, is excluded from the Windows per-PR
+//     set (`ctest -LE nightly`) and is run by build.yml's scheduled nightly
+//     step (`ctest -L nightly`). The Linux sanitizer lane runs it on every PR
+//     on purpose -- see .github/workflows/linux-sanitizers.yml.
 //
-// A handful of cases below drive the residency selector to full convergence,
-// baking thousands of chunks apiece -- ~90% of this file's wall time. They are
-// COVERAGE of the selector's end-to-end behaviour; every acceptance-criterion
-// NUMBER they touch (the #326 sub-pixel cull boundary, cross-level
-// watertightness, the 2:1 restriction, bake determinism, the residency policy)
-// is ALSO asserted by a fast case that stays in the core, so a field bug still
-// fails the per-PR run fast. Those convergence sweeps carry
+// Eight cases below drive the residency selector to full convergence at level
+// 9, baking hundreds to thousands of chunks apiece -- the bulk of this file's
+// wall time. They are COVERAGE of the selector's end-to-end behaviour; every
+// acceptance-criterion NUMBER they touch (the #326 sub-pixel cull boundary,
+// cross-level watertightness, the 2:1 restriction, bake determinism, the
+// residency policy) is ALSO asserted by a fast case that stays in the core, so
+// a field bug still fails the per-PR run fast. Those convergence sweeps carry
 // `* doctest::test_suite("exhaustive")` so they run nightly, not on every PR.
 // Nothing is deleted -- the exhaustive half still runs in CI, just not per-PR.
+//
+// Two convergence cases are deliberately KEPT in the core, because they are
+// the only per-PR sentinels for their bugs and nothing cheaper stands in:
+//   * "no converged leaf still wants to split" -- the one ragged-schedule
+//     settle. The #284 fixed-point bug is invisible to a smooth schedule, and
+//     every other core case that converges the selector is a smooth one.
+//   * "#326: the selector culls every chunk from orbit ..." -- the cull WIRING.
+//     Its orbital convergences are cheap; the expensive surface half is nightly.
 // If the core ever needs to get faster again: cut redundancy, not cases.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -1423,62 +1432,83 @@ TEST_CASE("#326: the from-orbit cull predicate honours its limb-shift boundary")
     }
 }
 
-TEST_CASE("#326: sub-pixel terrain is culled from orbit and kept at the surface"
-          * doctest::test_suite("exhaustive")) {
-    // EXHAUSTIVE: four full convergences at level 9 -- the single most
-    // expensive case in the file. The #326 cull DECISION (the kCullLimbPx
-    // limb-shift boundary and every degenerate guard) is asserted directly and
-    // in microseconds by the fast "#326: the from-orbit cull predicate honours
-    // its limb-shift boundary" case, which stays in the core. This case is the
-    // end-to-end property that the selector wires that predicate into the
-    // desired set -- coverage of the wiring, not of the number.
-    // The selector must drop terrain the analytic backstop already carries --
-    // from orbit every chunk stands a fixed ~27.7 km above the backstop, but
-    // that height moves the lit disc's limb by well under a pixel, so tracing
-    // the chunks changes no pixel and only costs BLAS traversal. The claim is
-    // a PROPERTY OF THE DESIRED SET: empty from orbit, full at the surface.
+// --- #326: the selector must drop terrain the analytic backstop already
+// carries. From orbit every chunk stands a fixed ~27.7 km above the backstop,
+// but that height moves the lit disc's limb by well under a pixel, so tracing
+// the chunks changes no pixel and only costs BLAS traversal. The claim is a
+// PROPERTY OF THE DESIRED SET: empty from orbit, full at the surface. The cull
+// DECISION (the kCullLimbPx boundary and every degenerate guard) is pinned in
+// microseconds by the predicate case above; the two cases below are the
+// WIRING -- that Select() actually applies the predicate to the desired set.
+//
+// Split across the per-PR core and the nightly sweep by COST, not by claim.
+// The orbital convergences are cheap (a culled orbit bakes six roots and
+// stops; an unculled one settles at level 2-3), so the orbit half -- which is
+// the half that fails if the predicate call is ever dropped from Select() --
+// stays per-PR. The surface half is two full level-9 convergences under a
+// ground camera, the single most expensive thing in this file, and it asserts
+// only that the cull is inert there; that runs nightly.
+namespace {
+
+// The orbital fixture's own cone: a 40-degree field at 1080p, which is where
+// the ~36 ms this cull recovers was measured.
+double CullFixtureCone() {
+    return 2.0 * std::tan(0.5 * 40.0 * kPi / 180.0) / 1080.0;
+}
+
+std::set<ChunkKey> ConvergeDesiredAt(const ElevationField& field,
+                                     const PlanetSite& site,
+                                     const glm::dvec3& cam, double backstop) {
+    TerrainQuadtree tree;
+    LodParams p;
+    p.cone_spread       = CullFixtureCone();
+    p.camera_w          = cam;
+    p.planet_center_w   = site.CenterWorld();
+    p.backstop_radius_m = backstop;
+    p.max_level         = 9;
+    p.chunk_budget      = 4096;
+    Converge(tree, field, site, p);
+    REQUIRE(tree.Converged());
+    return tree.Desired();
+}
+
+}  // namespace
+
+TEST_CASE("#326: the selector culls every chunk from orbit when the backstop is there") {
+    // PER-PR. This is the case that goes red if the BackstopGapSubPixel call is
+    // removed from Select(), or if its inputs (planet_center_w, the backstop
+    // radius, the chunk's surface_r_max_m) stop reaching it -- none of which the
+    // predicate-only case above can see.
     ElevationField field = MakeProceduralField();
     const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
-
-    // The orbital fixture's own cone: a 40-degree field at 1080p, which is
-    // where the ~36 ms this cull recovers was measured.
-    const double cone = 2.0 * std::tan(0.5 * 40.0 * kPi / 180.0) / 1080.0;
-
-    auto converge_desired = [&](const glm::dvec3& cam,
-                                double backstop) -> std::set<ChunkKey> {
-        TerrainQuadtree tree;
-        LodParams p;
-        p.cone_spread       = cone;
-        p.camera_w          = cam;
-        p.planet_center_w   = site.CenterWorld();
-        p.backstop_radius_m = backstop;
-        p.max_level         = 9;
-        p.chunk_budget      = 4096;
-        Converge(tree, field, site, p);
-        REQUIRE(tree.Converged());
-        return tree.Desired();
-    };
-
-    const glm::dvec3 orbit (0.0, 3.0e7, 0.0);   // 30 000 km up
-    const glm::dvec3 ground(0.0, 1.7,   0.0);   // eye height
+    const glm::dvec3 orbit(0.0, 3.0e7, 0.0);   // 30 000 km up
 
     // GREEN: with the backstop present, orbit traces NO terrain. The analytic
     // body carries the whole disc and every chunk is a sub-pixel stand-in.
-    const std::set<ChunkKey> orbit_culled = converge_desired(orbit, kBackstopRadius);
+    const std::set<ChunkKey> orbit_culled =
+        ConvergeDesiredAt(field, site, orbit, kBackstopRadius);
     CHECK(orbit_culled.empty());
 
     // RED control: the cull is load-bearing, not vacuous. backstop_radius_m 0
     // disables it (no backstop to fall back onto), and the SAME orbital camera
     // then keeps the coarse cover it traced before this fix.
-    const std::set<ChunkKey> orbit_uncts = converge_desired(orbit, 0.0);
+    const std::set<ChunkKey> orbit_uncts = ConvergeDesiredAt(field, site, orbit, 0.0);
     CHECK(orbit_uncts.size() >= 6u);
+}
 
-    // At the surface the cover is full AND the cull changes nothing: a ground
-    // camera's terrain stands kilometres in front of the backstop across a
-    // 600 km horizon, so nothing is a sub-pixel stand-in and the desired set
-    // is identical whether or not the backstop is there to fall back onto.
-    const std::set<ChunkKey> ground_culled = converge_desired(ground, kBackstopRadius);
-    const std::set<ChunkKey> ground_uncts  = converge_desired(ground, 0.0);
+TEST_CASE("#326: the cull never bites at the surface"
+          * doctest::test_suite("exhaustive")) {
+    // EXHAUSTIVE: two full convergences at level 9 under a ground camera. A
+    // ground camera's terrain stands kilometres in front of the backstop across
+    // a 600 km horizon, so nothing is a sub-pixel stand-in and the desired set
+    // must be identical whether or not the backstop is there to fall back onto.
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    const glm::dvec3 ground(0.0, 1.7, 0.0);    // eye height
+
+    const std::set<ChunkKey> ground_culled =
+        ConvergeDesiredAt(field, site, ground, kBackstopRadius);
+    const std::set<ChunkKey> ground_uncts = ConvergeDesiredAt(field, site, ground, 0.0);
     CHECK(ground_culled.size() > 6u);          // refined well past the six roots
     CHECK(ground_culled == ground_uncts);      // the cull never bites at the surface
 }
@@ -1737,10 +1767,13 @@ LodParams FixedPointParams() {
 TEST_CASE("the converged set does not depend on the bake schedule"
           * doctest::test_suite("exhaustive")) {
     // EXHAUSTIVE: ten full convergences (a reference plus 3 batch sizes x 3
-    // seeds) -- the "do the same check at every schedule" sweep. The #284
-    // schedule-independence it proves is guarded per-PR, cheaply, by "the
-    // barrier reaches the same fixed point at any worker count" (1 vs 8 workers
-    // finish a round in different orders and must still agree bit-for-bit).
+    // seeds) -- the "do the same check at every schedule" sweep. Its per-PR
+    // guard is "no converged leaf still wants to split" below: ONE ragged
+    // schedule, checked against the split rule itself rather than against a
+    // reference run. NOT "the barrier reaches the same fixed point at any worker
+    // count" -- that case drains the whole round before every Select(), which is
+    // exactly the smooth schedule the note above says cannot expose #284,
+    // whatever the worker count.
     ElevationField field = MakeProceduralField(1500.0, 20000.0);
     const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
     const LodParams p = FixedPointParams();
@@ -1762,11 +1795,12 @@ TEST_CASE("the converged set does not depend on the bake schedule"
     }
 }
 
-TEST_CASE("no converged leaf still wants to split"
-          * doctest::test_suite("exhaustive")) {
-    // EXHAUSTIVE: builds a converged level-9 tree and re-bakes every leaf. The
-    // same #284 fixed-point property stated as a rule; its per-PR guard is "the
-    // barrier reaches the same fixed point at any worker count".
+TEST_CASE("no converged leaf still wants to split") {
+    // PER-PR: the one ragged-schedule convergence that stays in the core, and
+    // the per-PR sentinel for #284. It is a single level-9 settle under a
+    // shuffled 16-per-round arrival order plus one re-bake per leaf -- an order
+    // of magnitude cheaper than the 3x3 sweep above -- and it is the ragged
+    // arrival, not the bake count, that reproduces what the worker pool does.
     // The same property stated as a rule rather than as a comparison, so it
     // survives a change to the camera or to tau that would move the
     // reference set. Every leaf below max_level must be at or beyond its own

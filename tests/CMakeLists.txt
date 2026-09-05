@@ -422,16 +422,21 @@ target_compile_definitions(pt_sky_units PRIVATE
 #   * pt_planet_terrain -- everything OUTSIDE the "exhaustive" suite: every
 #     acceptance-criterion claim (watertightness at representative levels,
 #     async==sync bake determinism, the LOD sub-pixel + hysteresis numbers, the
-#     #304 level-consistency, the finiteBits guard) plus the fast unit tests. No
-#     label, so it is in the default per-PR set (build.yml's `-LE golden`).
+#     #304 level-consistency, the finiteBits guard), the fast unit tests, and
+#     the two convergence cases that are the ONLY per-PR sentinels for their
+#     bugs -- the ragged-schedule fixed point (#284) and the from-orbit cull
+#     wiring (#326); see the file header. No label, so it is in the default
+#     per-PR set (build.yml's `-LE "golden|nightly"`).
 #
-#   * pt_planet_terrain_exhaustive -- ONLY the "exhaustive" suite: the nine
-#     cases that drive the residency selector to full convergence, baking
-#     thousands of chunks apiece (~90% of the old wall time). LABELS "nightly"
-#     so the per-PR run excludes it (build.yml uses `-LE "golden|nightly"`) and
-#     the scheduled Nightly workflow selects it (`ctest -L nightly`). It is
-#     COVERAGE, not new claims -- every number it exercises is also asserted by
-#     a fast core case -- so keeping it off the PR path weakens no PR gate.
+#   * pt_planet_terrain_exhaustive -- ONLY the "exhaustive" suite: the eight
+#     cases that drive the residency selector to full convergence at level 9,
+#     baking hundreds to thousands of chunks apiece (~75% of the old wall
+#     time). LABELS "nightly" so build.yml's per-PR step excludes it
+#     (`-LE "golden|nightly"`) and its scheduled nightly step selects it
+#     (`ctest -L nightly`); linux-sanitizers.yml deliberately runs it per-PR,
+#     see the comment there. It is COVERAGE, not new claims -- every number it
+#     exercises is also asserted by a fast core case -- so keeping it off the
+#     PR path weakens no PR gate.
 #
 # WHY SPLIT, not raise the budget or trim the sweep. The combined test went
 # 180 -> 600 s once already (#322 -O2-in-Debug for the field TUs; #307
@@ -458,29 +463,47 @@ else()
     target_compile_options(pt_planet_terrain PRIVATE $<$<CONFIG:Release>:/fp:fast>)
 endif()
 
-# CORE (per-PR): exclude the "exhaustive" suite. TIMEOUT 180 -- measured ~13 s
-# on an M4 Max (-O2 Debug) and comfortably under a minute on the several-times-
-# slower shared runner, so unlike the combined test this never approaches its
-# budget. It still asserts determinism, watertightness, the LOD/hysteresis
-# numbers and the #304 level-consistency; a field bug fails it fast.
+# CORE (per-PR): exclude the "exhaustive" suite. TIMEOUT 300, measured on the
+# toolchain CI actually uses, not estimated from the M4 Max: MSVC win-debug
+# (/O2 field TUs, /Od test TU with checked iterators) on a desktop 2026-09-05
+# ran the core in ~55 s, of which "hysteresis stops a chunk oscillating" is
+# ~34 s and "no converged leaf still wants to split" ~12 s. windows-latest was
+# 1.2x slower than that box on 2026-09-03 (the combined test: 560 s there vs
+# 462 s here) and ~2.3x slower on 2026-09-04 (pt_planet_residency 111 -> 261 s
+# on the same code), so the core lands at ~65-130 s on the runner. 300 is
+# ~2.3x the bad day. It still asserts determinism, watertightness, the
+# LOD/hysteresis numbers, the #304 level-consistency, the #284 ragged-schedule
+# fixed point and the #326 cull wiring; a field bug fails it fast.
 add_test(
     NAME    pt_planet_terrain
     COMMAND pt_planet_terrain --test-suite-exclude=exhaustive
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 180)
+set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 300)
 
 # EXHAUSTIVE (nightly): the same binary, opposite filter. The "nightly" label
-# is what build.yml's per-PR `-LE "golden|nightly"` excludes and the Nightly
-# workflow's `-L nightly` step selects; "planetary" mirrors pt_planet_residency.
-# TIMEOUT 900 -- ~96 s on an M4 Max, several times that on the runner, but a
-# nightly job has the room and a generous backstop costs nothing there.
+# is what build.yml's per-PR `-LE "golden|nightly"` excludes and its nightly
+# `-L nightly` step selects; "planetary" mirrors pt_planet_residency.
+# TIMEOUT 1800. Measured, same toolchain and box as the core above: ~407 s
+# in MSVC win-debug (the surface half of #326 alone is ~200 s, the 3x3
+# schedule sweep ~80 s), which is ~490 s on the runner's good day and up to
+# ~950-1100 s on its bad day -- over the 900 s a "~96 s on an M4 Max, several
+# times that" estimate would have given it. A nightly job has the room and a
+# generous backstop costs nothing there; a timeout here would have blocked
+# the nightly release for a runner's bad day, not a bug.
+#
+# FAIL_REGULAR_EXPRESSION: doctest exits 0 when a suite filter matches no
+# cases and prints "test cases: 0 |". If every `test_suite("exhaustive")` tag
+# were ever removed or renamed, this registration would go green while
+# running nothing; the regex turns that into a failure. Belt to the
+# `--no-tests=error` braces on the ctest invocation in build.yml.
 add_test(
     NAME    pt_planet_terrain_exhaustive
     COMMAND pt_planet_terrain --test-suite=exhaustive
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(pt_planet_terrain_exhaustive PROPERTIES
-    TIMEOUT 900
-    LABELS  "nightly;planetary")
+    TIMEOUT 1800
+    LABELS  "nightly;planetary"
+    FAIL_REGULAR_EXPRESSION "test cases:[ ]*0 \\|")
 
 # --- pt_planet_residency (paced terrain streaming) -------------------------
 # Chunk residency on the PACED streaming path.
