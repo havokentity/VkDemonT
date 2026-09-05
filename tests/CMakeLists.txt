@@ -390,6 +390,12 @@ endif()
 pt_add_test(pt_sky_units
     pt_sky_units_test.cpp
     LINK_TARGETS pt_renderer)
+# TIMEOUT 180, not the 60 s default: building Hillaire's multiple-scattering
+# table on the CPU in Debug took 39 s on windows-latest on 2026-09-03 (main,
+# green) and 61.24 s -- a timeout -- on 2026-09-04 on the same code. The 60 s
+# backstop was already inside the runner's day-to-day variance; 180 is 3x the
+# worst measurement and still catches a hang.
+set_tests_properties(pt_sky_units PROPERTIES TIMEOUT 180)
 target_compile_definitions(pt_sky_units PRIVATE
     PT_SHADER_MATH_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTraceMath.slang"
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
@@ -526,15 +532,19 @@ set_tests_properties(pt_planet_terrain_exhaustive PROPERTIES
 # CPU set arithmetic over quadtree keys -- so a second backend would
 # re-measure the same thing at the cost of a GPU-contended CI cell.
 #
-# TIMEOUT 300: the flight is 180 ticks with a 4 ms frame emulation and a
+# TIMEOUT 600: the flight is 180 ticks with a 4 ms frame emulation and a
 # software BLAS build per admitted chunk; measured well under a minute on an
-# M4 Max, and CI runners are slower at BVH builds by a wide margin.
+# M4 Max, and CI runners are slower at BVH builds by a wide margin -- AND
+# noisy: the same test took 111 s on windows-latest on 2026-09-03 (main,
+# green) and 261 s on 2026-09-04 (PR, same code), a 2.3x swing on a 300 s
+# budget. 600 is 2.3x the worst measurement; the budget is a backstop for a
+# hang, not a performance assertion, so the slack costs nothing on a good day.
 if(WIN32)
     pt_add_test(pt_planet_residency
         pt_planet_residency_test.cpp
         LINK_TARGETS pt_engine pt_rhi)
     set_tests_properties(pt_planet_residency PROPERTIES
-        TIMEOUT          300
+        TIMEOUT          600
         SKIP_RETURN_CODE 125
         LABELS           "planetary;residency")
 endif()
