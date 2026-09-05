@@ -4108,19 +4108,25 @@ float3 starsOnly(float3 rd, float3 sun) {
 //     BLUE first, leaving RED with headroom, so a broadband star pokes through
 //     as a warm dot even while it is a small fraction of the sky's luminance.
 // The remedy is a CONTRAST attenuation, not a brightness flag: a point source is
-// detectable only when its luminance beats the veiling sky background by more
-// than the eye/sensor's threshold contrast, and the detection index of a point
-// source against a luminous background grows with the SQUARE of that contrast
-// (Rose 1948; Rose-de Vries / ideal-observer, shot-noise-limited detection).
-// Rose gives the FORM, not a value. starsPhysical() scales the star by
-//     vis = ls^2 / (ls^2 + (K * lk)^2),   ls = luma(star*T), lk = luma(sky)
-// photopic Rec.709 luma, K = kStarVeilK (see starsPhysical() below for what K is
-// and why it is NOT parameter-free -- it is a veiling factor that balances a
-// deliberate rendering choice, tracked for removal by issue #338). vis tends to
-// 1 as the sky in-scatter tends to 0 (space AND ground night: stars full,
-// unchanged, for ANY K) and to 0 as the sky brightens (daylight: stars drowned).
-// It is applied to all channels off the LUMINANCE contrast (not per channel)
-// precisely so the warm dot on the bright blue sky is pulled down with the rest.
+// seen only when its luminance beats the veiling sky background by more than the
+// observer's threshold contrast. In the photopic (daylit) regime that threshold
+// is approximately a CONSTANT Weber contrast dL/L -- Blackwell 1946 (JOSA 36,
+// 624) measures ~1-3% for small targets at high background luminance -- so the
+// criterion is the ratio ls/lk against a fixed contrast, and starsPhysical()
+// scales the star by the order-2 soft threshold (Hill / Naka-Rushton form)
+//     vis = C^2 / (C^2 + K^2),   C = ls / lk,   ls = luma(star*T), lk = luma(sky)
+// photopic Rec.709 luma, K = kStarVeilK the threshold contrast in RASTER units
+// (see starsPhysical() below for what K is and why it is NOT parameter-free --
+// it is a veiling factor that balances a deliberate rendering choice, tracked
+// for removal by issue #338). The order 2 is a smoothness choice -- C^1 at
+// C = 0, no kink where a star fades in -- not a derived exponent. What this is
+// NOT: Rose (1948)'s shot-noise-limited law B C^2 alpha^2 = const, under which
+// the threshold contrast FALLS as 1/sqrt(B); that is the photon-starved
+// (scotopic) regime and is not modelled here. vis tends to 1 as the sky
+// in-scatter tends to 0 (space AND ground night: stars full, unchanged, for ANY
+// K) and to 0 as the sky brightens (daylight: stars drowned). It is applied to
+// all channels off the LUMINANCE contrast (not per channel) precisely so the
+// warm dot on the bright blue sky is pulled down with the rest.
 //
 // starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
 // kept a separate function (rather than sharing starsOnly's body) so modes
@@ -6893,9 +6899,10 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 // sun-specific; the name is historical.
 //
 // `sky_inscatter` is the skyPhysical() radiance skyColor() already computed for
-// this ray (passed in rather than recomputed). vis is the squared-contrast
-// detectability of the star against the veiling sky (Rose 1948) -- 1 where the
-// sky is dark, ->0 where it is bright.
+// this ray (passed in rather than recomputed). vis is the order-2 soft Weber-
+// contrast threshold of the star against the veiling sky (the form, and what it
+// is not, are derived at starsRadianceRaw()) -- 1 where the sky is dark, ->0
+// where it is bright.
 //
 // kStarVeilK is a TUNED veiling factor, not a derived or parameter-free constant.
 // It exists to balance a DELIBERATE rendering choice against daytime contrast:
@@ -6919,10 +6926,14 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 // through twilight; 8 buries Sirius at noon (brightest daytime star +60 -> +0
 // sensor levels) while letting stars return by nautical/astronomical twilight as
 // the in-scatter falls. See starsRadianceRaw() for the surrounding rationale.
-// The max() below is a 0/0 NaN guard: it covers the ls = lk = 0 case, which the
-// s <= 0 early-out does NOT exclude (a star with s > 0 whose extinction T -> 0
-// against a dark sky gives ls -> 0, lk = 0). It is a divide guard, not a tuning
-// constant.
+//
+// fp32 FORM. Both luminances are normalised by the larger of the two before
+// the ratio is formed, so the denominator lies in [1, 2]: no 0/0 when a star
+// with s > 0 is extincted to ls = 0 against a dark sky (T -> 0 at the limb,
+// lk = 0 -- a case the s <= 0 early-out does NOT exclude), no overflow when
+// lk/ls is huge, and no epsilon. ls = 0 has nothing to veil and returns black,
+// which is what star * vis would be anyway. lk = 0 gives a = 1, b = 0 and
+// vis = 1 EXACTLY, which is the K-independence of night and space stated above.
 static const float kStarVeilK = 8.0;
 float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
     float3 s = starsRadianceRaw(ro, rd);
@@ -6930,7 +6941,11 @@ float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
     float3 star = s * sunSlantTransmittance(ro, rd);
     float ls = dot(star,         float3(0.2126, 0.7152, 0.0722));
     float lk = dot(sky_inscatter, float3(0.2126, 0.7152, 0.0722)) * kStarVeilK;
-    float vis = (ls * ls) / max(ls * ls + lk * lk, 1.0e-30);
+    if (!(ls > 0.0)) return float3(0.0);    // fully extinct: nothing to veil
+    float m = max(ls, lk);                  // > 0 because ls > 0
+    float a = ls / m;                       // in (0, 1]
+    float b = lk / m;                       // in [0, 1]; one of a, b is exactly 1
+    float vis = (a * a) / (a * a + b * b);  // denominator in [1, 2]
     return star * vis;
 }
 // --- end Planetary P6 physical sky ------------------------------------------

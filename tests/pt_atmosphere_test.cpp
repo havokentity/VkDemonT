@@ -1726,6 +1726,17 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(countOf(pt, "if(star_visible&&exposure_pad.z>0.5&&day<0.6){") == 1u);
     CHECK(countOf(pt, "}elseif(star_visible&&exposure_pad.y>0.5&&day<0.6){") == 1u);
     CHECK(countOf(pt, "cosTheta>-0.05&&exposure_pad") == 0u);
+    // ...and the behaviour #333 is about, not just its gate geometry: the
+    // physical mode composes the EXTINCTED star term from the ray's own
+    // origin; skyColor() no longer composes the day-faded starsOnly() onto
+    // any of its mode branches (procSky's own mode-2 injection is a different
+    // call, `sky += starsOnly(rd, sun)`, and is untouched); and the (1 - day)
+    // fade multiplies exactly twice -- both inside starsOnly() -- so a fade
+    // cannot creep back into starsRadianceRaw() unnoticed.
+    CHECK(countOf(pt, "+starsPhysical(ro,rd,sky)") == 1u);
+    CHECK(countOf(pt, "float3star=s*sunSlantTransmittance(ro,rd);") == 1u);
+    CHECK(countOf(pt, "+starsOnly(rd,sun_and_mode.xyz)") == 0u);
+    CHECK(countOf(pt, "*(1.0-day);") == 2u);
     const std::string sc = tighten(PT_SHADER_STARSCOMPOSITE_PATH);
     REQUIRE_FALSE(sc.empty());
     CHECK(countOf(sc, "boolstarRayHitsBody(float3rd){") == 1u);
