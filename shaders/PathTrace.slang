@@ -7850,7 +7850,72 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // RGBA16F write per pixel per frame on non-AOV
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
-            albedo_tex[tid] = float4(hit_albedo, 0.0);
+            // .rgb = raw primary-hit albedo. .a = camera->surface
+            // atmospheric transmittance, the aerial-perspective term of
+            // the SVGF demodulation guide (DenoiseTemporal.slang
+            // `demodGuide`). This replaces the MetalFX-era albedo FLOOR
+            // that lived here: that floor was gated on the MetalFX
+            // specular G-buffer, which no Vulkan denoiser kind allocates,
+            // so on this tree it never ran.
+            //
+            // THE DEFECT. SVGF demodulates on the model C = A * E
+            // (radiance = albedo x incident lighting) and divides
+            // denoise_color by the albedo. On a planet the primary-hit
+            // radiance is
+            //     C = T * A * E + S
+            // with T the air's transmittance over the camera->hit segment
+            // (`radiance *= trans_atm_surf` after the bounce loop) and S
+            // the additive in-scatter march + HDRI haze, neither of which
+            // scales with A. C / A = T*E + S/A, and on a dark, spectrally
+            // skewed surface (MODIS ocean ~0.06 blue-skewed, forest
+            // 0.05-0.15) S/A is tens of times the physical radiance with
+            // the albedo's per-channel ratio INVERTED. The a-trous taps and
+            // the 2x2 history fetch are depth/normal-gated, not albedo-
+            // gated, so that signal blends into neighbours and reprojected
+            // history of a DIFFERENT albedo and is then re-multiplied by
+            // the centre albedo -- exact only when every blended sample
+            // shares it. The residue is the magenta / green band over
+            // distant water and ridges at a low sun. (The ocean shell
+            // writes albedo 1.0 and is never the dark side of that seam;
+            // the P3 body / land cover / rock ramp are.)
+            //
+            // THE GUIDE. Aerial perspective replaces a fraction (1 - T) of
+            // the surface radiance with sky-coloured in-scatter, and sky
+            // pixels are already demodulated with unit albedo (the
+            // float3(0) sentinel bypass). So the guide is the same blend:
+            //     G = T * A + (1 - T)
+            // Writing S = (1 - T) * L (L = the haze source radiance),
+            // C / G is a positive-weighted mean of E and L, so it is
+            // bounded by max(E, L) per channel for EVERY A in [0, 1] and
+            // EVERY T in [0, 1] -- no tuned constant -- and G = A exactly
+            // when T = 1. atmosphericTransmittance returns float3(1) when
+            // all three species scales are zero, so scenes without an
+            // atmosphere are bit-identical to before this write existed.
+            //
+            // ONE SCALAR. .rgb must stay the raw albedo: RestirFinal shades
+            // with it, and OptiX takes it as its albedo guide (the
+            // programming guide: "the fourth channel of this buffer is
+            // ignored"). So the guide is assembled in the denoiser from T
+            // stored here in .a. T is per channel (Rayleigh: T.b < T.g <
+            // T.r); the MIN is stored, because with Tm = min(T),
+            //     Tm*A_c + (1 - Tm) >= T_c*A_c + (1 - T_c)   for A_c <= 1
+            // in every channel c -- the guide never UNDER-states the hazed
+            // fraction, which is the blow-up direction. The cost is a mild
+            // under-demodulation of red on hazy pixels, bounded by
+            // (1 - T.b) / (1 - T.r).
+            //
+            // Sky / miss: .rgb stays the float3(0) sentinel the kernels
+            // key on; .a is written 0 and is not read for those pixels.
+            // Cost: one 8-step optical-depth integral per pixel per frame
+            // while a denoiser is active (the shading pass runs the same
+            // integral per sample); the no-medium early-out makes it free
+            // everywhere else.
+            float guide_trans = 0.0;
+            if (h0.hit) {
+                float3 T = atmosphericTransmittance(ro0, rd0, h0.t);
+                guide_trans = min(T.r, min(T.g, T.b));
+            }
+            albedo_tex[tid] = float4(hit_albedo, guide_trans);
         }
         // MetalFX specular-guidance G-buffers (issue #118). Three
         // textures fed to MTLFXTemporalDenoisedScaler so it can tell

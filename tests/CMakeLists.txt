@@ -574,6 +574,24 @@ target_compile_definitions(pt_planet_shader PRIVATE
     PT_PLANET_TERRAINCHUNK_H_PATH="${CMAKE_SOURCE_DIR}/src/renderer/Planet/TerrainChunk.h"
     PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
 
+# --- pt_denoise_demod_guide ------------------------------------------------
+# Host mirror of the SVGF demodulation-guide contract: the three Denoise
+# kernels must divide and multiply back by the SAME guide, G = T*A + (1-T)
+# with T (camera->surface atmospheric transmittance) carried in albedo_tex.a
+# by PathTrace.slang, and the raw albedo must stay in .rgb for RestirFinal.
+# Pinned as source-text counts because the software backend does not
+# execute the Slang and no Vulkan SVGF golden cell exists yet; the fourth
+# case pins the bound the guide is derived from (C / G stays within the
+# physical radiances for every albedo and transmittance; C / A does not).
+pt_add_test(pt_denoise_demod_guide
+    pt_denoise_demod_guide_test.cpp)
+target_compile_definitions(pt_denoise_demod_guide PRIVATE
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_DENOISE_TEMPORAL_PATH="${CMAKE_SOURCE_DIR}/shaders/DenoiseTemporal.slang"
+    PT_SHADER_DENOISE_ATROUS_PATH="${CMAKE_SOURCE_DIR}/shaders/DenoiseAtrous.slang"
+    PT_SHADER_DENOISE_REMOD_PATH="${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang"
+    PT_SHADER_RESTIR_FINAL_PATH="${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang")
+
 # --- pt_planet_albedo (issue #300, land cover) -----------------------------
 # The surface albedo raster, the two physical models that modulate it, and
 # the wire formats between the CPU sampler and the shader's.

@@ -119,10 +119,27 @@ bool isSkyAlbedo(float3 a) {
     return (a.r + a.g + a.b) <= kAlbedoSkyEps;
 }
 
+// Demodulation guide. albedo_tex.rgb is the raw primary-hit albedo A;
+// albedo_tex.a is the camera->surface atmospheric transmittance T
+// (min over RGB; 1 = clear air / no atmosphere), both written by
+// PathTrace.slang at the albedo G-buffer site, where the derivation
+// lives. The guide blends A toward the sky's unit albedo by the hazed
+// fraction, G = T * A + (1 - T): planet radiance is C = T*A*E + S with
+// S the additive in-scatter, so C / A = T*E + S/A blows up (and takes
+// the albedo's inverted per-channel ratio) on a dark skewed surface,
+// while C / G stays bounded by max(E, S/(1-T)) for every A and T. With
+// T = 1 the guide IS the albedo, so non-atmosphere scenes are
+// unchanged. Kept in lockstep with DenoiseAtrous.slang /
+// DenoiseRemod.slang -- the remod multiply must use the SAME guide the
+// divide used, or demod<->remod stops round-tripping.
+float3 demodGuide(float4 a) {
+    return lerp(float3(1.0), a.rgb, saturate(a.a));
+}
+
 // Read color_in[p] in (optionally) demodulated space. When demod is
-// on, divides by max(albedo_tex[p], kDemodEps) per channel so the
-// temporal blend operates on incident lighting rather than reflected
-// radiance. Sky pixels (albedo == 0) bypass demod -- the path
+// on, divides by max(demodGuide(albedo_tex[p]), kDemodEps) per channel
+// so the temporal blend operates on incident lighting rather than
+// reflected radiance. Sky pixels (albedo == 0) bypass demod -- the path
 // tracer's sky / celestials terms are emissive radiance, not
 // reflected radiance, so dividing by anything would corrupt the
 // signal and the remod multiply (by 0) would zero the sky entirely.
@@ -132,9 +149,9 @@ bool isSkyAlbedo(float3 a) {
 float3 readDemodColor(uint2 p) {
     float3 c = color_in[uint2(p)].rgb;
     if (demod_enabled != 0u) {
-        float3 a = albedo_tex[uint2(p)].rgb;
-        if (!isSkyAlbedo(a)) {
-            c /= max(a, float3(kDemodEps, kDemodEps, kDemodEps));
+        float4 a = albedo_tex[uint2(p)];
+        if (!isSkyAlbedo(a.rgb)) {
+            c /= max(demodGuide(a), float3(kDemodEps, kDemodEps, kDemodEps));
         }
     }
     return c;
