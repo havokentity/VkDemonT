@@ -40,7 +40,10 @@ on:
   push:
     branches: [ main, integration/parallel-batch-1 ]
   pull_request:
-    branches: [ main, integration/parallel-batch-1 ]
+    # No base-branch filter: stacked PRs (a PR whose base is another PR
+    # branch) must get CI too. `push` stays filtered to avoid building every
+    # topic-branch push; nightly-release / the exhaustive sweep are gated on
+    # event type below, so PR runs never tag or publish.
   workflow_dispatch:
 
 # Cancel in-flight runs for the same branch when a newer push lands.
