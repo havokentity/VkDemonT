@@ -338,15 +338,39 @@ const char* VkResultToString(VkResult r) {
     }
 }
 
-bool DeviceSupportsExtension(VkPhysicalDevice pd, const char* name) {
-    std::uint32_t n = 0;
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> props(n);
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, props.data());
-    for (auto& p : props) {
-        if (std::strcmp(p.extensionName, name) == 0) return true;
+// The physical device's extension list, enumerated once. The constructor
+// probes ~20 names (RT, mutable descriptors, the next-gen roadmap's
+// extensions); enumerating per probe was fine at four names but is
+// needless churn at twenty.
+class DeviceExtensionSet {
+public:
+    explicit DeviceExtensionSet(VkPhysicalDevice pd) {
+        std::uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+        props_.resize(n);
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, props_.data());
     }
-    return false;
+    bool Has(const char* name) const {
+        for (const auto& p : props_) {
+            if (std::strcmp(p.extensionName, name) == 0) return true;
+        }
+        return false;
+    }
+
+private:
+    std::vector<VkExtensionProperties> props_;
+};
+
+// "1.4.351"-style rendering of a VK_MAKE_API_VERSION value for the log.
+std::string ApiVersionString(std::uint32_t v) {
+    return fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v),
+                       VK_API_VERSION_PATCH(v));
+}
+
+// Core version with the patch field cleared, for comparisons against the
+// VK_API_VERSION_1_x constants (which carry patch 0).
+constexpr std::uint32_t CoreApiVersion(std::uint32_t v) {
+    return VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), 0);
 }
 
 }  // namespace
@@ -807,12 +831,34 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     height_ = nw.height;
 
     // ---- Instance ------------------------------------------------------
+    // Request the newest core version this loader offers, capped at 1.4 --
+    // the version whose promoted features (maintenance5/6, subgroup rotate)
+    // the next-gen roadmap's RT-pipeline step builds on
+    // (docs/NEXTGEN_PLAN.md, step 0). A loader older than 1.4 -- or SDK
+    // headers that predate 1.4 and so know neither the version constant nor
+    // VkPhysicalDeviceVulkan14Features -- gets the previous 1.3 request
+    // unchanged: 1.3 is the engine's floor (it chains
+    // VkPhysicalDeviceVulkan13Features). Since Vulkan 1.1 an instance may
+    // legally be created with an apiVersion above what the physical device
+    // implements; the effective version is the minimum of the two, resolved
+    // (and logged) once the device is picked below, and every version-gated
+    // feature struct keys off that effective value.
+    std::uint32_t loader_api = VK_API_VERSION_1_0;
+    vkEnumerateInstanceVersion(&loader_api);
+#if defined(VK_VERSION_1_4)
+    const std::uint32_t requested_api =
+        (CoreApiVersion(loader_api) >= VK_API_VERSION_1_4) ? VK_API_VERSION_1_4
+                                                           : VK_API_VERSION_1_3;
+#else
+    const std::uint32_t requested_api = VK_API_VERSION_1_3;
+#endif
+
     VkApplicationInfo ai{};
     ai.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     ai.pApplicationName = "DeMonT Engine";
     ai.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     ai.pEngineName      = "DeMonT";
-    ai.apiVersion       = VK_API_VERSION_1_3;
+    ai.apiVersion       = requested_api;
 
     std::uint32_t glfw_ext_n = 0;
     const char** glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_n);
@@ -888,6 +934,39 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     LOG_INFO("Vulkan device: {}", device_name_);
     LOG_INFO("  maxPushConstantsSize: {}", max_push_constant_size_);
 
+    // Effective core version = min(what we asked the loader for, what the
+    // device implements). Everything version-gated below (the 1.3 / 1.4
+    // promoted-feature structs) keys off this, never off requested_api.
+    const std::uint32_t device_api = CoreApiVersion(props.apiVersion);
+    api_version_ = std::min(requested_api, device_api);
+    const bool have_core_13 = api_version_ >= VK_API_VERSION_1_3;
+#if defined(VK_VERSION_1_4)
+    const bool have_core_14 = api_version_ >= VK_API_VERSION_1_4;
+#else
+    const bool have_core_14 = false;
+#endif
+    // VkPhysicalDeviceDriverProperties (core 1.2) carries the vendor's own
+    // version string ("616.56" on NVIDIA) -- the number a driver bug report
+    // is filed against, so it belongs in the startup log verbatim.
+    VkPhysicalDeviceDriverProperties driver_props{};
+    driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    if (device_api >= VK_API_VERSION_1_2) {
+        VkPhysicalDeviceProperties2 dp2{};
+        dp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        dp2.pNext = &driver_props;
+        vkGetPhysicalDeviceProperties2(phys_device_, &dp2);
+    }
+    LOG_INFO("Vulkan API: loader {} device {} driver '{}' {} -> requested {} effective {}",
+             ApiVersionString(loader_api), ApiVersionString(props.apiVersion),
+             driver_props.driverName, driver_props.driverInfo,
+             ApiVersionString(requested_api), ApiVersionString(api_version_));
+    if (!have_core_14) {
+        LOG_WARN("Vulkan: core 1.4 unavailable (loader {} / device {} / headers {}); the 1.4 "
+                 "promoted features stay off and the engine runs its 1.3 configuration",
+                 ApiVersionString(loader_api), ApiVersionString(props.apiVersion),
+                 ApiVersionString(VK_HEADER_VERSION_COMPLETE));
+    }
+
     // --- Per-pass GPU timestamps capability (#320) ------------------------
     // timestampComputeAndGraphics guarantees every compute/graphics queue
     // family reports a non-zero timestampValidBits; we still read the chosen
@@ -933,9 +1012,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // ---- Logical device ----------------------------------------------
     // Probe for the optional extensions first; we'll degrade to "no
     // hardware RT" if the driver lacks them (e.g. very old card).
-    bool has_ray_query        = DeviceSupportsExtension(phys_device_, VK_KHR_RAY_QUERY_EXTENSION_NAME);
-    bool has_accel_struct     = DeviceSupportsExtension(phys_device_, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-    bool has_deferred_host_op = DeviceSupportsExtension(phys_device_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    const DeviceExtensionSet phys_exts(phys_device_);
+    bool has_ray_query        = phys_exts.Has(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    bool has_accel_struct     = phys_exts.Has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    bool has_deferred_host_op = phys_exts.Has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
     // One-line log for the bringup gate so the cause of a missing RT
     // path is obvious in the console. On drivers without ray query /
@@ -954,6 +1034,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     v12_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     f2_supported.pNext = &v12_supported;
 
+    // The 1.3 / 1.4 promoted-feature structs may only be chained on a
+    // device that implements that core version.
+    VkPhysicalDeviceVulkan13Features v13_supported{};
+    v13_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+#if defined(VK_VERSION_1_4)
+    VkPhysicalDeviceVulkan14Features v14_supported{};
+    v14_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+#endif
+
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_supported{};
     as_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     VkPhysicalDeviceRayQueryFeaturesKHR rq_supported{};
@@ -964,6 +1053,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         *supported_next = node;
         supported_next = node_next;
     };
+    if (have_core_13) {
+        chain_supported(&v13_supported, reinterpret_cast<void**>(&v13_supported.pNext));
+    }
+#if defined(VK_VERSION_1_4)
+    if (have_core_14) {
+        chain_supported(&v14_supported, reinterpret_cast<void**>(&v14_supported.pNext));
+    }
+#endif
     if (rt_supported_) {
         chain_supported(&as_supported, reinterpret_cast<void**>(&as_supported.pNext));
         chain_supported(&rq_supported, reinterpret_cast<void**>(&rq_supported.pNext));
@@ -1051,8 +1148,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // stays acceleration-structure-only and the cloud kernels still fault --
     // a follow-up would re-slot those shaders instead).
     const bool supports_mutable_desc =
-        DeviceSupportsExtension(phys_device_,
-                                VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+        phys_exts.Has(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
     // Only load-bearing where binding 2 is the (typed) acceleration structure,
     // i.e. on hardware-RT builds; the norq layout omits binding 2 entirely.
     const bool use_mutable_binding2 = supports_mutable_desc && rt_supported_;
@@ -1116,8 +1212,82 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         (v12_supported.timelineSemaphore == VK_TRUE) ? VK_TRUE : VK_FALSE;
 #endif
 
+    // Core-1.2 layout relaxations the NRC library's SPIR-V declares
+    // (docs/NEXTGEN_PLAN.md section 4); enabling them only widens what the
+    // driver accepts, it changes nothing about the layouts today's shaders
+    // already use.
+    v12.scalarBlockLayout           = v12_supported.scalarBlockLayout;
+    v12.uniformBufferStandardLayout = v12_supported.uniformBufferStandardLayout;
+
+    // Core 1.3: the three docs/NEXTGEN_PLAN.md step 0 lists, set from the
+    // supported struct so an implementation lacking one leaves it off
+    // rather than failing vkCreateDevice.
+    //   maintenance4 -- SPIR-V LocalSizeId, relaxed interface matching
+    //                   between stages, and a VkPipelineLayout that may be
+    //                   destroyed as soon as the pipeline it built exists
+    //                   (multi-stage RT pipelines).
+    //   synchronization2 -- vkCmdPipelineBarrier2 / vkQueueSubmit2 with the
+    //                   64-bit VK_PIPELINE_STAGE_2_* masks; the 1.0 entry
+    //                   points the existing barriers use stay valid
+    //                   alongside, so nothing recorded today changes.
+    //   shaderDemoteToHelperInvocation -- governs
+    //                   OpDemoteToHelperInvocation, a fragment-stage
+    //                   construct no compute / RT stage uses: inert here,
+    //                   enabled only so a later module may declare it
+    //                   without another device-creation change.
     VkPhysicalDeviceVulkan13Features v13{};
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    v13.maintenance4                   = v13_supported.maintenance4;
+    v13.synchronization2               = v13_supported.synchronization2;
+    v13.shaderDemoteToHelperInvocation = v13_supported.shaderDemoteToHelperInvocation;
+
+    // Core 1.4, only when the effective version is 1.4: the pipeline
+    // plumbing and the subgroup ops the roadmap draws on.
+    //   maintenance5 -- VkPipelineCreateFlags2 / VkBufferUsageFlags2. It
+    //                   also pins vkGetDeviceProcAddr to NULL for functions
+    //                   of extensions that were not enabled (undefined
+    //                   before); checked: every proc the engine resolves is
+    //                   core or belongs to an extension it enabled.
+    //   maintenance6 -- vkCmdBindDescriptorSets2 / VkBindDescriptorSetsInfo,
+    //                   VK_NULL_HANDLE set layouts in a pipeline layout.
+    //   shaderSubgroupRotate(+Clustered) -- the wavefront-compaction passes
+    //                   of step 1's fallback.
+    // Everything else in VkPhysicalDeviceVulkan14Features is rasterisation
+    // plumbing (line styles, vertex divisors, dynamic-rendering local read,
+    // index-type uint8), hostImageCopy, pushDescriptor, or the robustness /
+    // protected-access pair: nothing on the roadmap needs them, so they
+    // stay off. Plain bools mirror what got set so the log line below needs
+    // no #ifdef of its own.
+    bool en_maintenance5 = false, en_maintenance6 = false, en_subgroup_rotate = false,
+         en_subgroup_rotate_clustered = false;
+#if defined(VK_VERSION_1_4)
+    VkPhysicalDeviceVulkan14Features v14{};
+    v14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+    if (have_core_14) {
+        v14.maintenance5                  = v14_supported.maintenance5;
+        v14.maintenance6                  = v14_supported.maintenance6;
+        v14.shaderSubgroupRotate          = v14_supported.shaderSubgroupRotate;
+        v14.shaderSubgroupRotateClustered = v14_supported.shaderSubgroupRotateClustered;
+    }
+    en_maintenance5              = v14.maintenance5 == VK_TRUE;
+    en_maintenance6              = v14.maintenance6 == VK_TRUE;
+    en_subgroup_rotate           = v14.shaderSubgroupRotate == VK_TRUE;
+    en_subgroup_rotate_clustered = v14.shaderSubgroupRotateClustered == VK_TRUE;
+#endif
+    // The core-feature side of what vkCreateDevice is about to be asked
+    // for, so a "feature not present" failure or a behaviour change is
+    // attributable from the startup log alone. Every field not named here
+    // is unchanged from before step 0.
+    LOG_INFO("Vulkan core features enabled: 1.2{{scalarBlockLayout={} "
+             "uniformBufferStandardLayout={} bufferDeviceAddress={} timelineSemaphore={}}} "
+             "1.3{{maintenance4={} synchronization2={} shaderDemoteToHelperInvocation={}}} "
+             "1.4{{maintenance5={} maintenance6={} shaderSubgroupRotate={} "
+             "shaderSubgroupRotateClustered={}}}",
+             v12.scalarBlockLayout == VK_TRUE, v12.uniformBufferStandardLayout == VK_TRUE,
+             v12.bufferDeviceAddress == VK_TRUE, v12.timelineSemaphore == VK_TRUE,
+             v13.maintenance4 == VK_TRUE, v13.synchronization2 == VK_TRUE,
+             v13.shaderDemoteToHelperInvocation == VK_TRUE, en_maintenance5, en_maintenance6,
+             en_subgroup_rotate, en_subgroup_rotate_clustered);
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feat{};
     as_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -1138,7 +1308,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         next_slot = node_next;
     };
     chain(&v12, reinterpret_cast<void**>(&v12.pNext));
-    chain(&v13, reinterpret_cast<void**>(&v13.pNext));
+    if (have_core_13) {
+        chain(&v13, reinterpret_cast<void**>(&v13.pNext));
+    }
+#if defined(VK_VERSION_1_4)
+    if (have_core_14) {
+        chain(&v14, reinterpret_cast<void**>(&v14.pNext));
+    }
+#endif
     if (rt_supported_) {
         chain(&as_feat, reinterpret_cast<void**>(&as_feat.pNext));
         chain(&rq_feat, reinterpret_cast<void**>(&rq_feat.pNext));

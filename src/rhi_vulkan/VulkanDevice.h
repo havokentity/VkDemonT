@@ -424,6 +424,10 @@ private:
     bool        device_lost_  = false;
     std::uint32_t frame_index_ = 0;
     std::uint32_t max_push_constant_size_ = 128;
+    // Effective core version = min(apiVersion requested from the loader,
+    // version the physical device implements). Every version-gated feature
+    // struct in the constructor keys off this.
+    std::uint32_t api_version_ = 0;
 
     // Core handles
     VkInstance              instance_      = VK_NULL_HANDLE;
