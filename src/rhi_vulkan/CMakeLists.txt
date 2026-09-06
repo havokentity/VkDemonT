@@ -161,6 +161,28 @@ foreach(_pt_probe_variant 0 1 2)
             MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
     endforeach()
 endforeach()
+# Diagnostic sub-variants of P1, -O2 only, to attribute its driver compile
+# time to one of the two things P1 adds over P0 (the numbers are in the
+# probe notes):
+#   p1a: the BSDF branches with transmittance() still stubbed to 1
+#        (PT_PROBE_NO_TRANSMITTANCE), i.e. P1 minus the shadow chain;
+#   p1b: full P1, but every transmittance() leg traces the TLAS alone
+#        instead of the five software tiers (PT_PROBE_SHADOW_TLAS_ONLY),
+#        i.e. P1 minus the tier code the inliner replicates per leg.
+# Neither renders the design's image; they exist to be compiled and timed.
+foreach(_pt_probe_diag "p1a;-DPT_PROBE_NO_TRANSMITTANCE=1" "p1b;-DPT_PROBE_SHADOW_TLAS_ONLY=1")
+    list(GET _pt_probe_diag 0 _pt_diag_name)
+    list(GET _pt_probe_diag 1 _pt_diag_define)
+    pt_compile_slang(
+        TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceRaygen.slang
+        STAGE raygeneration ENTRY main TARGETS spirv
+        VARIANT ${_pt_diag_name}_o2
+        OPT -O2 CAPABILITY ${_pt_rt_cap}
+        EXTRA_DEFINES -DPT_PROBE_VARIANT=1 -DPT_RT_HITOBJECT=0 ${_pt_diag_define}
+                      ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
+        EXTRA_DEPENDS ${_pt_raygen_deps}
+        MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
+endforeach()
 # The stub miss / closest-hit entries the probe pipeline links next to the
 # raygen (one file, two entry points, selected with ENTRY). Tiny, so -O2
 # costs nothing and matches what the design ships for every RT stage.

@@ -61,6 +61,10 @@ extern const unsigned char shader_PathTraceRaygen_p2_o0_spirv_data[];
 extern const unsigned long shader_PathTraceRaygen_p2_o0_spirv_size;
 extern const unsigned char shader_PathTraceRaygen_p2_o2_spirv_data[];
 extern const unsigned long shader_PathTraceRaygen_p2_o2_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p1a_o2_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p1a_o2_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p1b_o2_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p1b_o2_spirv_size;
 extern const unsigned char shader_PathTraceRtStubs_miss_spirv_data[];
 extern const unsigned long shader_PathTraceRtStubs_miss_spirv_size;
 extern const unsigned char shader_PathTraceRtStubs_chit_spirv_data[];
@@ -4080,6 +4084,10 @@ const RtKernelBlob* FindRtKernelBlob(std::string_view name) {
         { "pathtrace_rt_p1_o2", shader_PathTraceRaygen_p1_o2_spirv_data, shader_PathTraceRaygen_p1_o2_spirv_size },
         { "pathtrace_rt_p2_o0", shader_PathTraceRaygen_p2_o0_spirv_data, shader_PathTraceRaygen_p2_o0_spirv_size },
         { "pathtrace_rt_p2_o2", shader_PathTraceRaygen_p2_o2_spirv_data, shader_PathTraceRaygen_p2_o2_spirv_size },
+        // Diagnostic sub-variants of P1 (see the CMake record): which half
+        // of P1's additions the driver compile time comes from.
+        { "pathtrace_rt_p1a_o2", shader_PathTraceRaygen_p1a_o2_spirv_data, shader_PathTraceRaygen_p1a_o2_spirv_size },
+        { "pathtrace_rt_p1b_o2", shader_PathTraceRaygen_p1b_o2_spirv_data, shader_PathTraceRaygen_p1b_o2_spirv_size },
         { "pathtrace_rt_miss",  shader_PathTraceRtStubs_miss_spirv_data,  shader_PathTraceRtStubs_miss_spirv_size },
         { "pathtrace_rt_chit",  shader_PathTraceRtStubs_chit_spirv_data,  shader_PathTraceRtStubs_chit_spirv_size },
     };
@@ -4200,6 +4208,18 @@ PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDe
     // RayQuery, design R3), so one level of recursion is the whole pipeline.
     ci.maxPipelineRayRecursionDepth = 1;
     ci.layout                       = shared_pipe_layout_;
+    // The stack size is set per launch (vkCmdSetRayTracingPipelineStackSizeKHR
+    // in TraceRays), which is only legal when the pipeline declares it
+    // dynamic: VUID-vkCmdTraceRaysKHR-None-08608 otherwise. Declared only
+    // when both the query and the set entry points exist, since the launch
+    // leaves the driver default in place without them.
+    const bool dynamic_stack = pfn_GetRtGroupStackSize_ != nullptr && pfn_CmdSetRtStackSize_ != nullptr;
+    const VkDynamicState kDynamicStack = VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR;
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 1;
+    dyn.pDynamicStates    = &kDynamicStack;
+    ci.pDynamicState      = dynamic_stack ? &dyn : nullptr;
 
     // THE MEASUREMENT (design section 10, R1): wall time of the driver
     // compile, logged in seconds. The 120 s abort criterion is applied by
@@ -4265,9 +4285,9 @@ PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDe
     entry.pipeline = pipe;
 
     // Stack size: raygen + max(miss, closest-hit). vkCmdSetRayTracingPipeline
-    // StackSizeKHR is optional; when the query is missing the driver's own
-    // default stays in force (stack_size 0).
-    if (pfn_GetRtGroupStackSize_ != nullptr) {
+    // StackSizeKHR is optional; without the dynamic state above the driver's
+    // own default stays in force (stack_size 0).
+    if (dynamic_stack) {
         const VkDeviceSize rg_stack = pfn_GetRtGroupStackSize_(
             device_, pipe, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR);
         const VkDeviceSize miss_stack = pfn_GetRtGroupStackSize_(

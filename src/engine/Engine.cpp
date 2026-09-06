@@ -422,7 +422,10 @@ namespace cvar {
             "Step 1 probe raygen variant under r_pt_pipeline rt: p0 (loop "
             "skeleton + hardware trace + Lambert only) | p1 (p0 + every BSDF "
             "branch + transmittance) | p2 (the full kernel). See "
-            "docs/STEP1_RT_PIPELINE_DESIGN.md section 1.", 0);
+            "docs/STEP1_RT_PIPELINE_DESIGN.md section 1. p1a / p1b (o2 only) are "
+            "compile-time diagnostics of p1 -- BSDF branches without the shadow "
+            "chain, and the shadow chain against the TLAS alone -- and do not "
+            "render the design's image.", 0);
     PT_CVAR(r_pt_rt_opt, "o2",
             "Step 1 probe raygen slangc optimisation level under r_pt_pipeline "
             "rt: o0 | o2. The compute kernel is always -O0 (cmake/Slang.cmake); "

@@ -61,6 +61,17 @@
 #ifndef PT_PROBE_VARIANT
 #define PT_PROBE_VARIANT 2
 #endif
+// Diagnostic sub-variants of P1 (src/rhi_vulkan/CMakeLists.txt), raygen
+// build only: NO_TRANSMITTANCE keeps transmittance() at the P0 stub with
+// the BSDF branches on; SHADOW_TLAS_ONLY keeps transmittance() but traces
+// each of its legs against the TLAS alone, without the software tiers.
+// Both are 0 in every build that renders an image.
+#ifndef PT_PROBE_NO_TRANSMITTANCE
+#define PT_PROBE_NO_TRANSMITTANCE 0
+#endif
+#ifndef PT_PROBE_SHADOW_TLAS_ONLY
+#define PT_PROBE_SHADOW_TLAS_ONLY 0
+#endif
 #if PT_RT_PIPELINE
 #include "PathTraceRtPayload.slang"
 #endif
@@ -3404,6 +3415,34 @@ PtHwHit ptTraceHardware(RayDesc r) {
 #endif
     return hw;
 }
+
+#if PT_PROBE_SHADOW_TLAS_ONLY
+// p1b diagnostic only: a transmittance() leg against the TLAS alone. The
+// hit is reported as an opaque Lambert surface so the caller's refraction
+// chain never continues; only hit / t are meaningful.
+HitInfo ptTraceTlasOnlyOpaque(float3 ro, float3 rd, PtRayCone cone) {
+    HitInfo h;
+    h.hit = false; h.t = 1e30; h.mat = MAT_LAMBERT; h.normal = float3(0.0, 1.0, 0.0);
+    h.albedo = float3(0.0); h.emission = float3(0.0); h.roughness = 1.0; h.ior = 1.0;
+    h.prim_id = 0u; h.uv = float2(0.0); h.uv_scale = 0.0; h.tex_tiles = uint4(0u);
+    h.mat_ext = 0u;
+    if (tlas_present != 0u) {
+        RayDesc r;
+        r.Origin    = ro;
+        r.Direction = rd;
+        r.TMin      = ptRayTMin(ro, cone);
+        r.TMax      = h.t;
+        RayQuery<RAY_FLAG_NONE> q;
+        q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, r);
+        while (q.Proceed()) {}
+        if (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT) {
+            h.hit = true;
+            h.t   = q.CommittedRayT();
+        }
+    }
+    return h;
+}
+#endif  // PT_PROBE_SHADOW_TLAS_ONLY
 #endif  // PT_RT_PIPELINE
 
 // `cone` is the ray cone at THIS ray's origin (issue #256).  It is the
@@ -7309,10 +7348,11 @@ float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
 // dielectric and moved a long way from where it started.
 float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
                      PtRayCone cone, uint start_medium = 0u) {
-#if PT_PROBE_VARIANT < 1
+#if PT_PROBE_VARIANT < 1 || PT_PROBE_NO_TRANSMITTANCE
     // P0 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 1): the shadow /
     // transmittance chain is stubbed to "unoccluded" so P0 measures the
-    // loop skeleton + hardware trace + Lambert alone. P1 restores the body.
+    // loop skeleton + hardware trace + Lambert alone. P1 restores the body
+    // (the p1a diagnostic keeps this stub with P1's BSDF branches).
     return float3(1.0);
 #else
     // Cloud optical depth along the original (un-refracted) ray. Real
@@ -7347,7 +7387,13 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
     uint sr_medium = start_medium;
 #endif
     for (int i = 0; i <= kMaxRefract; ++i) {
+#if PT_RT_PIPELINE && PT_PROBE_SHADOW_TLAS_ONLY
+        // p1b diagnostic: the leg sees TLAS triangles only, as opaque
+        // Lambert, so the five software tiers are not inlined per leg.
+        HitInfo h = ptTraceTlasOnlyOpaque(o, d, c);
+#else
         HitInfo h = traceScene(o, d, shutter_t01, c);
+#endif
 #if PT_WATER_ENABLED
         // Absorb along however much of this segment lies in water --
         // up to the hit, or up to t_max on the final unoccluded leg.
