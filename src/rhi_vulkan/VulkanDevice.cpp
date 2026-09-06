@@ -1026,6 +1026,137 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     LOG_INFO("Vulkan RT extension presence: ray_query={} accel_struct={} deferred_host_op={} -> hw_rt={}",
              has_ray_query, has_accel_struct, has_deferred_host_op, rt_supported_);
 
+    // ---- Next-gen capability probe (docs/NEXTGEN_PLAN.md, step 0) ---------
+    // Presence of every extension the roadmap's later steps depend on, plus
+    // the properties those steps size their data structures from. Each
+    // struct is guarded by its extension's spec macro so the tree still
+    // compiles against an SDK that predates it, and is chained only when
+    // the driver exposes the extension (the validation layers flag feature/
+    // property structs from unexposed extensions). Presence here is
+    // diagnostic; what actually gets ENABLED is decided further down, and
+    // is deliberately the low-risk subset -- cluster / partitioned
+    // acceleration structures and the cooperative vector/matrix family stay
+    // query-only until the step that uses them lands.
+    bool has_rt_pipeline = false, has_pipeline_library = false, has_rt_maint1 = false,
+         has_ser_ext = false, has_ser_nv = false, has_pos_fetch = false, has_sucf = false,
+         has_clas = false, has_ptlas = false, has_coopvec = false, has_coopmat = false,
+         has_coopmat2 = false, has_fp8 = false, has_bf16 = false, has_omm = false;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    has_rt_pipeline = phys_exts.Has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_pipeline_library)
+    has_pipeline_library = phys_exts.Has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    has_rt_maint1 = phys_exts.Has(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    has_ser_ext = phys_exts.Has(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    has_ser_nv = phys_exts.Has(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    has_pos_fetch = phys_exts.Has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    has_sucf = phys_exts.Has(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    has_clas = phys_exts.Has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    has_ptlas = phys_exts.Has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cooperative_vector)
+    has_coopvec = phys_exts.Has(VK_NV_COOPERATIVE_VECTOR_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    has_coopmat = phys_exts.Has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    has_coopmat2 = phys_exts.Has(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_shader_float8)
+    has_fp8 = phys_exts.Has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    has_bf16 = phys_exts.Has(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    has_omm = phys_exts.Has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+#endif
+    // The RT-pipeline family layers on VK_KHR_acceleration_structure, so it
+    // is only meaningful (and only enabled below) on a hardware-RT device.
+    has_rt_pipeline = has_rt_pipeline && rt_supported_;
+    has_rt_maint1   = has_rt_maint1 && rt_supported_;
+    has_pos_fetch   = has_pos_fetch && rt_supported_;
+    has_ser_ext     = has_ser_ext && has_rt_pipeline;   // requires VK_KHR_ray_tracing_pipeline
+    has_ser_nv      = has_ser_nv && has_rt_pipeline;
+
+    // Properties. Plain locals are filled from the guarded structs so the
+    // log lines and caps_ below need no #ifdefs of their own; 0 / NONE
+    // means "extension absent or SDK too old to know about it".
+    VkPhysicalDeviceProperties2 ng_props2{};
+    ng_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    void** ng_props_next = &ng_props2.pNext;
+    auto chain_props = [&](void* node, void** node_next) {
+        *ng_props_next = node;
+        ng_props_next = node_next;
+    };
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtp_props{};
+    rtp_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+    if (has_rt_pipeline) chain_props(&rtp_props, reinterpret_cast<void**>(&rtp_props.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT ser_ext_props{};
+    ser_ext_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT;
+    if (has_ser_ext) chain_props(&ser_ext_props, reinterpret_cast<void**>(&ser_ext_props.pNext));
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV ser_nv_props{};
+    ser_nv_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV;
+    if (has_ser_nv) chain_props(&ser_nv_props, reinterpret_cast<void**>(&ser_nv_props.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV clas_props{};
+    clas_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+    if (has_clas) chain_props(&clas_props, reinterpret_cast<void**>(&clas_props.pNext));
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV ptlas_props{};
+    ptlas_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+    if (has_ptlas) chain_props(&ptlas_props, reinterpret_cast<void**>(&ptlas_props.pNext));
+#endif
+#if defined(VK_NV_cooperative_vector)
+    VkPhysicalDeviceCooperativeVectorPropertiesNV coopvec_props{};
+    coopvec_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_PROPERTIES_NV;
+    if (has_coopvec) chain_props(&coopvec_props, reinterpret_cast<void**>(&coopvec_props.pNext));
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR coopmat_props{};
+    coopmat_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    if (has_coopmat) chain_props(&coopmat_props, reinterpret_cast<void**>(&coopmat_props.pNext));
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    VkPhysicalDeviceCooperativeMatrix2PropertiesNV coopmat2_props{};
+    coopmat2_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_PROPERTIES_NV;
+    if (has_coopmat2) chain_props(&coopmat2_props, reinterpret_cast<void**>(&coopmat2_props.pNext));
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    VkPhysicalDeviceOpacityMicromapPropertiesEXT omm_props{};
+    omm_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
+    if (has_omm) chain_props(&omm_props, reinterpret_cast<void**>(&omm_props.pNext));
+#endif
+    if (ng_props2.pNext != nullptr) {
+        vkGetPhysicalDeviceProperties2(phys_device_, &ng_props2);
+    }
+
     // Query feature support before enabling anything in vkCreateDevice.
     VkPhysicalDeviceFeatures2 f2_supported{};
     f2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -1065,7 +1196,223 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         chain_supported(&as_supported, reinterpret_cast<void**>(&as_supported.pNext));
         chain_supported(&rq_supported, reinterpret_cast<void**>(&rq_supported.pNext));
     }
+    // Next-gen feature structs (same guard discipline as the properties).
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_supported{};
+    rtp_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    if (has_rt_pipeline) chain_supported(&rtp_supported, reinterpret_cast<void**>(&rtp_supported.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_supported{};
+    rtm1_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+    if (has_rt_maint1) chain_supported(&rtm1_supported, reinterpret_cast<void**>(&rtm1_supported.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_ext_supported{};
+    ser_ext_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+    if (has_ser_ext) chain_supported(&ser_ext_supported, reinterpret_cast<void**>(&ser_ext_supported.pNext));
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV ser_nv_supported{};
+    ser_nv_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
+    if (has_ser_nv) chain_supported(&ser_nv_supported, reinterpret_cast<void**>(&ser_nv_supported.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posfetch_supported{};
+    posfetch_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+    if (has_pos_fetch) chain_supported(&posfetch_supported, reinterpret_cast<void**>(&posfetch_supported.pNext));
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR sucf_supported{};
+    sucf_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    if (has_sucf) chain_supported(&sucf_supported, reinterpret_cast<void**>(&sucf_supported.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clas_supported{};
+    clas_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+    if (has_clas) chain_supported(&clas_supported, reinterpret_cast<void**>(&clas_supported.pNext));
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV ptlas_supported{};
+    ptlas_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
+    if (has_ptlas) chain_supported(&ptlas_supported, reinterpret_cast<void**>(&ptlas_supported.pNext));
+#endif
+#if defined(VK_NV_cooperative_vector)
+    VkPhysicalDeviceCooperativeVectorFeaturesNV coopvec_supported{};
+    coopvec_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_FEATURES_NV;
+    if (has_coopvec) chain_supported(&coopvec_supported, reinterpret_cast<void**>(&coopvec_supported.pNext));
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat_supported{};
+    coopmat_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    if (has_coopmat) chain_supported(&coopmat_supported, reinterpret_cast<void**>(&coopmat_supported.pNext));
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV coopmat2_supported{};
+    coopmat2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+    if (has_coopmat2) chain_supported(&coopmat2_supported, reinterpret_cast<void**>(&coopmat2_supported.pNext));
+#endif
+#if defined(VK_EXT_shader_float8)
+    VkPhysicalDeviceShaderFloat8FeaturesEXT fp8_supported{};
+    fp8_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+    if (has_fp8) chain_supported(&fp8_supported, reinterpret_cast<void**>(&fp8_supported.pNext));
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16_supported{};
+    bf16_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+    if (has_bf16) chain_supported(&bf16_supported, reinterpret_cast<void**>(&bf16_supported.pNext));
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT omm_supported{};
+    omm_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+    if (has_omm) chain_supported(&omm_supported, reinterpret_cast<void**>(&omm_supported.pNext));
+#endif
     vkGetPhysicalDeviceFeatures2(phys_device_, &f2_supported);
+
+    // Flatten the guarded results into plain values for the log block, the
+    // enable decisions and caps_. "feat_*" = the driver reports the
+    // extension's headline feature; "*_present" = extension exposed.
+    bool feat_rt_pipeline = false, feat_rt_maint1 = false, feat_ser_ext = false,
+         feat_ser_nv = false, feat_pos_fetch = false, feat_sucf = false, feat_clas = false,
+         feat_ptlas = false, feat_coopvec = false, feat_coopvec_training = false,
+         feat_coopmat = false, feat_coopmat2_wg = false, feat_coopmat2_flex = false,
+         feat_fp8 = false, feat_fp8_coopmat = false, feat_bf16_type = false,
+         feat_bf16_dot = false, feat_bf16_coopmat = false, feat_omm = false;
+    bool ser_ext_reorders = false, ser_nv_reorders = false;
+    std::uint32_t rtp_handle_size = 0, rtp_max_recursion = 0, rtp_max_hit_attr = 0,
+                  rtp_base_align = 0, rtp_handle_align = 0, rtp_max_dispatch = 0,
+                  ser_ext_max_sbt_index = 0;
+    std::uint32_t clas_max_verts = 0, clas_max_tris = 0, clas_scratch_align = 0,
+                  clas_align = 0, clas_template_align = 0, clas_blas_align = 0,
+                  clas_template_bounds_align = 0, clas_max_geom_index = 0;
+    std::uint32_t ptlas_max_partitions = 0, coopvec_max_components = 0,
+                  coopmat2_wg_max_size = 0, coopmat2_flex_max_dim = 0,
+                  omm_max_2state_subdiv = 0, omm_max_4state_subdiv = 0;
+    std::uint32_t coopvec_stages = 0, coopmat_stages = 0;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    feat_rt_pipeline  = rtp_supported.rayTracingPipeline == VK_TRUE;
+    rtp_handle_size   = rtp_props.shaderGroupHandleSize;
+    rtp_max_recursion = rtp_props.maxRayRecursionDepth;
+    rtp_max_hit_attr  = rtp_props.maxRayHitAttributeSize;
+    rtp_base_align    = rtp_props.shaderGroupBaseAlignment;
+    rtp_handle_align  = rtp_props.shaderGroupHandleAlignment;
+    rtp_max_dispatch  = rtp_props.maxRayDispatchInvocationCount;
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    feat_rt_maint1 = rtm1_supported.rayTracingMaintenance1 == VK_TRUE;
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    feat_ser_ext = ser_ext_supported.rayTracingInvocationReorder == VK_TRUE;
+    ser_ext_reorders = ser_ext_props.rayTracingInvocationReorderReorderingHint ==
+                       VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT;
+    ser_ext_max_sbt_index = ser_ext_props.maxShaderBindingTableRecordIndex;
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    feat_ser_nv = ser_nv_supported.rayTracingInvocationReorder == VK_TRUE;
+    ser_nv_reorders = ser_nv_props.rayTracingInvocationReorderReorderingHint ==
+                      VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV;
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    feat_pos_fetch = posfetch_supported.rayTracingPositionFetch == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    feat_sucf = sucf_supported.shaderSubgroupUniformControlFlow == VK_TRUE;
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    feat_clas                  = clas_supported.clusterAccelerationStructure == VK_TRUE;
+    clas_max_verts             = clas_props.maxVerticesPerCluster;
+    clas_max_tris              = clas_props.maxTrianglesPerCluster;
+    clas_scratch_align         = clas_props.clusterScratchByteAlignment;
+    clas_align                 = clas_props.clusterByteAlignment;
+    clas_template_align        = clas_props.clusterTemplateByteAlignment;
+    clas_blas_align            = clas_props.clusterBottomLevelByteAlignment;
+    clas_template_bounds_align = clas_props.clusterTemplateBoundsByteAlignment;
+    clas_max_geom_index        = clas_props.maxClusterGeometryIndex;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    feat_ptlas           = ptlas_supported.partitionedAccelerationStructure == VK_TRUE;
+    ptlas_max_partitions = ptlas_props.maxPartitionCount;
+#endif
+#if defined(VK_NV_cooperative_vector)
+    feat_coopvec           = coopvec_supported.cooperativeVector == VK_TRUE;
+    feat_coopvec_training  = coopvec_supported.cooperativeVectorTraining == VK_TRUE;
+    coopvec_stages         = coopvec_props.cooperativeVectorSupportedStages;
+    coopvec_max_components = coopvec_props.maxCooperativeVectorComponents;
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    feat_coopmat   = coopmat_supported.cooperativeMatrix == VK_TRUE;
+    coopmat_stages = coopmat_props.cooperativeMatrixSupportedStages;
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    feat_coopmat2_wg     = coopmat2_supported.cooperativeMatrixWorkgroupScope == VK_TRUE;
+    feat_coopmat2_flex   = coopmat2_supported.cooperativeMatrixFlexibleDimensions == VK_TRUE;
+    coopmat2_wg_max_size = coopmat2_props.cooperativeMatrixWorkgroupScopeMaxWorkgroupSize;
+    coopmat2_flex_max_dim = coopmat2_props.cooperativeMatrixFlexibleDimensionsMaxDimension;
+#endif
+#if defined(VK_EXT_shader_float8)
+    feat_fp8         = fp8_supported.shaderFloat8 == VK_TRUE;
+    feat_fp8_coopmat = fp8_supported.shaderFloat8CooperativeMatrix == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    feat_bf16_type    = bf16_supported.shaderBFloat16Type == VK_TRUE;
+    feat_bf16_dot     = bf16_supported.shaderBFloat16DotProduct == VK_TRUE;
+    feat_bf16_coopmat = bf16_supported.shaderBFloat16CooperativeMatrix == VK_TRUE;
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    feat_omm              = omm_supported.micromap == VK_TRUE;
+    omm_max_2state_subdiv = omm_props.maxOpacity2StateSubdivisionLevel;
+    omm_max_4state_subdiv = omm_props.maxOpacity4StateSubdivisionLevel;
+#endif
+
+    // The diagnostic block. One line per roadmap area, INFO like the RT
+    // presence line above, so the whole capability picture of the box is
+    // pasteable from the startup log.
+    LOG_INFO("Vulkan next-gen [rt pipeline]: ray_tracing_pipeline={} (feature={}, "
+             "maxRayRecursionDepth={}, shaderGroupHandleSize={}, maxRayHitAttributeSize={}, "
+             "shaderGroupBaseAlignment={}, shaderGroupHandleAlignment={}, "
+             "maxRayDispatchInvocationCount={}) pipeline_library={} "
+             "ray_tracing_maintenance1={} (feature={}) position_fetch={} (feature={})",
+             has_rt_pipeline, feat_rt_pipeline, rtp_max_recursion, rtp_handle_size,
+             rtp_max_hit_attr, rtp_base_align, rtp_handle_align, rtp_max_dispatch,
+             has_pipeline_library, has_rt_maint1, feat_rt_maint1, has_pos_fetch, feat_pos_fetch);
+    LOG_INFO("Vulkan next-gen [SER]: invocation_reorder EXT={} (feature={}, mode={}, "
+             "maxShaderBindingTableRecordIndex={}) NV={} (feature={}, mode={})",
+             has_ser_ext, feat_ser_ext, ser_ext_reorders ? "REORDER" : "NONE",
+             ser_ext_max_sbt_index, has_ser_nv, feat_ser_nv, ser_nv_reorders ? "REORDER" : "NONE");
+    LOG_INFO("Vulkan next-gen [mega geometry]: cluster_accel_struct={} (feature={}, "
+             "maxVerticesPerCluster={}, maxTrianglesPerCluster={}, clusterScratchByteAlignment={}, "
+             "clusterByteAlignment={}, clusterTemplateByteAlignment={}, "
+             "clusterBottomLevelByteAlignment={}, clusterTemplateBoundsByteAlignment={}, "
+             "maxClusterGeometryIndex={}) partitioned_accel_struct={} (feature={}, maxPartitionCount={})",
+             has_clas, feat_clas, clas_max_verts, clas_max_tris, clas_scratch_align, clas_align,
+             clas_template_align, clas_blas_align, clas_template_bounds_align, clas_max_geom_index,
+             has_ptlas, feat_ptlas, ptlas_max_partitions);
+    LOG_INFO("Vulkan next-gen [neural]: cooperative_vector={} (feature={}, training={}, "
+             "stages=0x{:x}, maxCooperativeVectorComponents={}) cooperative_matrix KHR={} "
+             "(feature={}, stages=0x{:x}) NV2={} (workgroupScope={} maxWorkgroupSize={}, "
+             "flexibleDimensions={} maxDimension={}) shader_float8={} (feature={}, coopmat={}) "
+             "shader_bfloat16={} (type={}, dot={}, coopmat={})",
+             has_coopvec, feat_coopvec, feat_coopvec_training, coopvec_stages,
+             coopvec_max_components, has_coopmat, feat_coopmat, coopmat_stages, has_coopmat2,
+             feat_coopmat2_wg, coopmat2_wg_max_size, feat_coopmat2_flex, coopmat2_flex_max_dim,
+             has_fp8, feat_fp8, feat_fp8_coopmat, has_bf16, feat_bf16_type, feat_bf16_dot,
+             feat_bf16_coopmat);
+    LOG_INFO("Vulkan next-gen [misc]: subgroup_uniform_control_flow={} (feature={}) "
+             "opacity_micromap={} (feature={}, maxOpacity2StateSubdivisionLevel={}, "
+             "maxOpacity4StateSubdivisionLevel={})",
+             has_sucf, feat_sucf, has_omm, feat_omm, omm_max_2state_subdiv, omm_max_4state_subdiv);
+
+    // SBT layout properties for step 1; zero unless the RT pipeline
+    // extension is present (and, below, enabled).
+    caps_.shader_group_handle_size         = rtp_handle_size;
+    caps_.shader_group_base_alignment      = rtp_base_align;
+    caps_.shader_group_handle_alignment    = rtp_handle_align;
+    caps_.max_ray_recursion_depth          = rtp_max_recursion;
+    caps_.max_ray_hit_attribute_size       = rtp_max_hit_attr;
 
     const bool supports_storage_image_rw_wo_format =
         f2_supported.features.shaderStorageImageReadWithoutFormat == VK_TRUE &&
@@ -1155,6 +1502,39 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (use_mutable_binding2) {
         dexts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
     }
+    // Next-gen roadmap, step 0: enable the low-risk RT-pipeline family now so
+    // steps 1 (RT pipeline + SER) and 2 (cluster geometry, whose hit decode
+    // wants position fetch) never touch device creation again. Each is
+    // enabled only when the driver exposes the extension AND reports its
+    // headline feature; a device without them keeps today's compute +
+    // RayQuery configuration untouched. Nothing here changes how the
+    // existing kernels compile or dispatch -- the features are inert until
+    // a pipeline or shader asks for them.
+    const bool enable_rt_pipeline = has_rt_pipeline && feat_rt_pipeline;
+    const bool enable_rt_maint1   = has_rt_maint1 && feat_rt_maint1;
+    const bool enable_ser_ext     = enable_rt_pipeline && has_ser_ext && feat_ser_ext;
+    const bool enable_pos_fetch   = has_pos_fetch && feat_pos_fetch;
+    const bool enable_sucf        = has_sucf && feat_sucf;
+    // VK_KHR_pipeline_library has no feature struct; presence is enough.
+    const bool enable_pipeline_library = has_pipeline_library;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    if (enable_rt_pipeline) dexts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_pipeline_library)
+    if (enable_pipeline_library) dexts.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    if (enable_rt_maint1) dexts.push_back(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    if (enable_ser_ext) dexts.push_back(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    if (enable_pos_fetch) dexts.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    if (enable_sucf) dexts.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+#endif
 #if defined(PT_ENABLE_OPTIX)
     // CUDA-Vulkan interop for the OptiX denoiser. The base
     // VK_KHR_external_memory / VK_KHR_external_semaphore are core 1.1
@@ -1302,6 +1682,35 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     mut_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
     mut_feat.mutableDescriptorType = VK_TRUE;
 
+    // Next-gen extension feature structs, one headline feature each (the
+    // enable_* decisions above). Chained only when enabled, so an absent
+    // extension's struct never reaches vkCreateDevice.
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_feat{};
+    rtp_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    rtp_feat.rayTracingPipeline = VK_TRUE;
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_feat{};
+    rtm1_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+    rtm1_feat.rayTracingMaintenance1 = VK_TRUE;
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_ext_feat{};
+    ser_ext_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+    ser_ext_feat.rayTracingInvocationReorder = VK_TRUE;
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posfetch_feat{};
+    posfetch_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+    posfetch_feat.rayTracingPositionFetch = VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR sucf_feat{};
+    sucf_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    sucf_feat.shaderSubgroupUniformControlFlow = VK_TRUE;
+#endif
+
     void** next_slot = &f2.pNext;
     auto chain = [&](void* node, void** node_next) {
         *next_slot = node;
@@ -1323,6 +1732,37 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (use_mutable_binding2) {
         chain(&mut_feat, reinterpret_cast<void**>(&mut_feat.pNext));
     }
+#if defined(VK_KHR_ray_tracing_pipeline)
+    if (enable_rt_pipeline) chain(&rtp_feat, reinterpret_cast<void**>(&rtp_feat.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    if (enable_rt_maint1) chain(&rtm1_feat, reinterpret_cast<void**>(&rtm1_feat.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    if (enable_ser_ext) chain(&ser_ext_feat, reinterpret_cast<void**>(&ser_ext_feat.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    if (enable_pos_fetch) chain(&posfetch_feat, reinterpret_cast<void**>(&posfetch_feat.pNext));
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    if (enable_sucf) chain(&sucf_feat, reinterpret_cast<void**>(&sucf_feat.pNext));
+#endif
+
+    caps_.ray_tracing_pipeline             = enable_rt_pipeline;
+    caps_.pipeline_library                 = enable_pipeline_library;
+    caps_.ray_tracing_maintenance1         = enable_rt_maint1;
+    caps_.invocation_reorder               = enable_ser_ext;
+    caps_.invocation_reorder_hint_reorders = enable_ser_ext && ser_ext_reorders;
+    caps_.position_fetch                   = enable_pos_fetch;
+    caps_.subgroup_uniform_control_flow    = enable_sucf;
+    // The extension side of what vkCreateDevice is about to be asked for
+    // (the core-feature line is above), so a "feature not present" failure
+    // or a behaviour change is attributable from the startup log alone.
+    LOG_INFO("Vulkan extensions enabled: ray_tracing_pipeline={} pipeline_library={} "
+             "ray_tracing_maintenance1={} invocation_reorder_ext={} position_fetch={} "
+             "subgroup_uniform_control_flow={} mutable_descriptor_type={}",
+             enable_rt_pipeline, enable_pipeline_library, enable_rt_maint1, enable_ser_ext,
+             enable_pos_fetch, enable_sucf, use_mutable_binding2);
 
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
