@@ -25,105 +25,11 @@ env:
   RELEASE_CACHE_VERSION: v1
 
 jobs:
-  macos-release:
-    name: macOS (Apple Silicon) -- release artefact
-    # macos-26 SDK has MTLFXTemporalDenoisedScaler; releases include the
-    # full MetalFX denoiser path, not the SDK-stubbed fallback.
-    runs-on: macos-26
-    permissions:
-      contents: write   # needed to attach artefacts to a Release
-    steps:
-      # Check out the release tag explicitly so re-running this workflow
-      # via workflow_dispatch (with `tag` input) builds at the tagged
-      # commit rather than the default branch HEAD. For tag-push
-      # triggers, github.ref already points at the tag so this is a no-op.
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install build tools
-        # vulkan-headers + vulkan-loader give CMake's FindVulkan a
-        # discoverable Vulkan::Vulkan target so the Vk backend builds.
-        # molten-vk supplies the runtime ICD for full release coverage.
-        run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
-
-      - name: Cache CMake build directory
-        # Restores the entire build/mac-release tree (CMakeCache.txt +
-        # _deps fetched source + compiled object files) when the cache
-        # key matches a prior successful build.  The hashFiles() inputs
-        # cover everything that changes what gets built: top-level
-        # CMakeLists, all cmake/ helpers (Dependencies.cmake especially
-        # -- bumping a dep version busts the cache as intended), every
-        # subdirectory CMakeLists, and the workflow file itself
-        # (compiler-flag changes, dep upgrades, etc).  No restore-keys
-        # fallback: an exact-match hit or fresh build, nothing fuzzy --
-        # release builds value reproducibility over the marginal time
-        # win of a partial restore.  RELEASE_CACHE_VERSION at the top
-        # of this workflow is the manual invalidate-everything knob.
-        uses: actions/cache@v4
-        with:
-          path: build/mac-release
-          key: ${{ env.RELEASE_CACHE_VERSION }}-macos-release-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt', '.github/workflows/release.yml') }}
-
-      - name: Configure (release)
-        run: cmake --preset mac-release
-
-      - name: Build
-        run: cmake --build build/mac-release --parallel
-
-      - name: Stage artefact tree
-        # Stage just what an end-user actually needs to run the engine
-        # -- the binary plus the data files it loads (HDRI, BSC star
-        # catalog, etc). Skip object files, archives, third-party
-        # source. Tag-named so the release page sees a meaningful
-        # download name.
-        run: |
-          STAGE="demont-${{ steps.tag.outputs.value }}-macos-arm64"
-          mkdir -p "dist/$STAGE"
-          cp build/mac-release/src/app/demont "dist/$STAGE/"
-          cp -R assets                        "dist/$STAGE/"
-          cp LICENSE README.md                "dist/$STAGE/"
-          cd dist
-          # tar.gz preserves the executable bit; zip on macOS strips it.
-          tar -czf "$STAGE.tar.gz" "$STAGE"
-          ls -lh "$STAGE.tar.gz"
-          echo "ARCHIVE=dist/$STAGE.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Upload artefact (always)
-        uses: actions/upload-artifact@v4
-        with:
-          name: demont-macos-arm64
-          path: ${{ env.ARCHIVE }}
-
-      - name: Attach to GitHub Release
-        # Fires for both tag-push triggers and workflow_dispatch with a
-        # tag input.  tag_name is resolved explicitly so the action
-        # targets the right release even when github.ref is a branch
-        # ref (workflow_dispatch case).  generate_release_notes only
-        # populates the body if the release doesn't already exist;
-        # editing an existing release via `gh release edit` after the
-        # initial creation is the right way to curate notes.
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.value }}
-          files: ${{ env.ARCHIVE }}
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-
   windows-release:
     name: Windows (x64, clang-cl) -- release artefact
     # Mirrors the build.yml Windows job (compile-test) but in Release
-    # config + staging an artefact tarball, parallel with the macOS
-    # release job.  windows-latest gets cmake, MSVC via the action
+    # config + staging an artefact archive.  windows-latest gets cmake,
+    # MSVC via the action
     # below (we keep that step for the SDK headers + linker), and the
     # Vulkan SDK pinned to a known-good LunarG release.
     #
@@ -196,9 +102,8 @@ jobs:
       - name: Cache CMake build directory
         # Restores the entire build/win-clang-release tree (CMakeCache.txt,
         # _deps fetched source, compiled object files) when the cache key
-        # matches.  Same hashFiles() shape + behaviour as the macOS job
-        # above; the per-OS prefix in the key keeps Mac and Windows
-        # caches separate.  Embree alone is ~250k LOC of templated
+        # matches.  The per-OS prefix in the key keeps this cache
+        # namespaced.  Embree alone is ~250k LOC of templated
         # kernels that take ~10 min to compile cold under clang-cl;
         # cache hits should bring that down to "rebuild only the
         # changed app code + relink" -- a few minutes at most.

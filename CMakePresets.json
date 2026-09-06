@@ -3,37 +3,6 @@
   "cmakeMinimumRequired": { "major": 3, "minor": 27, "patch": 0 },
   "configurePresets": [
     {
-      "name": "mac-base",
-      "hidden": true,
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/${presetName}",
-      "cacheVariables": {
-        "CMAKE_OSX_ARCHITECTURES": "arm64",
-        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
-        "CMAKE_C_COMPILER": "clang",
-        "CMAKE_CXX_COMPILER": "clang++"
-      }
-    },
-    {
-      "name": "mac-debug",
-      "displayName": "Mac · Debug",
-      "inherits": "mac-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "PT_ENABLE_TRACY": "ON"
-      }
-    },
-    {
-      "name": "mac-release",
-      "displayName": "Mac · Release",
-      "inherits": "mac-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "PT_ENABLE_TRACY": "OFF"
-      }
-    },
-
-    {
       "name": "win-base",
       "hidden": true,
       "generator": "Ninja",
@@ -131,8 +100,6 @@
     }
   ],
   "buildPresets": [
-    { "name": "mac-debug",       "configurePreset": "mac-debug",       "jobs": 0 },
-    { "name": "mac-release",     "configurePreset": "mac-release",     "jobs": 0 },
     { "name": "win-debug",       "configurePreset": "win-debug",       "jobs": 0 },
     { "name": "win-release",     "configurePreset": "win-release",     "jobs": 0 },
     { "name": "win-clang-debug",   "configurePreset": "win-clang-debug",   "jobs": 0 },

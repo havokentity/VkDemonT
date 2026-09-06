@@ -488,7 +488,7 @@ set_tests_properties(pt_planet_terrain PROPERTIES TIMEOUT 600)
 # TIMEOUT 300: the flight is 180 ticks with a 4 ms frame emulation and a
 # software BLAS build per admitted chunk; measured well under a minute on an
 # M4 Max, and CI runners are slower at BVH builds by a wide margin.
-if(APPLE OR WIN32)
+if(WIN32)
     pt_add_test(pt_planet_residency
         pt_planet_residency_test.cpp
         LINK_TARGETS pt_engine pt_rhi)
@@ -552,7 +552,6 @@ target_compile_definitions(pt_planet_albedo PRIVATE
     PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
     PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
     PT_VULKAN_DEVICE_H_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.h"
-    PT_METAL_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_metal/MetalDevice.h"
     PT_RHI_TYPES_PATH="${CMAKE_SOURCE_DIR}/src/rhi/Types.h"
     PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
 
@@ -640,55 +639,14 @@ target_compile_definitions(pt_planet_ocean PRIVATE
 
 # --- pt_ocean_gpu (#259 planetary P5 / #133 water roadmap Phase 2) ---------
 #
-# THE ACCEPTANCE TEST FOR THE GPU CASCADE SOLVER. Runs both solvers on the
-# same seeded Phillips base spectrum -- the CPU pt::ocean::OceanFFT and the
-# shaders/OceanCascades.slang compute pre-pass -- and compares the packed
-# fields texel by texel against a bound DERIVED from float32 radix-2 FFT
-# arithmetic (see the header of pt_ocean_gpu_test.cpp; ~4.0e-4 relative
-# 2-norm at grid 256, and ~96% of it is the host's recurrence twiddle, not
-# the kernel's). Also asserts the GPU field is bit-identical across eight
-# consecutive runs, which is what the three P5 golden cells depend on.
-#
-# Needs a REAL Metal device: it creates one headlessly the way
-# rhi_accel_update_test.cpp does, builds the "ocean_cascades" pipeline,
-# dispatches, and reads the atlas back. Links pt_rhi (for the device) and
-# pt_physics (for the reference solver + the Cox-Munk kernels); the push
-# layout and the five-pass sequence come from
-# src/physics/OceanCascadeDispatch.h, shared verbatim with
-# Engine::DispatchOceanCascades so there is one transcription of the
-# shader's wire format and not two.
-#
-# Apple-only and SKIP_RETURN_CODE 125: there is no Vulkan pipeline for this
-# kernel yet (VulkanDevice's shared descriptor-set layout stops at binding
-# 39 and the kernel declares 40..45) and the software backend has no
-# compute pipelines at all, so on those the engine takes the CPU solver and
-# there is nothing to compare. A host without a usable Metal device reads
-# as SKIPPED, never as green -- the #252 failure mode.
-#
-# 300s timeout: MetalDevice compiles every MSL kernel in its constructor
-# and the test constructs one per TEST_CASE.
-if(APPLE)
-    add_executable(pt_ocean_gpu pt_ocean_gpu_test.cpp)
-    # pt_physics is listed explicitly even though pt_rhi already drags it
-    # in four hops down (pt_rhi -> pt_rhi_metal -> pt_app_window ->
-    # pt_console -> pt_editor -> pt_physics). Apple's ld64 then prints one
-    # `ignoring duplicate libraries` note, because CMake emits the archive
-    # at both depths; it is informational and the link is correct. The
-    # alternative -- depending on that six-target chain to keep supplying
-    # pt::ocean::OceanFFT -- is a worse trade than one linker note.
-    target_link_libraries(pt_ocean_gpu PRIVATE doctest::doctest pt_rhi pt_physics)
-    target_compile_definitions(pt_ocean_gpu PRIVATE
-        PT_ENGINE_H_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.h")
-    if(COMMAND pt_target_warnings)
-        pt_target_warnings(pt_ocean_gpu)
-    endif()
-    add_test(NAME pt_ocean_gpu COMMAND pt_ocean_gpu
-             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-    set_tests_properties(pt_ocean_gpu PROPERTIES
-        TIMEOUT          300
-        SKIP_RETURN_CODE 125
-        LABELS           "ocean;planetary;metal")
-endif()
+# The GPU cascade-solver acceptance test (pt_ocean_gpu_test.cpp) needed a
+# real Metal device -- the only backend that ever registered the
+# "ocean_cascades" compute pipeline -- and was Apple-only. With the Metal
+# backend retired it has been removed. A Vulkan replacement waits on a
+# Vulkan ocean pipeline: VulkanDevice's shared descriptor-set layout stops
+# at binding 39 and the kernel declares 40..45, so the Vulkan/software
+# paths take the CPU solver (pt::ocean::OceanFFT) today. Re-add a headless
+# Vulkan acceptance test here once that pipeline lands.
 # --- end planetary ocean ---------------------------------------------------
 
 # --- pt_water_optics (issue #261, planetary P7) ----------------------------
@@ -925,29 +883,26 @@ pt_add_test(scene_serialize
 # dispatches shaders/AccelProbe.slang (or its CPU mirror) to read
 # CommittedInstanceID() back per instance. Two things it pins that
 # nothing else can:
-#   - TLASInstance::instance_id survives the round trip on EVERY
-#     backend. Vulkan always honoured it; Metal silently dropped it
-#     (#251) and no test could see that, because the engine has only
-#     ever built one instance so the id was always 0 and the backends
-#     agreed by coincidence.
+#   - TLASInstance::instance_id survives the round trip. The engine has
+#     only ever built one instance so far, so the id was always 0 and a
+#     backend that silently dropped it would agree by coincidence -- the
+#     failure mode #251 hit on the (now-retired) Metal backend, which
+#     nothing else could see.
 #   - Device::UpdateTLASInstances re-points a live TLAS and the change
 #     is observed by the next dispatch, with the handle unchanged and
-#     AccelGpuStallCount() unmoved -- i.e. no waitUntilCompleted /
-#     vkQueueWaitIdle / vkDeviceWaitIdle on the update path.
+#     AccelGpuStallCount() unmoved -- i.e. no vkQueueWaitIdle /
+#     vkDeviceWaitIdle on the update path.
 # Links pt_rhi, which brings in whichever backends this build compiled
 # (PT_HAS_*_BACKEND are PUBLIC defines on that target). The suite body
 # is backend-agnostic and skips itself when a backend is absent, has no
 # acceleration-structure support, or cannot produce the accel_probe
-# pipeline -- so the same file is correct on Mac (metal + software),
-# Windows (adds vulkan when a headless VkDevice comes up) and Linux.
+# pipeline -- so the same file is correct on Windows (software, plus
+# vulkan when a headless VkDevice comes up) and Linux.
 #
 # Whether a backend can actually host an acceleration structure is a
 # RUNTIME device capability, so the suite queries the device
-# (`SupportsHardwareRT()`, now backed by MTLDevice.supportsRaytracing)
-# rather than assuming it, and records a per-backend reason when it
-# cannot. The binary also prints that ledger, including an explicit
-# note when Metal -- the only backend that can reproduce #251 -- was
-# skipped.
+# (`SupportsHardwareRT()`) rather than assuming it, and records a
+# per-backend reason when it cannot. The binary also prints that ledger.
 #
 # The executable is built once; ctest then gets ONE CELL PER BACKEND,
 # mirroring pt_add_golden_cell's `golden_<scene>__<backend>__<denoiser>`
@@ -956,33 +911,29 @@ pt_add_test(scene_serialize
 # backend that cannot run says so on its OWN ctest line:
 #
 #     rhi_accel_software .... Passed
-#     rhi_accel_metal ....... ***Skipped
+#     rhi_accel_vulkan ...... ***Skipped
 #
 # That visibility is the entire point. A single aggregate cell would
-# print `Passed` on a GH-hosted macOS runner -- true, because the
-# software backend really did run the full suite -- while saying nothing
-# about Metal having been skipped, and ctest suppresses a passing test's
-# stdout so the in-binary coverage ledger never reaches the log. One
-# cell per backend puts the skip where a reader cannot miss it.
+# print `Passed` because the software backend really did run the full
+# suite, while saying nothing about the hardware-RT backend being
+# skipped, and ctest suppresses a passing test's stdout so the in-binary
+# coverage ledger never reaches the log. One cell per backend puts the
+# skip where a reader cannot miss it.
 #
 # Registration follows pt_add_golden_cell's configure-time gating
 # exactly: a cell is only registered where its backend is compiled in
-# (metal => APPLE, software => APPLE OR WIN32, vulkan =>
-# PT_ENABLE_VULKAN_BACKEND), so no host carries a cell that could only
-# ever skip.
+# (software => WIN32, vulkan => PT_ENABLE_VULKAN_BACKEND), so no host
+# carries a cell that could only ever skip.
 #
 # SKIP_RETURN_CODE 125: the binary exits 125 when the backend it was
 # filtered to could not run -- no device, no hardware ray tracing, or no
 # accel_probe pipeline -- and ctest reports `***Skipped` rather than a
 # green tick over zero coverage. That is the #252 failure mode and it is
-# worth a return code to avoid. Verified in CI: the Linux lane, which
-# builds neither Metal nor the software backend, correctly reports
-# Skipped instead of passing.
+# worth a return code to avoid.
 #
-# 120s timeout rather than the 60s default: the Metal backend compiles
-# every MSL kernel in its constructor (PathTrace.slang is the long pole)
-# and a cold CI runner with a paravirtualised GPU is a lot slower at it
-# than an M4 Max.
+# 120s timeout rather than the 60s default: the backend compiles every
+# shader in its constructor (PathTrace.slang is the long pole) and a cold
+# CI runner is a lot slower at it than a dev box.
 add_executable(rhi_accel_update rhi_accel_update_test.cpp)
 target_link_libraries(rhi_accel_update PRIVATE doctest::doctest pt_rhi)
 if(COMMAND pt_target_warnings)
@@ -1010,11 +961,8 @@ function(pt_add_accel_cell _backend)
         LABELS           "rhi_accel;rhi_accel_${_backend}")
 endfunction()
 
-if(APPLE OR WIN32)
+if(WIN32)
     pt_add_accel_cell(software)
-endif()
-if(APPLE)
-    pt_add_accel_cell(metal)
 endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     # Skips by default even here -- VulkanDevice has no headless path.
@@ -1101,17 +1049,18 @@ function(pt_add_golden_cell)
     # Skip cells whose backend isn't compiled in. The wrapper would
     # fail at runtime anyway (engine rejects an unknown r_backend);
     # skipping at configure time keeps the ctest run clean.
-    if(PT_CELL_BACKEND STREQUAL "metal" AND NOT APPLE)
+    # The Metal backend has been retired; reject any stray metal cell.
+    if(PT_CELL_BACKEND STREQUAL "metal")
         return()
     endif()
     if(PT_CELL_BACKEND STREQUAL "vulkan" AND NOT PT_ENABLE_VULKAN_BACKEND)
         return()
     endif()
-    # rhi_software is gated to APPLE OR WIN32 in src/rhi/CMakeLists.txt
-    # (no SetDIBitsToDevice analog implemented for Linux). Registering
-    # a software cell on Linux would fail at runtime when the engine
+    # rhi_software is gated to WIN32 in src/rhi/CMakeLists.txt (no
+    # SetDIBitsToDevice analog implemented for Linux). Registering a
+    # software cell on Linux would fail at runtime when the engine
     # rejects r_backend software; skip it at configure time.
-    if(PT_CELL_BACKEND STREQUAL "software" AND NOT (APPLE OR WIN32))
+    if(PT_CELL_BACKEND STREQUAL "software" AND NOT WIN32)
         return()
     endif()
 
@@ -1311,7 +1260,6 @@ endfunction()
 # succeeds. The doctest unit tests above don't depend on the tools.
 if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE cornell_csg BACKEND software DENOISER off)
-    pt_add_golden_cell(SCENE cornell_csg BACKEND metal    DENOISER off)
     pt_add_golden_cell(SCENE cornell_csg BACKEND vulkan   DENOISER off)
 
     # --- SDF Phase 1 (#97) -------------------------------------------------
@@ -1323,8 +1271,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # across backends than the analytic-sphere path. Tightening once
     # cross-backend variance is measured is fine.
     pt_add_golden_cell(SCENE sdf_smin_row BACKEND software DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE sdf_smin_row BACKEND metal    DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     pt_add_golden_cell(SCENE sdf_smin_row BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
@@ -1340,12 +1286,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # shipped green. Registered here, with tolerances matching sdf_smin_row
     # (all four render bit-identically run-to-run on the M4 Max now that
     # smoke-mode dt is pinned + the sims are frozen during loading frames).
-    pt_add_golden_cell(SCENE water_pool         BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE light_tree_200_pts BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE sdf_fractals       BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # aurora_smoke MUST run with a denoiser: AuroraComposite is dispatched
     # only inside the use_engine_tonemap branch, which is gated on
     # denoiser_active_ (Engine.cpp). The old aurora_smoke__metal__off.png
@@ -1380,8 +1320,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # left red on purpose. Regenerate it with that phase, not before.
     # See PR #301 and its remainder list.
     # ------------------------------------------------------------------
-    pt_add_golden_cell(SCENE aurora_smoke       BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # ReSTIR DI final-shading coverage (issue #78). light_primitives_mixed
     # is the ONLY fixture that combines analytic lights (light_count > 0:
     # point + spot + sphere + quad) with a denoiser -- and that exact
@@ -1415,8 +1353,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # deterministic golden. Widen per-cell if it ever flakes across Apple
     # GPU generations (this cell is a local M-series guard; CI runs the
     # software lane).
-    pt_add_golden_cell(SCENE light_primitives_mixed BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 2)
     # sdf_phase2_procedural is NOT registered unconditionally: the fixture
     # exercises displaced / procedural SDF ops that are compiled out unless
     # PT_SDF_PROCEDURAL_OPS=ON (default OFF), and in a default build it
@@ -1427,8 +1363,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # pipeline build on both MoltenVK and NVIDIA -- the autodiff IR
     # complexity, not a driver bug.)
     if(PT_SDF_PROCEDURAL_OPS)
-        pt_add_golden_cell(SCENE sdf_phase2_procedural BACKEND metal DENOISER off
-            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endif()
     # --- end previously-orphaned baselines ---------------------------------
 
@@ -1521,8 +1455,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         # against a half-migrated state. See the hold note on
         # bsc_night_clouds below.
         pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
-        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER svgf_atrous
-            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
 
     # DAY. Software cells keep the defaults (16 / 2 / 1) and keep their
@@ -1542,12 +1474,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # noon is the tight one because its sun sits at 60 degrees, where the
     # slant path through the ozone layer is at its shortest -- the same
     # geometry that makes ozone invisible at noon and decisive at twilight.
-    pt_add_golden_cell(SCENE procedural_noon    BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 0.5 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE procedural_evening BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 3 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE procedural_dawn    BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end #112 sky/sun/stars/moon matrix --------------------------------
 
     # --- Planetarium (#281) ------------------------------------------------
@@ -1643,8 +1569,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # left red on purpose. Regenerate it with that phase, not before.
     # See PR #301 and its remainder list.
     # ------------------------------------------------------------------
-    pt_add_golden_cell(SCENE planetarium_jupiter BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 0.0074 FAIL_PERCENT 0.0025)
     # --- end Planetarium ---------------------------------------------------
 
     # --- Curved-Earth sunset fixtures (#51) --------------------------------
@@ -1701,8 +1625,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     set(_sunset_scenes sunset_horizon sunset_altitude sunset_altitude_planar)
     foreach(_scene IN LISTS _sunset_scenes)
         pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
-            MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-        pt_add_golden_cell(SCENE ${_scene} BACKEND metal    DENOISER off
             MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
     # --- end curved-Earth sunset fixtures ----------------------------------
@@ -2137,8 +2059,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   CONFIRMED by a control -- r_planet_hillslope_break 106 (the default,
     #   restated through --extra) renders planet_surface BYTE-IDENTICALLY to
     #   the new golden, so the deltas are the value and not the channel.
-    pt_add_golden_cell(SCENE planet_surface  BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- Land cover (#300) --------------------------------------------
     # The planet from full-disc range, which is the ONLY scale at which
     # "Earth is recognisable" is a claim a golden can hold.
@@ -2194,8 +2114,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # in tests/pt_planet_albedo_test.cpp, which measures the raster's
     # SPECTRAL SHAPE (green where chlorophyll absorbs, red-over-green-over-
     # blue where iron oxide does) rather than its pixels.
-    pt_add_golden_cell(SCENE planet_land_orbit BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- #317: the SAME disc WITH the sea -------------------------------
     # planet_land_orbit above pins r_planet_ocean 0 so the specular sea
     # cannot perturb the land-colour measurement -- which means it dodges
@@ -2258,12 +2176,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #                      fma ordering, exactly as every other planet cell
     #                      here argues.
     # Re-measure if the camera, resolution, exposure or frame count moves.
-    pt_add_golden_cell(SCENE planet_land_orbit_ocean BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_aerial   BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_lod_seam BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- #307: the cell where the ROCK RAMP is the variable under test -----
     #
     # planet_surface cannot be that cell, and the reason is measured rather
@@ -2310,13 +2222,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   210.7, 193 distinct luminance levels and 25 122 distinct RGB
     #   triples. A frame where the feature is invisible cannot fail for the
     #   feature's sake, and this one is not that frame.
-    pt_add_golden_cell(SCENE planet_hillslope_rock BACKEND metal DENOISER off
-                       FRAMES 32 MAX_DELTA 16 MEAN_DELTA 0.8 FAIL_PERCENT 1)
     # --- end Planetary P4 -------------------------------------------------
-    pt_add_golden_cell(SCENE planet_horizon_clouds        BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
-    pt_add_golden_cell(SCENE planet_horizon_clouds_planar BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
     # --- Planetary P3 (#257): ozone at civil twilight ----------------------
     # The phase's other acceptance criterion: the twilight sky must read
     # BLUE, not brown, and that is what ozone buys.
@@ -2348,10 +2254,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # spectral shape. tests/pt_atmosphere_test.cpp asserts the same
     # mechanism on the numbers directly, including the ordering that
     # would catch the triple being entered in the wrong wavelength order.
-    pt_add_golden_cell(SCENE civil_twilight          BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
-    pt_add_golden_cell(SCENE civil_twilight_no_ozone BACKEND metal DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 3)
     # --- end Planetary P3 --------------------------------------------------
 
     # --- Wave 9 hosek-sky --------------------------------------------------
@@ -2367,8 +2269,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # (exp/pow per channel) than the procedural gradient.
     pt_add_golden_cell(SCENE sky_hosek BACKEND software DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE sky_hosek BACKEND metal    DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Wave 9 hosek-sky ----------------------------------------------
 
     # --- Fluid Phase 1 (#136) -- smoke emitter fixture --------------------
@@ -2383,8 +2283,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # in-cloud single-scatter path is more sensitive to per-backend FP
     # ordering than primary-hit Lambert.
     pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND software DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND metal    DENOISER svgf_atrous
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Fluid Phase 1 ------------------------------------------------
 
@@ -2407,8 +2305,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # #280: smallest signal 7.19 (ozone off; multiple scattering off moves
     # this cell by 249, because a cloud deck lit through the atmosphere is
     # mostly higher-order light). MEAN_DELTA 1.5 -> 4.8x clear.
-    pt_add_golden_cell(SCENE clouds_raymarched BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 1.5 FAIL_PERCENT 3)
     # --- end Wave 7 (#24) -------------------------------------------------
 
     # --- Wave 9 -- god rays / crepuscular light shafts --------------------
@@ -2454,9 +2350,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # on the dev M4 Max (max_delta 0), so the 32/4/3 thresholds remain
     # pure cross-host headroom.
     # #280: smallest signal 7.19 (ozone off) -> MEAN_DELTA 1.5, 4.8x clear.
-    pt_add_golden_cell(SCENE clouds_godrays BACKEND metal DENOISER svgf_atrous
-        EXTRA "r_godrays 1"
-        MAX_DELTA 32 MEAN_DELTA 1.5 FAIL_PERCENT 3)
     # --- end Wave 9 -------------------------------------------------------
 
     # --- Fluid Phase 3 (#22) -- SPH smoke wind fixture ---------------------
@@ -2472,9 +2365,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #
     # Metal only at first; software backend goldens can be added once
     # the Metal one is committed.
-    pt_add_golden_cell(SCENE smoke_phase3_wind BACKEND metal DENOISER off
-        FRAMES 90
-        MAX_DELTA 64 MEAN_DELTA 16 FAIL_PERCENT 10)
     # --- end Fluid Phase 3 ------------------------------------------------
 
     # --- FFT ocean surface (Wave 8, #25) ----------------------------------
@@ -2602,9 +2492,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # software gates the ocean off (its CPU tracer ignores the textures)
     # so no software cell, and a Vulkan cell can land once a Vulkan PNG is
     # committed.
-    pt_add_golden_cell(SCENE ocean_fft BACKEND metal DENOISER svgf_atrous
-        FRAMES 120
-        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end FFT ocean surface --------------------------------------------
 
     # --- Ocean foam + whitecaps (Wave 9) ----------------------------------
@@ -2701,9 +2588,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #
     # Metal-only (software gates the ocean off; a Vulkan cell can land once
     # a Vulkan PNG is committed).
-    pt_add_golden_cell(SCENE ocean_foam BACKEND metal DENOISER svgf_atrous
-        FRAMES 120
-        MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
     # --- end Ocean foam + whitecaps ---------------------------------------
 
     # --- Planetary P5 (#259): the planetary ocean -------------------------
@@ -2822,12 +2706,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # a long warm-up because the surface had to evolve into a developed sea
     # from t = 0, and the cascades here are spectrally normalised to Cox &
     # Munk from the first frame rather than growing into an amplitude.
-    pt_add_golden_cell(SCENE planet_ocean_boat  BACKEND metal DENOISER off
-                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_ocean_orbit BACKEND metal DENOISER off
-                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE planet_ocean_snell BACKEND metal DENOISER off
-                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
 
     # --- #305: WATER-LEAVING RADIANCE. THE FULL GOLDEN DECOMPOSITION -------
     #
@@ -3041,11 +2919,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # magnitude in red and N = 1 is as far from the reference as deleting the
     # march altogether. That is the honest reason the default is 16 and not
     # 2.
-    pt_add_golden_cell(SCENE planet_underwater_column BACKEND metal
-                       DENOISER off
-                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
-    pt_add_golden_cell(SCENE water_pool_submerged BACKEND metal DENOISER off
-                       FRAMES 48 MAX_DELTA 16 MEAN_DELTA 2 FAIL_PERCENT 1)
 
     # --- The Cox-Munk test (#259's stated acceptance criterion) -----------
     #
@@ -3087,44 +2960,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # committed PNG above: two black frames would agree too, so "they match"
     # and "they show an ocean" are separate assertions and neither stands in
     # for the other.
-    if(APPLE)
-        set(_p5_scenes ${CMAKE_SOURCE_DIR}/tests/goldens/scenes)
-        set(_p5_cell planet_ocean_coxmunk__metal)
-        foreach(_half a b)
-            if(_half STREQUAL "a")
-                set(_p5_scene planet_ocean_orbit)
-            else()
-                set(_p5_scene planet_ocean_orbit_smooth)
-            endif()
-            set(_p5_png ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__${_half}.png)
-            set(_p5_wd  ${CMAKE_BINARY_DIR}/golden_workdir/${_p5_cell}__${_half})
-            file(MAKE_DIRECTORY ${_p5_wd})
-            add_test(NAME ${_p5_cell}_render_${_half}
-                COMMAND $<TARGET_FILE:pt_render_one_frame>
-                    --scene    ${_p5_scenes}/${_p5_scene}.cfg
-                    --backend  metal
-                    --denoiser off
-                    --frames   48
-                    --out      ${_p5_png}
-                WORKING_DIRECTORY ${_p5_wd})
-            set_tests_properties(${_p5_cell}_render_${_half} PROPERTIES
-                TIMEOUT 300
-                LABELS  "golden;golden_metal;planetary")
-        endforeach()
-        add_test(NAME ${_p5_cell}_diff
-            COMMAND $<TARGET_FILE:imgdiff>
-                ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__a.png
-                ${CMAKE_BINARY_DIR}/golden_actual/${_p5_cell}__b.png
-                --max-delta    16
-                --mean-delta   2
-                --fail-percent 1
-                --diff         ${CMAKE_BINARY_DIR}/golden_diff/${_p5_cell}.png
-            WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-        set_tests_properties(${_p5_cell}_diff PROPERTIES
-            TIMEOUT 30
-            DEPENDS "${_p5_cell}_render_a;${_p5_cell}_render_b"
-            LABELS  "golden;golden_metal;planetary")
-    endif()
     # --- end Planetary P5 -------------------------------------------------
 
     # --- Physics Phase 2a rigid-body fixtures (#138, #181) ----------------
@@ -3195,14 +3030,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # Neither cell catches subtle physics bugs that shift body positions
     # by a few cm; a structural diff (body-count + albedo histogram) is
     # the right tool for that and is left as future work.
-    pt_add_golden_cell(SCENE phys_rb_smoke BACKEND metal DENOISER off
-        FRAMES 60
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2
-        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_smoke_late.cfg")
-    pt_add_golden_cell(SCENE phys_rb_demo  BACKEND metal DENOISER off
-        FRAMES 60
-        MAX_DELTA 64 MEAN_DELTA 12 FAIL_PERCENT 5
-        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/phys_rb_demo_late.cfg")
     # --- end Physics Phase 2a rigid-body fixtures -------------------------
 
     # --- Mesh motion blur (wave-7 #21, follow-up to PR #85) ---------------
@@ -3236,9 +3063,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     pt_add_golden_cell(SCENE motion_blur_mesh BACKEND software DENOISER off
         MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
         EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
-    pt_add_golden_cell(SCENE motion_blur_mesh BACKEND metal    DENOISER off
-        MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
-        EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
     # --- end Mesh motion blur fixture -------------------------------------
 
     # --- Wave 8 spectral dispersion (#27) ---------------------------------
@@ -3254,8 +3078,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # dispersion pipeline end-to-end (Cauchy IOR + CIE reconstruction);
     # the achromatic-glass regression is already covered bit-for-bit by
     # the cornell_csg cells (r_spectral defaults to 0).
-    pt_add_golden_cell(SCENE spectral_prism BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 8 spectral dispersion -----------------------------------
 
     # --- Env double-count through dielectrics (2026-07-13 audit, B9) -------
@@ -3280,7 +3102,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # regression pin. Metal-only: the CPU SoftwareTracer is a single-bounce
     # direct-lighting renderer with no env-NEE / MIS / refractive shadow rays,
     # so it can neither exhibit nor guard this bug.
-    pt_add_golden_cell(SCENE env_glass_furnace BACKEND metal DENOISER off)
     # --- end env double-count through dielectrics -------------------------
 
     # --- Wave 8 thin-lens depth of field (#27) ----------------------------
@@ -3294,8 +3115,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # settle. Tolerances widened like the other stochastic cells; the
     # pinhole regression (r_dof 0 -> every sphere sharp) is the default
     # path already covered bit-for-bit by cornell_csg / the other cells.
-    pt_add_golden_cell(SCENE dof_bokeh BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 8 thin-lens depth of field ------------------------------
 
     # --- Wave 8 PBR (#26) -- textured-material fixture --------------------
@@ -3334,8 +3153,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # "material-editor-and-textures").
     pt_add_golden_cell(SCENE pbr_textured BACKEND software DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
-    pt_add_golden_cell(SCENE pbr_textured BACKEND metal    DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # Vulkan cell: golden deferred to #71 (Mac-Vulkan pixel correctness) --
     # registers on Vulkan hosts, no-op on macOS. See the note above.
     pt_add_golden_cell(SCENE pbr_textured BACKEND vulkan   DENOISER off
@@ -3369,8 +3186,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # catch the fog failing to engage (haze-free frame), the depth
     # reconstruction breaking (uniform fog ignoring distance), or the
     # composite blowing out / zeroing the scene.
-    pt_add_golden_cell(SCENE height_fog BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 48 MEAN_DELTA 8 FAIL_PERCENT 6)
     # --- end Wave 9 volumetric height fog ---------------------------------
 
     # --- Wave 9 advanced materials (#wave9) ------------------------------
@@ -3389,18 +3204,12 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #
     # brushed_metal: anisotropic GGX metal sphere -- the sun's specular
     # highlight stretches into a brushed streak (vs an isotropic dot).
-    pt_add_golden_cell(SCENE brushed_metal BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # car_paint: red Lambert pigment + clearcoat -- a crisp white gloss
     # highlight from the clear lacquer floats on the saturated red body.
-    pt_add_golden_cell(SCENE car_paint BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # subsurface: backlit translucent wax sphere -- the bounded random-walk
     # SSS transmits warm light through the thin rim. This is the highest-
     # variance estimator of the three (a multi-step random walk per path),
     # so the tolerances are widened a notch beyond the specular cells.
-    pt_add_golden_cell(SCENE subsurface BACKEND metal DENOISER off
-        MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 6)
     # --- end Wave 9 advanced materials -----------------------------------
 
     # --- Wave 9 tone-mapping operators (#27 follow-up) --------------------
@@ -3457,8 +3266,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the seed). The thresholds catch bloom failing to engage (no halos),
     # the strength gain being dropped (dim halos), or the dirt modulation
     # breaking (uniform or absent grime).
-    pt_add_golden_cell(SCENE bloom_lensdirt BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 10 bloom + lens dirt ------------------------------------
 
     # --- Wave 10 polygonal bokeh ------------------------------------------
@@ -3477,8 +3284,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the dof_bokeh cell (the scene is identical apart from the aperture
     # shape, so the stochastic aperture-integration noise floor is the
     # same regime).
-    pt_add_golden_cell(SCENE dof_bokeh_blades BACKEND metal DENOISER off
-        MAX_DELTA 48 MEAN_DELTA 6 FAIL_PERCENT 4)
     # --- end Wave 10 polygonal bokeh --------------------------------------
 
     # --- SIGMA sun-shadow demod (issue #115, B10) -------------------------
@@ -3499,8 +3304,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # far past these thresholds. Deterministic (no meshes -> no TLAS build
     # entropy); default-ish tolerances with a little headroom for Apple
     # GPU FP-order variance.
-    pt_add_golden_cell(SCENE shadow_umbra_point BACKEND metal DENOISER svgf_atrous
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SIGMA sun-shadow demod ---------------------------------------
 
     # --- Planetary P1 (#255): camera-anchored render frame ----------------
@@ -3550,10 +3353,10 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #
     # _worldframe_pair(<name> <backend> <scene_a> <scene_b> <max_delta>)
     function(pt_add_worldframe_pair _name _backend _scene_a _scene_b _max_delta)
-        if(_backend STREQUAL "metal" AND NOT APPLE)
+        if(_backend STREQUAL "metal")
             return()
         endif()
-        if(_backend STREQUAL "software" AND NOT (APPLE OR WIN32))
+        if(_backend STREQUAL "software" AND NOT WIN32)
             return()
         endif()
         set(_cell worldframe_${_name}__${_backend})
@@ -3614,10 +3417,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # paravirtualised GPU cannot flake the cell; --fail-percent 0 keeps
     # it strict, since a real coordinate leak shows up as hundreds of L2
     # across a fifth of the frame, not as a 2/255 wobble.
-    pt_add_worldframe_pair(equivalence metal
-        worldframe_origin worldframe_ecef 2)
-    pt_add_worldframe_pair(rebase metal
-        worldframe_ecef   worldframe_ecef_rebased 2)
 
     # A/B the disable switch. r_origin_rebase_radius 0 pins the anchor to
     # the origin forever -- the permanent legacy path -- so on a scene
@@ -3635,7 +3434,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the switch under test. The committed-golden comparison is still
     # made -- by golden_cornell_csg__software__off_diff, which is the
     # cell that owns it.
-    if(APPLE OR WIN32)
+    if(WIN32)
         set(_rb_png ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__software__off__rebaseoff.png)
         set(_rb_wd  ${CMAKE_BINARY_DIR}/golden_workdir/golden_cornell_csg__software__off__rebaseoff)
         file(MAKE_DIRECTORY ${_rb_wd})
@@ -3710,12 +3509,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     #   orbital_limb        smallest signal 3.46 (ozone off) -> 4.3x clear
     #   orbital_terminator  smallest signal 15.25 (ozone off) -> 5.1x clear
     #   sky_physical_ground smallest signal 4.92 (ozone off) -> 4.1x clear
-    pt_add_golden_cell(SCENE orbital_limb       BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 0.8 FAIL_PERCENT 3)
-    pt_add_golden_cell(SCENE orbital_terminator BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 3 FAIL_PERCENT 3)
-    pt_add_golden_cell(SCENE sky_physical_ground BACKEND metal DENOISER off
-        FRAMES 32 MAX_DELTA 32 MEAN_DELTA 1.2 FAIL_PERCENT 3)
 
     # The shell crossing, as an A/B with its own control.
     #
@@ -3772,48 +3565,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # Nothing here is an engine-side mode change -- the shell clip is a
     # shader-side branch on a pushed uniform -- so crossing never sets
     # accum_dirty_ and a live fly-through does not flash.
-    if(APPLE)
-        set(_sc_scene ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/shell_crossing.cfg)
-        # name -> cam_pos altitude in metres
-        set(_sc_names   below   above    ctl_lo  ctl_hi)
-        set(_sc_alts    99999   100001   89999   90001)
-        foreach(_i RANGE 3)
-            list(GET _sc_names ${_i} _n)
-            list(GET _sc_alts  ${_i} _a)
-            set(_sc_png ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_n}.png)
-            set(_sc_wd  ${CMAKE_BINARY_DIR}/golden_workdir/sky_continuity_shell__${_n})
-            file(MAKE_DIRECTORY ${_sc_wd})
-            add_test(NAME sky_continuity_shell_render_${_n}
-                COMMAND $<TARGET_FILE:pt_render_one_frame>
-                    --scene    ${_sc_scene}
-                    --backend  metal
-                    --denoiser off
-                    --frames   32
-                    --extra    "cam_pos 0 ${_a} 0"
-                    --out      ${_sc_png}
-                WORKING_DIRECTORY ${_sc_wd})
-            set_tests_properties(sky_continuity_shell_render_${_n} PROPERTIES
-                TIMEOUT 300 LABELS "golden;golden_metal;planetary")
-        endforeach()
-        # The crossing, and its control, at one and the same bar.
-        foreach(_pair cross:below:above control:ctl_lo:ctl_hi)
-            string(REPLACE ":" ";" _pl ${_pair})
-            list(GET _pl 0 _tag)
-            list(GET _pl 1 _lo)
-            list(GET _pl 2 _hi)
-            add_test(NAME sky_continuity_shell_${_tag}
-                COMMAND $<TARGET_FILE:imgdiff>
-                    ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_lo}.png
-                    ${CMAKE_BINARY_DIR}/golden_actual/sky_continuity_shell__${_hi}.png
-                    --max-delta 8 --mean-delta 0.02 --fail-percent 1.0
-                    --diff ${CMAKE_BINARY_DIR}/golden_diff/sky_continuity_shell__${_tag}.png
-                WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-            set_tests_properties(sky_continuity_shell_${_tag} PROPERTIES
-                TIMEOUT 30
-                DEPENDS "sky_continuity_shell_render_${_lo};sky_continuity_shell_render_${_hi}"
-                LABELS  "golden;golden_metal;planetary")
-        endforeach()
-    endif()
     # --- end Planetary P6 -------------------------------------------------
 else()
     message(STATUS

@@ -23,164 +23,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  macos:
-    name: macOS (Apple Silicon)
-    # macos-26 ships the macOS 26 SDK which declares MTLFXTemporalDenoisedScaler
-    # (the API the engine's MetalFX denoiser uses). Earlier runner images
-    # (macos-15 / Sequoia SDK) lack it; the engine's MetalFXDenoiser.mm is
-    # SDK-version-gated to compile to no-op stubs on those, but using
-    # macos-26 here means CI actually exercises the denoiser code path.
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install build tools
-        run: |
-          # cmake + ninja are pre-installed on the macOS-15 runner image,
-          # but pin via brew in case the runner image strips them later.
-          # vulkan-headers + vulkan-loader give CMake's FindVulkan a
-          # discoverable Vulkan::Vulkan target on macOS without needing
-          # the full ~750MB LunarG SDK. molten-vk supplies the runtime
-          # ICD (not strictly needed for compile-only CI, but cheap to
-          # install and keeps the layout matching a dev box).
-          brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
-          cmake --version
-          ninja --version
-
-      - name: Cache CMake build directory
-        uses: actions/cache@v4
-        with:
-          path: build/mac-debug
-          # Bust on CMakeLists / Dependencies changes since those drive
-          # what FetchContent pulls. Source-only changes hit the cache.
-          key: macos-build-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt') }}
-          restore-keys: |
-            macos-build-
-
-      - name: Configure
-        # Vulkan ON -- exercises both Metal and Vulkan/MoltenVK backends
-        # on the same runner so PRs can't silently break the Vk path.
-        run: cmake --preset mac-debug
-
-      - name: Build
-        run: cmake --build build/mac-debug --parallel
-
-      - name: Verify zero warnings
-        # Fails the job if a build line printed a compiler warning.
-        # Filter to lines that look like clang's "file:line:col:
-        # warning:" so harmless info lines (like Slang's own E40100
-        # which we suppressed via -Wno-40100) don't trip the gate.
-        run: |
-          cmake --build build/mac-debug --clean-first 2>&1 | tee build.log
-          if grep -qE ":[0-9]+:[0-9]+: warning:" build.log; then
-            echo "::error::Build emitted compiler warnings -- check build.log"
-            grep -E ":[0-9]+:[0-9]+: warning:" build.log | head -20
-            exit 1
-          fi
-          echo "Zero compiler warnings."
-
-      - name: Unit tests (ctest)
-        # Phase 1 test harness (issue #47). Runs every doctest-based
-        # test registered via tests/CMakeLists.txt -- harness_smoke
-        # canary + cvar_roundtrip + imgdiff_test + capture_format
-        # today, more module tests as the rollout phases land.
-        # --output-on-failure prints the doctest report inline when
-        # a test fails so the CI log shows what broke without an
-        # extra artefact download.
-        #
-        # The golden-image regression matrix (#45) cells are excluded
-        # here (-LE golden) and run in a dedicated step below so a
-        # render failure produces a downloadable PNG artefact instead
-        # of just a log line.
-        run: ctest --test-dir build/mac-debug --output-on-failure -LE golden
-
-      # Golden-image regression matrix (#45) -- software backend only.
-      # Metal + Vulkan cells exist in the matrix (one per primary host)
-      # but are deliberately skipped on GH-hosted Mac runners because
-      # the macos-26 image has only a paravirtualised GPU without
-      # reliable hardware ray tracing, which the Metal CSG path
-      # requires. Software backend uses Embree on the CPU and runs
-      # everywhere. The Metal + Vulkan cells stay registered with
-      # ctest so a self-hosted Mac runner (future) or a developer's
-      # local box catches them; -L golden_software filters to the
-      # subset that's safe here.
-      - name: Golden-image regression matrix (software cell)
-        # `|| true` lets the upload step below still run when the
-        # cell fails; the step's own exit code is what fails the
-        # job. Actual implementation: `set +e` then capture the rc.
-        #
-        # Clear `golden_actual/` + `golden_diff/` before invoking
-        # ctest so a render that crashes before producing a fresh
-        # PNG can't leave the always-uploaded artifact populated
-        # with stale images from a previous cached-build run. The
-        # cache key includes CMakeLists / cmake/* / preset hash but
-        # NOT the source files, so stale PNGs are a real hazard.
-        id: goldens
-        run: |
-          # Clear stale PNGs from the cached build dir but recreate
-          # the parent directories: imgdiff writes via stb_image_write
-          # which doesn't auto-mkdir, and the configure-time
-          # `file(MAKE_DIRECTORY)` only fires on a fresh cmake configure.
-          rm -rf build/mac-debug/golden_actual build/mac-debug/golden_diff
-          mkdir -p build/mac-debug/golden_actual build/mac-debug/golden_diff
-          set +e
-          ctest --test-dir build/mac-debug --output-on-failure -L golden_software
-          echo "rc=$?" >> "$GITHUB_OUTPUT"
-          true
-
-      - name: Upload golden-image diff artefacts
-        # On failure (any golden_<...>_diff cell tripped above), the
-        # build dir contains the diff PNGs heat-mapping where the
-        # render diverged from the committed golden. Upload so a
-        # reviewer can eyeball without re-running CI. if: always()
-        # so a successful cell uploads its (likely empty) diff dir
-        # too -- not strictly needed but keeps the step idempotent.
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: goldens-macos
-          path: |
-            build/mac-debug/golden_actual/
-            build/mac-debug/golden_diff/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Fail job if golden cell failed
-        # The `goldens` step above swallowed its own rc into the
-        # output so the upload step could run unconditionally. This
-        # step propagates the real outcome to the job's exit code.
-        if: steps.goldens.outputs.rc != '0'
-        run: |
-          echo "::error::Golden-image cell failed (rc=${{ steps.goldens.outputs.rc }}); see goldens-macos artefact."
-          exit "${{ steps.goldens.outputs.rc }}"
-
-      # Backend smoke tests (`demont --smoke-frames=N --r-backend=X`)
-      # intentionally NOT run on the GH-hosted runner. The standard
-      # macos-* runners have only a paravirtualized Apple GPU --
-      # basic Metal renders but hardware ray tracing (which the engine
-      # requires) doesn't work reliably, and the smoke tests would
-      # either hang or fail-fast on no-device init. GitHub's paid
-      # GPU runner offering (`gpu-t4-4-core`, Tesla T4) is gated to
-      # Team / Enterprise plans and is Linux/Windows-only -- no
-      # Apple-Silicon GPU runner exists at any tier. See PR #77 for
-      # the full investigation.
-      #
-      # The engine-side `--smoke-frames` mode itself stays usable for
-      # local dev + future self-hosted-runner CI. Run manually on real
-      # hardware when validating a backend:
-      #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=metal
-      #   ./build/mac-debug/src/app/demont --smoke-frames=8 --r-backend=vulkan
-      # or end-to-end via the golden harness:
-      #   ./build/mac-debug/tools/pt_render_one_frame/pt_render_one_frame \
-      #     --scene tests/goldens/scenes/cornell_csg.cfg --backend metal \
-      #     --denoiser off --frames 64 --out /tmp/out.png
-
   windows:
     name: Windows (NVIDIA RTX target)
     # Compile-test only -- the runner has no NVIDIA hardware so we can't
     # actually exercise the Vulkan path, but link errors and Windows-
-    # specific compilation breakage get caught here. Same purpose as
-    # the macos job: regression gate on PRs.
+    # specific compilation breakage get caught here -- the regression
+    # gate on PRs.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -296,17 +144,24 @@ jobs:
       #     --denoiser off --frames 64 --out C:\temp\out.png
 
   # Scheduled nightly release: at 23:00 IST (cron at top, in UTC) the
-  # macos build runs and -- if it passes -- this job repackages the
+  # Windows build runs and -- if it passes -- this job repackages the
   # release-config artefact and updates the `nightly` pre-release tag.
   # PRs and ad-hoc pushes do NOT churn the nightly tag (gated by
   # event_name); workflow_dispatch is allowed for manual nightlies
   # outside the schedule. Versioned releases (v0.1.0, ...) still flow
   # through release.yml on a tag push.
+  #
+  # NOTE: this packages the compile-tested Windows binary; the runner has
+  # no NVIDIA GPU, so the nightly is not render-validated. Validate on
+  # real RTX hardware before promoting a nightly to a tagged release.
   nightly-release:
     name: Nightly release (scheduled)
-    needs: macos
+    needs: windows
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: macos-26
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
     permissions:
       contents: write   # required to update the rolling tag's release
     steps:
@@ -314,55 +169,67 @@ jobs:
 
       - name: Skip if nightly already matches HEAD
         # If the existing `nightly` tag already points at this commit,
-        # there's nothing new to publish -- short-circuit the job. Saves
-        # ~3 minutes of CI per quiet day. softprops/action-gh-release
-        # uses lightweight tags, so `git ls-remote refs/tags/nightly`
-        # gives the commit SHA directly. workflow_dispatch always
-        # rebuilds (the user explicitly asked for it).
+        # there's nothing new to publish -- short-circuit the job.
+        # softprops/action-gh-release uses lightweight tags, so
+        # `git ls-remote refs/tags/nightly` gives the commit SHA
+        # directly. workflow_dispatch always rebuilds.
         id: nightly_check
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "manual dispatch -- forcing rebuild"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "manual dispatch -- forcing rebuild"
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             exit 0
-          fi
-          PREV_SHA=$(git ls-remote origin refs/tags/nightly | awk '{print $1}')
-          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" = "${GITHUB_SHA}" ]; then
-            echo "nightly already at ${GITHUB_SHA}; skipping rebuild"
-            echo "skip=true"  >> "$GITHUB_OUTPUT"
-          else
-            echo "rebuild needed: prev='${PREV_SHA}' current='${GITHUB_SHA}'"
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          }
+          $prev = (git ls-remote origin refs/tags/nightly | ForEach-Object { ($_ -split "\s+")[0] } | Select-Object -First 1)
+          if ($prev -and $prev -eq $env:GITHUB_SHA) {
+            "nightly already at $env:GITHUB_SHA; skipping rebuild"
+            "skip=true"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            "rebuild needed: prev='$prev' current='$env:GITHUB_SHA'"
+            "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
 
-      - name: Install build tools
+      - name: Set up MSVC
         if: steps.nightly_check.outputs.skip != 'true'
-        run: brew install ninja cmake vulkan-headers vulkan-loader molten-vk || true
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        if: steps.nightly_check.outputs.skip != 'true'
+        run: choco install ninja --no-progress -y
+
+      - name: Install Vulkan SDK
+        if: steps.nightly_check.outputs.skip != 'true'
+        uses: jakoch/install-vulkan-sdk-action@v1.2.0
+        with:
+          vulkan_version: 1.3.296.0
+          install_runtime: true
+          cache: true
+          stripdown: true
 
       - name: Configure (release)
         if: steps.nightly_check.outputs.skip != 'true'
-        run: cmake --preset mac-release
+        run: cmake --preset win-release
 
       - name: Build
         if: steps.nightly_check.outputs.skip != 'true'
-        run: cmake --build build/mac-release --parallel
+        run: cmake --build build/win-release --parallel
 
       - name: Stage artefact tree
         if: steps.nightly_check.outputs.skip != 'true'
         # Same layout as release.yml's tag-driven flow, just with a
         # 'nightly' filename + commit SHA so users can correlate.
         run: |
-          SHA_SHORT="${GITHUB_SHA:0:7}"
-          STAGE="demont-nightly-${SHA_SHORT}-macos-arm64"
-          mkdir -p "dist/$STAGE"
-          cp build/mac-release/src/app/demont "dist/$STAGE/"
-          cp -R assets                        "dist/$STAGE/"
-          cp LICENSE README.md                "dist/$STAGE/"
-          cd dist
-          tar -czf "$STAGE.tar.gz" "$STAGE"
-          ls -lh "$STAGE.tar.gz"
-          echo "ARCHIVE=dist/$STAGE.tar.gz" >> "$GITHUB_ENV"
-          echo "SHA_SHORT=$SHA_SHORT" >> "$GITHUB_ENV"
+          $sha = $env:GITHUB_SHA.Substring(0,7)
+          $stage = "demont-nightly-$sha-windows-x64"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item build/win-release/src/app/demont.exe "dist/$stage/"
+          Copy-Item -Recurse assets "dist/$stage/"
+          Copy-Item LICENSE,README.md "dist/$stage/"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
+          "ARCHIVE=dist/$stage.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHA_SHORT=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Update rolling 'nightly' release
         if: steps.nightly_check.outputs.skip != 'true'
@@ -385,7 +252,7 @@ jobs:
             when no new commits land between scheduled runs.
             Commit: `${{ env.SHA_SHORT }}` (${{ github.sha }}).
 
-            For versioned, stable releases see the [tagged releases](https://github.com/havokentity/demont-engine/releases?q=v).
+            For versioned, stable releases see the [tagged releases](https://github.com/havokentity/vkdemont/releases?q=v).
             This tag is force-updated on each scheduled run with new
             commits; the attached artefact reflects whatever was on
             `main` at run time.

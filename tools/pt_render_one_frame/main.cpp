@@ -64,11 +64,7 @@ void PrintUsage(std::FILE* out) {
         "Required:\n"
         "  --scene PATH         Path to a console-script .cfg fixture\n"
         "                       (loaded by the engine before backend init).\n"
-#if defined(__APPLE__)
-        "  --backend NAME       One of software | metal. Vulkan is Windows/Linux only.\n"
-#else
-        "  --backend NAME       One of software | metal | vulkan.\n"
-#endif
+        "  --backend NAME       One of software | vulkan.\n"
         "  --out PATH           Destination PNG for the final frame.\n"
         "\n"
         "Optional:\n"

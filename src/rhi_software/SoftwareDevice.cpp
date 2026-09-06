@@ -2,10 +2,8 @@
 // Copyright (c) 2026 Rajesh D'Monte
 // Software backend: CPU compute via Embree (triangle BVH) + analytic-
 // primitive intersection done inline. The path tracer writes a CPU
-// framebuffer; the present path is platform-specific:
-//   * Mac: upload to a transient MTLTexture, blit to the drawable, and
-//     present via CAMetalLayer.
-//   * Windows: SetDIBitsToDevice from the same packed BGRA8 scratch
+// framebuffer; the present path is Windows-specific:
+//   * Windows: SetDIBitsToDevice from the packed BGRA8 scratch
 //     buffer directly to the HWND's device context.  This is a DIB-
 //     to-DC blit, not a `BitBlt` -- BitBlt copies between two DCs and
 //     isn't what we're doing here.  Grep for `SetDIBitsToDevice` to
@@ -34,13 +32,7 @@
 #include "../core/Memory/MemTag.h"
 #include "../core/Memory/Memory.h"
 
-#if defined(__APPLE__)
-// Headers only -- the metal-cpp PRIVATE_IMPLEMENTATION TU lives in
-// rhi_metal/MetalDevice.cpp and supplies the impl symbols we need.
-#  include <Foundation/Foundation.hpp>
-#  include <Metal/Metal.hpp>
-#  include <QuartzCore/QuartzCore.hpp>
-#elif defined(_WIN32)
+#if defined(_WIN32)
 // We pull in <windows.h> for GDI (SetDIBitsToDevice, BITMAPINFO,
 // GetClientRect, GetDC/ReleaseDC) and HWND.  NOMINMAX prevents
 // <windows.h>'s min/max macros from colliding with std::min/std::max
@@ -60,10 +52,7 @@
 #include <cstring>
 #include <cmath>
 
-#if defined(__APPLE__)
-extern "C" void  pt_metal_attach_layer(void* ns_window, void* metal_layer);
-extern "C" void* pt_window_native_cocoa(void* glfw_window);
-#elif defined(_WIN32)
+#if defined(_WIN32)
 extern "C" void* pt_window_native_win32(void* glfw_window);
 #endif
 
@@ -168,44 +157,7 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     if (width_ <= 0)  width_  = 1280;
     if (height_ <= 0) height_ = 720;
 
-#if defined(__APPLE__)
-    native_window_ = pt_window_native_cocoa(window.opaque);
-
-    mtl_device_ = MTL::CreateSystemDefaultDevice();
-    if (mtl_device_ == nullptr) {
-        LOG_ERROR("Software backend: MTL::CreateSystemDefaultDevice failed");
-        return;
-    }
-    mtl_queue_ = mtl_device_->newCommandQueue();
-    if (mtl_queue_ == nullptr) {
-        LOG_ERROR("Software backend: newCommandQueue failed");
-        return;
-    }
-
-    mtl_layer_ = CA::MetalLayer::layer();
-    mtl_layer_->retain();
-    mtl_layer_->setDevice(mtl_device_);
-    mtl_layer_->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-    mtl_layer_->setFramebufferOnly(false);
-    mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(width_),
-                                       static_cast<CGFloat>(height_)});
-
-    pt_metal_attach_layer(native_window_, mtl_layer_);
-    // When the engine creates the device via a cfg-driven backend
-    // switch, the window may not have realised its content-view size
-    // yet -- the caller passes width=0/height=0 in that case. Query
-    // the layer's drawable size (which CoreAnimation has already
-    // populated from the attached NSView) and prefer that when the
-    // caller-supplied dimensions are zero. Matches the same fallback
-    // BeginFrame() uses each frame.
-    if (width_ == 0 || height_ == 0) {
-        auto sz = mtl_layer_->drawableSize();
-        if (sz.width > 0 && sz.height > 0) {
-            width_  = static_cast<int>(sz.width);
-            height_ = static_cast<int>(sz.height);
-        }
-    }
-#elif defined(_WIN32)
+#if defined(_WIN32)
     // pt_window_native_win32 extracts the HWND from the GLFWwindow*
     // the engine handed us via NativeWindowHandle::opaque.
     native_window_ = pt_window_native_win32(window.opaque);
@@ -217,8 +169,7 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
         // Prefer the real client-rect size over the caller-supplied
         // width/height when available -- handles the cfg-driven backend
         // switch where the window dimensions arrive as 0x0 before the
-        // window has finished realising. Same shape as the Mac block
-        // above does via mtl_layer_->drawableSize().
+        // window has finished realising.
         RECT rc{};
         if (GetClientRect(static_cast<HWND>(native_window_), &rc)) {
             int w = static_cast<int>(rc.right  - rc.left);
@@ -237,10 +188,7 @@ SoftwareDevice::SoftwareDevice(const NativeWindowHandle& window) {
     }
     rtcSetDeviceErrorFunction(embree_device_, EmbreeErrorCallback, nullptr);
 
-#if defined(__APPLE__)
-    LOG_INFO("Software backend online (CPU + Embree, Metal present): {}x{}",
-             width_, height_);
-#elif defined(_WIN32)
+#if defined(_WIN32)
     // Pick present path. The default ("vulkan") is the only mode that
     // survives a vulkan -> software backend switch on Windows: once
     // Vulkan touched the HWND, DXGI flip-model permanently locks the
@@ -294,12 +242,6 @@ SoftwareDevice::~SoftwareDevice() {
         textures_.clear();
     }
     if (embree_device_) { rtcReleaseDevice(embree_device_); embree_device_ = nullptr; }
-#if defined(__APPLE__)
-    if (present_tex_)   { present_tex_->release();          present_tex_   = nullptr; }
-    if (mtl_layer_)     { mtl_layer_->release();            mtl_layer_     = nullptr; }
-    if (mtl_queue_)     { mtl_queue_->release();            mtl_queue_     = nullptr; }
-    if (mtl_device_)    { mtl_device_->release();           mtl_device_    = nullptr; }
-#endif
     // Windows: no GDI-side ownership to release. GetDC / ReleaseDC are
     // paired around each Present call so the device-context lifetime
     // never spans frames.
@@ -733,13 +675,7 @@ FrameContext SoftwareDevice::BeginFrame() {
     // Sync our cached width/height with the real window size each
     // frame -- handles late-arriving resize events that the engine
     // hasn't pumped through Resize() yet.
-#if defined(__APPLE__)
-    if (mtl_layer_) {
-        auto sz = mtl_layer_->drawableSize();
-        width_  = static_cast<int>(sz.width);
-        height_ = static_cast<int>(sz.height);
-    }
-#elif defined(_WIN32)
+#if defined(_WIN32)
     if (HWND hwnd = static_cast<HWND>(native_window_)) {
         RECT rc{};
         if (GetClientRect(hwnd, &rc)) {
@@ -759,59 +695,7 @@ FrameContext SoftwareDevice::BeginFrame() {
 }
 
 void SoftwareDevice::EndFrame(CommandBuffer*) {
-#if defined(__APPLE__)
-    if (mtl_layer_ == nullptr || mtl_queue_ == nullptr) { ++frame_index_; return; }
-
-    auto* pool = NS::AutoreleasePool::alloc()->init();
-
-    auto* drawable = mtl_layer_->nextDrawable();
-    if (drawable == nullptr) { pool->release(); ++frame_index_; return; }
-
-    // If the path tracer wrote into the output texture this frame,
-    // upload its CPU backing to a Metal texture and blit-copy to the
-    // drawable. Falls back to the clear-color render-pass path when
-    // no output is populated yet (very first frame before the engine
-    // has dispatched anything).
-    bool blitted = false;
-    BackedTexture* out_tex = GetTexture(TextureHandle{output_tex_id_});
-    if (out_tex != nullptr && out_tex->width > 0 && out_tex->height > 0) {
-        PresentOutput();
-        // PresentOutput uploaded into present_tex_; now blit to the
-        // drawable's texture.
-        if (present_tex_ != nullptr) {
-            auto* cb  = mtl_queue_->commandBuffer();
-            auto* enc = cb->blitCommandEncoder();
-            MTL::Origin src_origin{0, 0, 0};
-            MTL::Size   src_size{present_w_, present_h_, 1};
-            MTL::Origin dst_origin{0, 0, 0};
-            enc->copyFromTexture(present_tex_, 0, 0, src_origin, src_size,
-                                  drawable->texture(), 0, 0, dst_origin);
-            enc->endEncoding();
-            cb->presentDrawable(drawable);
-            cb->commit();
-            blitted = true;
-        }
-    }
-    if (!blitted) {
-        // Fallback: clear-only present.
-        auto* rpd = MTL::RenderPassDescriptor::renderPassDescriptor();
-        auto* attachment = rpd->colorAttachments()->object(0);
-        attachment->setTexture(drawable->texture());
-        attachment->setLoadAction(MTL::LoadActionClear);
-        attachment->setStoreAction(MTL::StoreActionStore);
-        attachment->setClearColor(MTL::ClearColor::Make(
-            pending_clear_[0], pending_clear_[1],
-            pending_clear_[2], pending_clear_[3]));
-
-        auto* cb  = mtl_queue_->commandBuffer();
-        auto* enc = cb->renderCommandEncoder(rpd);
-        enc->endEncoding();
-        cb->presentDrawable(drawable);
-        cb->commit();
-    }
-
-    pool->release();
-#elif defined(_WIN32)
+#if defined(_WIN32)
     // Windows present. Two paths:
     //   - Vulkan-blit (vk_present_ non-null, default): pack output via
     //     PresentOutput() then upload + vkCmdCopyBufferToImage +
@@ -878,10 +762,7 @@ void SoftwareDevice::EndFrame(CommandBuffer*) {
         // the previously-blitted content flashes a single ugly frame.
         // GDI doesn't auto-repaint, so leaving the HDC untouched
         // keeps the last good frame on screen until the kernel
-        // produces a new one -- much better UX than the flash.  Mac
-        // doesn't have this hazard because every Metal frame must
-        // present a drawable, so the equivalent fallback there
-        // genuinely needs to run.
+        // produces a new one -- much better UX than the flash.
         HDC hdc = GetDC(hwnd);
         if (hdc) {
             RECT rc{};
@@ -915,12 +796,7 @@ void SoftwareDevice::Submit(CommandBuffer*) {
 
 void SoftwareDevice::Resize(int w, int h) {
     width_  = w; height_ = h;
-#if defined(__APPLE__)
-    if (mtl_layer_) {
-        mtl_layer_->setDrawableSize(CGSize{static_cast<CGFloat>(w),
-                                           static_cast<CGFloat>(h)});
-    }
-#elif defined(_WIN32)
+#if defined(_WIN32)
     if (vk_present_) vk_present_->Resize(w, h);
 #endif
     // Windows GDI fallback: no layer-side state to resize.  GetClientRect
@@ -1285,8 +1161,7 @@ void SoftwareDevice::PresentOutput() {
     // into that range. Scratch buffer is a class member so the per-
     // frame heap churn (several MB at 1080p / tens of MB at 4K) goes
     // away after the first resize -- only re-allocates when the
-    // swapchain grows.  The packed format 0xAARRGGBB matches both
-    // Metal's BGRA8Unorm pixel format (Mac upload path) and GDI's
+    // swapchain grows.  The packed format 0xAARRGGBB matches GDI's
     // BI_RGB DIB layout (Windows present path).
     const std::size_t pixel_count = std::size_t(w) * h;
     if (present_scratch_.size() < pixel_count) {
@@ -1306,27 +1181,6 @@ void SoftwareDevice::PresentOutput() {
     present_scratch_w_ = w;
     present_scratch_h_ = h;
 
-#if defined(__APPLE__)
-    // Mac upload: copy scratch into a transient MTLTexture so the
-    // EndFrame blit can src from a GPU-side resource into the drawable.
-    if (mtl_device_ == nullptr) return;
-    if (present_tex_ == nullptr || present_w_ != w || present_h_ != h) {
-        if (present_tex_) { present_tex_->release(); present_tex_ = nullptr; }
-        auto* td = MTL::TextureDescriptor::alloc()->init();
-        td->setWidth(w);
-        td->setHeight(h);
-        td->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
-        td->setStorageMode(MTL::StorageModeShared);
-        td->setUsage(MTL::TextureUsageShaderRead);
-        present_tex_ = mtl_device_->newTexture(td);
-        td->release();
-        present_w_ = w;
-        present_h_ = h;
-    }
-    if (present_tex_ == nullptr) return;
-    MTL::Region region = MTL::Region::Make2D(0, 0, w, h);
-    present_tex_->replaceRegion(region, 0, present_scratch_.data(), w * 4);
-#endif
     // Windows: nothing more to do -- EndFrame() reads present_scratch_
     // directly via SetDIBitsToDevice. No intermediate GPU resource.
 }

@@ -32,7 +32,6 @@ inline constexpr std::size_t kMaxPushConstantBytes = 4096;
 enum class BackendType : std::uint8_t {
     None = 0,
     Software,
-    Metal,
     Vulkan,
 };
 
@@ -40,7 +39,6 @@ constexpr const char* BackendName(BackendType b) {
     switch (b) {
         case BackendType::None:     return "none";
         case BackendType::Software: return "software";
-        case BackendType::Metal:    return "metal";
         case BackendType::Vulkan:   return "vulkan";
     }
     return "?";

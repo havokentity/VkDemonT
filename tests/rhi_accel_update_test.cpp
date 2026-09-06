@@ -491,10 +491,6 @@ TEST_CASE("rhi accel: multi-instance TLAS + update verb (software)") {
     RunAccelSuite(BackendType::Software);
 }
 
-TEST_CASE("rhi accel: multi-instance TLAS + update verb (metal)") {
-    RunAccelSuite(BackendType::Metal);
-}
-
 TEST_CASE("rhi accel: multi-instance TLAS + update verb (vulkan)") {
     // Opt-in, and off by default even on a Vulkan build.
     //
@@ -509,8 +505,8 @@ TEST_CASE("rhi accel: multi-instance TLAS + update verb (vulkan)") {
     //
     // Set PT_TEST_VULKAN_ACCEL=1 to run it on a host where a Vulkan
     // device can come up (and expect it to need a headless-device path
-    // in VulkanDevice first). The suite body is identical to the Metal
-    // and software cases by construction -- that is the point of
+    // in VulkanDevice first). The suite body is identical to the
+    // software case by construction -- that is the point of
     // RunAccelSuite -- so wiring Vulkan in later is a one-line change
     // here, not a new test.
     const char* opt_in = std::getenv("PT_TEST_VULKAN_ACCEL");
@@ -562,18 +558,19 @@ int main(int argc, char** argv) {
                     "reporting SKIP, not pass.\n");
         return kCtestSkipExitCode;
     }
-    // Metal is the backend #251 is about -- the software backend cannot
-    // reproduce that bug because it never touches a Metal instance
-    // descriptor. Say so out loud when Metal did not run, so a green CI
-    // tick is never mistaken for cross-backend coverage.
-    bool metal_ran = false;
+    // The instance-id round-trip (#251) is exercised on the hardware-RT
+    // backend. The software backend cannot reproduce that class of bug
+    // because it never touches a GPU instance descriptor. Say so out loud
+    // when only software ran, so a green CI tick is never mistaken for
+    // hardware-RT coverage.
+    bool hw_rt_ran = false;
     for (const auto& o : g_outcomes) {
-        if (o.ran && o.backend == "metal") metal_ran = true;
+        if (o.ran && o.backend == "vulkan") hw_rt_ran = true;
     }
-    if (!metal_ran) {
-        std::printf("  => NOTE: the #251 instance-id guard is Metal-specific "
-                    "and did NOT run here. Software coverage alone does not "
-                    "prove the Metal fix.\n");
+    if (!hw_rt_ran) {
+        std::printf("  => NOTE: the #251 instance-id guard is a hardware-RT "
+                    "concern and did NOT run here. Software coverage alone "
+                    "does not prove the GPU fix.\n");
     }
     std::printf("  => %d backend(s) exercised.\n", ran);
     return res;

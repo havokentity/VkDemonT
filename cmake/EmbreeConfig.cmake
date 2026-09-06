@@ -91,10 +91,7 @@ function(pt_embree_artefact_name out_var config)
     # Default: no -debug suffix (Release everywhere except Windows).
     set(_suffix "")
 
-    if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^arm")
-        set(_plat "macos-arm64")
-        set(_ext "tar.gz")
-    elseif(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^AMD64$|^amd64$|^x86_64$|^x64$")
+    if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^AMD64$|^amd64$|^x86_64$|^x64$")
         # Windows prebuilt is the clang-cl build (matches release.yml's
         # win-clang-release preset).  MSVC consumers can't use AVX-512
         # anyway (Embree refuses cl.exe + AVX-512); they'd fall through
@@ -112,9 +109,8 @@ function(pt_embree_artefact_name out_var config)
             set(_suffix "-debug")
         endif()
     elseif(UNIX AND NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^aarch64$|^arm64$")
-        # Linux ARM64 (Pi 4/5, Graviton, Ampere Altra, etc.).  Same NEON
-        # path Embree uses on Apple Silicon; distinct from macos-arm64
-        # because libc / ABI / linker differ.  Strict aarch64/arm64
+        # Linux ARM64 (Pi 4/5, Graviton, Ampere Altra, etc.), NEON
+        # Embree build.  Strict aarch64/arm64
         # match: earlier `^arm` regex would have caught 32-bit Pi-Zero
         # / Pi-2-A+ hosts (armv7l, armv6l) and pointed them at the
         # ARM64 archive -- wrong ABI, linker would fail.  Those hosts

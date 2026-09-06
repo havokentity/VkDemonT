@@ -224,9 +224,7 @@ namespace {
 // archive paths still work so demont.cfg sharing across hosts keeps
 // round-tripping.
 inline bool CVarVisibleOnThisPlatform(std::uint32_t flags) {
-#if defined(__APPLE__)
-    if ((flags & CVAR_PLATFORM_WIN) != 0) return false;
-#elif defined(_WIN32)
+#if defined(_WIN32)
     if ((flags & CVAR_PLATFORM_MAC) != 0) return false;
 #else
     if ((flags & (CVAR_PLATFORM_MAC | CVAR_PLATFORM_WIN)) != 0) return false;
@@ -282,9 +280,7 @@ std::string PlatformsFromMask(std::uint32_t mask) {
 
 bool CVarValueAllowedOnThisPlatform(std::uint32_t value_flags) {
     if (value_flags == 0u) return true;     // CVAR_VALUE_ANY
-#if defined(__APPLE__)
-    return (value_flags & CVAR_VALUE_MAC) != 0u;
-#elif defined(_WIN32)
+#if defined(_WIN32)
     return (value_flags & CVAR_VALUE_WIN) != 0u;
 #else
     return (value_flags & CVAR_VALUE_LINUX) != 0u;
@@ -292,9 +288,7 @@ bool CVarValueAllowedOnThisPlatform(std::uint32_t value_flags) {
 }
 
 const char* CurrentPlatformName() {
-#if defined(__APPLE__)
-    return "macOS";
-#elif defined(_WIN32)
+#if defined(_WIN32)
     return "Windows";
 #else
     return "Linux";

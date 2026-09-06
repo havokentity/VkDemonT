@@ -1,7 +1,6 @@
 build/
 dist/
 third_party/slang/
-third_party/metal-cpp/
 .cache/
 .idea/
 .vscode/
