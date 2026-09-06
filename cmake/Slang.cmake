@@ -83,12 +83,31 @@ set(PT_SLANGC_OPT "-O0" CACHE STRING
 #
 # pt_compile_slang(TARGET <tgt>
 #                  SOURCE <file.slang>
-#                  STAGE  <compute|vertex|fragment>   default: compute
+#                  STAGE  <compute|vertex|fragment|raygeneration|miss|closesthit|...>
+#                                                     default: compute
 #                  ENTRY  <entry_point>               default: main
 #                  TARGETS spirv [cpp ...]
 #                  MODULE_DEPS <name1> [<name2> ...]
 #                  EXTRA_DEFINES <-DFOO> [-DBAR ...]
+#                  EXTRA_DEPENDS <file> [<file> ...]
+#                  OPT <-O0|-O1|-O2|-O3>              default: ${PT_SLANGC_OPT}
+#                  CAPABILITY <cap>[+<cap>...]
 #                  VARIANT  <suffix>)
+#
+# OPT overrides PT_SLANGC_OPT for ONE record. Step 1 of docs/NEXTGEN_PLAN.md
+# needs it because the -O0 mandate above is a property of the compute
+# megakernel, not of the toolchain: the ray-tracing-pipeline stages built
+# from the same source (shaders/PathTraceRaygen.slang) are exactly the
+# experiment that asks whether a raygen can run optimised, so they name
+# their level explicitly while every existing record keeps PT_SLANGC_OPT.
+#
+# CAPABILITY is passed straight to slangc -capability. The RT stages need
+# spirv_1_6+SPV_KHR_ray_tracing (TraceRay / DispatchRaysIndex); compute
+# records pass nothing and keep slangc's defaults.
+#
+# EXTRA_DEPENDS lists source files the record #includes beyond SOURCE, so
+# ninja rebuilds it when they change (slangc's depfile support is not
+# used; the include graph of these records is one level deep and known).
 #
 # For each requested target, emits a build-time custom command that runs
 # slangc and embeds the result as a binary blob into <tgt>. Symbol names
@@ -158,7 +177,8 @@ function(pt_compile_slang_module)
 endfunction()
 
 function(pt_compile_slang)
-    cmake_parse_arguments(SLG "" "TARGET;SOURCE;STAGE;ENTRY;VARIANT" "TARGETS;MODULE_DEPS;EXTRA_DEFINES" ${ARGN})
+    cmake_parse_arguments(SLG "" "TARGET;SOURCE;STAGE;ENTRY;VARIANT;OPT;CAPABILITY"
+                          "TARGETS;MODULE_DEPS;EXTRA_DEFINES;EXTRA_DEPENDS" ${ARGN})
 
     if(NOT SLG_TARGET OR NOT SLG_SOURCE OR NOT SLG_TARGETS)
         message(FATAL_ERROR "pt_compile_slang needs TARGET / SOURCE / TARGETS")
@@ -168,6 +188,14 @@ function(pt_compile_slang)
     endif()
     if(NOT SLG_ENTRY)
         set(SLG_ENTRY main)
+    endif()
+    # Per-record optimisation level (see the OPT note in the header comment).
+    if(NOT SLG_OPT)
+        set(SLG_OPT ${PT_SLANGC_OPT})
+    endif()
+    set(slg_capability "")
+    if(SLG_CAPABILITY)
+        set(slg_capability -capability ${SLG_CAPABILITY})
     endif()
 
     get_filename_component(slg_name "${SLG_SOURCE}" NAME_WE)
@@ -231,16 +259,17 @@ function(pt_compile_slang)
                     -target  ${slang_target}
                     -entry   ${SLG_ENTRY}
                     -stage   ${SLG_STAGE}
+                    ${slg_capability}
                     ${slang_defs}
                     ${_sdf_defs}
                     ${SLG_EXTRA_DEFINES}
                     -I       "${out_dir}"
                     -Wno-40100
-                    ${PT_SLANGC_OPT}
+                    ${SLG_OPT}
                     -o       "${out}"
-            DEPENDS "${slg_full}" "${PT_SLANGC_BIN}" ${module_outputs}
+            DEPENDS "${slg_full}" "${PT_SLANGC_BIN}" ${module_outputs} ${SLG_EXTRA_DEPENDS}
             VERBATIM
-            COMMENT "slangc ${label} -> ${ext}"
+            COMMENT "slangc ${label} -> ${ext} (${SLG_OPT})"
         )
 
         pt_embed_resource(${SLG_TARGET}

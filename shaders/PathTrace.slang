@@ -48,6 +48,38 @@
 #if !defined(PT_TARGET_SPIRV) || !defined(PT_SPIRV_NO_RAYQUERY)
 [[vk::binding(2, 0)]] RaytracingAccelerationStructure scene_tlas;
 #endif
+// --- Step 1 probe switches (docs/STEP1_RT_PIPELINE_DESIGN.md) --------------
+// PT_RT_PIPELINE: 1 when this source is compiled as the raygeneration stage
+// through shaders/PathTraceRaygen.slang; 0 here, for the compute kernel.
+// PT_PROBE_VARIANT: the P0 / P1 / P2 escalation of the probe (section 1).
+// 2 is the full kernel and the only value the compute build ever takes, so
+// every `#if PT_PROBE_VARIANT >= n` guard below is a no-op on the compute
+// path -- the compute SPIR-V is byte-identical with these blocks present.
+#ifndef PT_RT_PIPELINE
+#define PT_RT_PIPELINE 0
+#endif
+#ifndef PT_PROBE_VARIANT
+#define PT_PROBE_VARIANT 2
+#endif
+#if PT_RT_PIPELINE
+#include "PathTraceRtPayload.slang"
+#endif
+// traceScene's trace-form argument. Only the raygen build has one: the
+// per-pixel work (G-buffer pass, bounce loop) passes PT_TRACE_SCENE_PRIMARY
+// so its trace goes through the hardware pipeline, while transmittance()
+// passes nothing and keeps the inline RayQuery for shadow legs (design
+// R3). The compute build expands all three to nothing, so its traceScene
+// signature and call sites are textually what they were: that is what
+// keeps the compute SPIR-V byte-identical with these blocks present.
+#if PT_RT_PIPELINE
+#define PT_TRACE_SCENE_RT_PARAM         , bool rt_pipeline_trace
+#define PT_TRACE_SCENE_RT_PARAM_DEFAULT , bool rt_pipeline_trace = false
+#define PT_TRACE_SCENE_PRIMARY          , true
+#else
+#define PT_TRACE_SCENE_RT_PARAM
+#define PT_TRACE_SCENE_RT_PARAM_DEFAULT
+#define PT_TRACE_SCENE_PRIMARY
+#endif
 [[vk::binding(3, 0)]] StructuredBuffer<float>  mesh_positions;
 [[vk::binding(4, 0)]] StructuredBuffer<uint>   mesh_indices;
 [[vk::binding(5, 0)]] StructuredBuffer<float4> primitives;
@@ -2603,7 +2635,8 @@ struct HitInfo {
 // Forward declaration: the subsurface random walk (below) re-traces the
 // scene to find the medium boundary, but traceScene is defined further
 // down. Declare it here so the SSS helper links.
-HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone);
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone
+                   PT_TRACE_SCENE_RT_PARAM_DEFAULT);
 
 // --- Wave 9 advanced materials: per-hit extension lookup ------------------
 // Resolve the BSDF lobe extension for a hit by scanning the push-constant
@@ -3274,12 +3307,112 @@ bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) 
     return tmax >= max(tmin, 0.0) && tmin <= t_max;
 }
 
+#if PT_RT_PIPELINE
+// --- Step 1 probe: the TLAS trace when this kernel is a RAYGEN stage ------
+//
+// Compiled only through shaders/PathTraceRaygen.slang (PT_RT_PIPELINE=1);
+// the compute kernel never sees it. The bounce-loop trace in traceScene
+// goes through the VK_KHR_ray_tracing_pipeline instead of RayQuery, and
+// its result is unpacked into the SAME values the query used to yield (t,
+// primitive, barycentrics, instance custom index, object-to-world) so the
+// hit decode below stays the verbatim code the design's 1a contract
+// requires (docs/STEP1_RT_PIPELINE_DESIGN.md section 5). Shadow /
+// transmittance legs keep the inline RayQuery (design R3); traceScene's
+// `rt_pipeline_trace` argument selects which.
+//
+// Two trace forms, selected by PT_RT_HITOBJECT:
+//
+//   0 -> plain TraceRay: the stub closest-hit / miss entries in
+//        PathTraceRtStubs.slang copy the hit accessors into PtRtPayload.
+//        THE FORM THIS PROBE SHIPS.
+//   1 -> HitObject::TraceRay (shader invocation reorder): traversal only,
+//        no closest-hit / miss shader runs, the raygen reads the committed
+//        hit off the HitObject accessors. This is the design's 1a shape.
+//        Kept compilable but NOT used, for two Slang 2026.8 reasons
+//        measured on this tree: (a) HitObject.GetRayTCurrent(),
+//        GetObjectToWorld4x3() and GetRayTMin() are rejected in the
+//        raygeneration stage on the spirv target ("unavailable features in
+//        entry point"), so the t and the matrix are read through
+//        GetRayDesc().TMax (hitObjectGetRayTMax, the hit t for a hit) and
+//        GetObjectToWorld(); (b) the direct SPIR-V emitter mixes
+//        OpTypeHitObjectNV (opcode 5281) with the OpHitObject*EXT opcodes
+//        (5313 and up), which spirv-val rejects ("Type must be
+//        OpTypeHitObjectEXT"); only -emit-spirv-via-glsl produces a valid
+//        EXT module, and that is a different code generator from the one
+//        the compute kernel is built with, which the bitwise A/B forbids.
+//
+// The pipeline's ONE hit group and ONE miss record are both at SBT index
+// 0, so the trace uses hit-group offset 0 / stride 1 / miss index 0.
+
+// What the hit decode consumes. Mirrors the RayQuery Committed*() reads
+// one-for-one so the decode code needs no other change.
+struct PtHwHit {
+    bool     hit;
+    float    t;
+    uint     prim;
+    uint     inst;
+    float2   bary;
+    float4x3 o2w;
+};
+
+static const float4x3 kPtIdentity4x3 = float4x3(1.0, 0.0, 0.0,
+                                                0.0, 1.0, 0.0,
+                                                0.0, 0.0, 1.0,
+                                                0.0, 0.0, 0.0);
+
+PtHwHit ptTraceHardware(RayDesc r) {
+    PtHwHit hw;
+    hw.hit  = false;
+    hw.t    = r.TMax;
+    hw.prim = 0u;
+    hw.inst = 0u;
+    hw.bary = float2(0.0, 0.0);
+    hw.o2w  = kPtIdentity4x3;
+    PtRtPayload p;
+    p.t    = kPtRtMissT;
+    p.prim = 0u;
+    p.inst = 0u;
+    p.bary = float2(0.0, 0.0);
+    p.o2w  = kPtIdentity4x3;
+#if PT_RT_HITOBJECT
+    HitObject ho = HitObject::TraceRay<PtRtPayload>(
+        scene_tlas, RAY_FLAG_NONE, 0xFFu,
+        /*RayContributionToHitGroupIndex=*/0u,
+        /*MultiplierForGeometryContributionToHitGroupIndex=*/1u,
+        /*MissShaderIndex=*/0u, r, p);
+    if (ho.IsHit()) {
+        hw.hit  = true;
+        hw.t    = ho.GetRayDesc().TMax;
+        hw.prim = ho.GetPrimitiveIndex();
+        hw.inst = ho.GetInstanceID();
+        hw.bary = ho.GetAttributes<BuiltInTriangleIntersectionAttributes>().barycentrics;
+        hw.o2w  = ho.GetObjectToWorld();
+    }
+#else
+    TraceRay(scene_tlas, RAY_FLAG_NONE, 0xFFu,
+             /*RayContributionToHitGroupIndex=*/0u,
+             /*MultiplierForGeometryContributionToHitGroupIndex=*/1u,
+             /*MissShaderIndex=*/0u, r, p);
+    if (p.t < kPtRtMissT) {
+        hw.hit  = true;
+        hw.t    = p.t;
+        hw.prim = p.prim;
+        hw.inst = p.inst;
+        hw.bary = p.bary;
+        hw.o2w  = p.o2w;
+    }
+#endif
+    return hw;
+}
+#endif  // PT_RT_PIPELINE
+
 // `cone` is the ray cone at THIS ray's origin (issue #256).  It is the
 // only new input: the near cut every intersector needs is a pure function
 // of it and of the origin, so traceScene derives `t_min` once here rather
 // than making every caller carry a second parameter that could drift out
 // of step with the first.
-HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
+HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone
+                   PT_TRACE_SCENE_RT_PARAM) {
     float t_min = ptRayTMin(ro, cone);
     HitInfo h;
     h.hit = false; h.t = 1e30;
@@ -3624,6 +3757,42 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
         r.TMin      = t_min;
         r.TMax      = h.t;     // limit search to current closest
 
+#if PT_RT_PIPELINE
+        // Raygen stage. The bounce loop and the G-buffer pass pass
+        // rt_pipeline_trace, so their trace goes through the hardware
+        // pipeline: same ray, same TMax pruning, so the committed closest
+        // triangle under that bound is the one RayQuery commits (the
+        // design's R5). transmittance() legs pass false and keep the inline
+        // query (design R3). Both forms land in one PtHwHit so the decode
+        // below is shared. See ptTraceHardware above.
+        PtHwHit hw;
+        if (rt_pipeline_trace) {
+            hw = ptTraceHardware(r);
+        } else {
+            RayQuery<RAY_FLAG_NONE> q;
+            q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, r);
+            while (q.Proceed()) {}
+            hw.hit = (q.CommittedStatus() == COMMITTED_TRIANGLE_HIT);
+            if (hw.hit) {
+                hw.t    = q.CommittedRayT();
+                hw.prim = q.CommittedPrimitiveIndex();
+                hw.inst = q.CommittedInstanceID();
+                hw.bary = q.CommittedTriangleBarycentrics();
+                hw.o2w  = q.CommittedObjectToWorld4x3();
+            } else {
+                hw.t    = r.TMax;
+                hw.prim = 0u;
+                hw.inst = 0u;
+                hw.bary = float2(0.0, 0.0);
+                hw.o2w  = kPtIdentity4x3;
+            }
+        }
+        if (hw.hit) {
+            float t_mesh = hw.t;
+            if (t_mesh < h.t) {
+                uint   prim = hw.prim;
+                float2 bary = hw.bary;
+#else
         RayQuery<RAY_FLAG_NONE> q;
         q.TraceRayInline(scene_tlas, RAY_FLAG_NONE, 0xFFu, r);
         while (q.Proceed()) {}
@@ -3632,6 +3801,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
             if (t_mesh < h.t) {
                 uint   prim = q.CommittedPrimitiveIndex();
                 float2 bary = q.CommittedTriangleBarycentrics();
+#endif  // PT_RT_PIPELINE
 #if PT_PLANET_ENABLED
                 // --- Planetary P4 (#258): per-instance geometry + material -
                 // The first read of CommittedInstanceID() in this engine.
@@ -3640,7 +3810,11 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 // used to inline (MAT_METAL, MESH_ALBEDO, roughness 0.05,
                 // ior 1, push.mesh_tex_indices), so a scene with no planet in
                 // it renders bit-for-bit as it did before this phase.
+#if PT_RT_PIPELINE
+                uint inst = hw.inst;
+#else
                 uint inst = q.CommittedInstanceID();
+#endif
                 InstanceDesc idesc = loadInstanceDesc(inst);
                 if (idesc.kind == kInstKindTerrain) {
                     uint i0 = terrain_indices[idesc.index_base + prim * 3 + 0];
@@ -3713,7 +3887,11 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                                    mesh_positions[i2 * 3 + 1],
                                    mesh_positions[i2 * 3 + 2]);
                 float3 obj_n = normalize(cross(v1 - v0, v2 - v0));
+#if PT_RT_PIPELINE
+                float3x3 wfm = (float3x3)hw.o2w;
+#else
                 float3x3 wfm = (float3x3)q.CommittedObjectToWorld4x3();
+#endif
                 h.hit = true; h.t = t_mesh;
                 h.normal = normalize(mul(wfm, obj_n));
 #if PT_PLANET_ENABLED
@@ -7131,6 +7309,12 @@ float3 skyColorNoSunDisc(float3 ro, float3 rd, inout uint seed) {
 // dielectric and moved a long way from where it started.
 float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
                      PtRayCone cone, uint start_medium = 0u) {
+#if PT_PROBE_VARIANT < 1
+    // P0 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 1): the shadow /
+    // transmittance chain is stubbed to "unoccluded" so P0 measures the
+    // loop skeleton + hardware trace + Lambert alone. P1 restores the body.
+    return float3(1.0);
+#else
     // Cloud optical depth along the original (un-refracted) ray. Real
     // clouds live in a layer high above the scene -- approximating the
     // shadow as the straight-line cloud path is fine because no glass
@@ -7271,6 +7455,7 @@ float3 transmittance(float3 ro, float3 rd, float t_max, float shutter_t01,
         t_max = max(t_max - advance, 0.0);
     }
     return float3(0.0);
+#endif  // PT_PROBE_VARIANT >= 1
 }
 
 // Convenience predicate around transmittance() for the metal /
@@ -7884,9 +8069,21 @@ OceanHit oceanRayMarchShell(float3 ro, float3 rd, float3 shell_n,
 #endif  // PT_WATER_ENABLED
 // --- end Water Phase 1 -----------------------------------------------------
 
+#if PT_RT_PIPELINE
+// Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 1): the SAME
+// body as the compute entry below, driven as a raygen stage. One
+// invocation per pixel from vkCmdTraceRaysKHR(w, h, 1), so
+// DispatchRaysIndex is the pixel exactly as SV_DispatchThreadID was
+// with the 8x8 workgroup; the `tid >= dim` guard stays for the
+// out-of-image invocations a non-multiple-of-8 dispatch used to have.
+[shader("raygeneration")]
+void main() {
+    uint2 tid = DispatchRaysIndex().xy;
+#else
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID) {
+#endif
     uint2 dim;
     output.GetDimensions(dim.x, dim.y);
     if (any(tid >= dim)) return;
@@ -7916,7 +8113,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // of spread per unit distance, zero width at the eye.
         PtRayCone cone0 = ptConeMake(0.0,
                                      (2.0 * pos_fovtan.w) / float(max(dim.y, 1u)));
-        HitInfo h0 = traceScene(ro0, rd0, 1.0, cone0);
+        HitInfo h0 = traceScene(ro0, rd0, 1.0, cone0 PT_TRACE_SCENE_PRIMARY);
         // Wave 8 ocean (#25): displace the G-buffer's water-plane hit too so
         // the denoiser's depth + normal match the shaded displaced surface
         // (otherwise the SVGF/MetalFX reprojection would see a flat plane
@@ -8569,7 +8766,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // outlive the ray it belongs to.
         bool ocean_sun_nee_prev = ocean_sun_nee;
         ocean_sun_nee = false;
-        HitInfo h = traceScene(ro, rd, shutter_t01, cone);
+        HitInfo h = traceScene(ro, rd, shutter_t01, cone PT_TRACE_SCENE_PRIMARY);
         // --- Wave 8 ocean (#25) -- displace the analytic water plane --------
         // When the FFT ocean is on (ocean_params0.x != 0) and the ray hit a
         // MAT_WATER analytic plane, ray-march the displaced FFT heightfield
@@ -9460,6 +9657,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
                 prev_was_lambert_nee  = false;
             }
         }
+#if PT_PROBE_VARIANT >= 1
         else if (h.mat == MAT_METAL) {
             // Wave 9 (#wave9): anisotropic GGX (brushed metal) when the
             // prim carries the MAT_EXT_ANISOTROPIC flag. The base metal F0
@@ -9980,6 +10178,13 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
         }
 #endif  // PT_WATER_ENABLED
+#else   // PT_PROBE_VARIANT < 1
+        // P0 probe: Lambert is the only BSDF; any other material ends the
+        // path. P1 restores the metal / dielectric / water branches above.
+        else {
+            break;
+        }
+#endif  // PT_PROBE_VARIANT >= 1
 
             if (b >= 2u) {
                 float p = max(throughput.r, max(throughput.g, throughput.b));
@@ -10085,6 +10290,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // A proper subsurface scattering integral lands in Phase 5; for
         // Phase 4 we just don't add air-only volumetric terms to an
         // underwater frame.
+#if PT_PROBE_VARIANT >= 2
         if ((vol_params.x > 0.0 || clouds_p1.w > 0.0 || clouds_p3.w > 0.0
              || smoke_active_outer)
             && primary_t_recorded
@@ -11205,6 +11411,7 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
         // --- end Planetary P7 underwater in-scatter -------------------------
 #endif  // PT_WATER_ENABLED
+#endif  // PT_PROBE_VARIANT >= 2 (P0 / P1 probes skip every volumetric march)
 
         // --- Wave 8 spectral (#27) ---
         // Fold this path's hero-wavelength radiance into the frame estimate.

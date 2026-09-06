@@ -131,6 +131,50 @@ pt_compile_slang(
     STAGE compute ENTRY main TARGETS spirv
     VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
     MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
+# --- Step 1 go/no-go probe (docs/STEP1_RT_PIPELINE_DESIGN.md sections 1 and
+# 10, risk R1): the megakernel as a VK_KHR_ray_tracing_pipeline RAYGEN.
+# shaders/PathTraceRaygen.slang #includes PathTrace.slang with
+# PT_RT_PIPELINE=1, so the raygen is built from the same text as the
+# compute kernel above (same defines, same modules; EXTRA_DEPENDS makes
+# ninja rebuild it when the included file changes). Three escalating
+# variants (P0 loop skeleton + HW trace + Lambert, P1 + every BSDF branch +
+# transmittance, P2 = the full kernel), each at -O0 and at -O2: six blobs
+# the engine selects between at run time (r_pt_rt_variant / r_pt_rt_opt),
+# so one build answers the whole matrix. The -O2 level is the experiment:
+# PT_SLANGC_OPT stays -O0 for the compute kernel for the reason recorded
+# in cmake/Slang.cmake.
+set(_pt_rt_cap "spirv_1_6+SPV_KHR_ray_tracing")
+set(_pt_raygen_deps
+    ${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang
+    ${CMAKE_SOURCE_DIR}/shaders/PathTraceRtPayload.slang)
+foreach(_pt_probe_variant 0 1 2)
+    foreach(_pt_probe_opt O0 O2)
+        string(TOLOWER "${_pt_probe_opt}" _pt_probe_opt_lc)
+        pt_compile_slang(
+            TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceRaygen.slang
+            STAGE raygeneration ENTRY main TARGETS spirv
+            VARIANT p${_pt_probe_variant}_${_pt_probe_opt_lc}
+            OPT -${_pt_probe_opt} CAPABILITY ${_pt_rt_cap}
+            EXTRA_DEFINES -DPT_PROBE_VARIANT=${_pt_probe_variant} -DPT_RT_HITOBJECT=0
+                          ${_pt_water_def} ${_pt_light_tree_def} ${_pt_planet_def}
+            EXTRA_DEPENDS ${_pt_raygen_deps}
+            MODULE_DEPS PathTraceMath PathTraceCloud SdfPrimitives SdfFractals RestirReservoir)
+    endforeach()
+endforeach()
+# The stub miss / closest-hit entries the probe pipeline links next to the
+# raygen (one file, two entry points, selected with ENTRY). Tiny, so -O2
+# costs nothing and matches what the design ships for every RT stage.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceRtStubs.slang
+    STAGE miss ENTRY ptMiss TARGETS spirv VARIANT miss
+    OPT -O2 CAPABILITY ${_pt_rt_cap}
+    EXTRA_DEPENDS ${CMAKE_SOURCE_DIR}/shaders/PathTraceRtPayload.slang)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PathTraceRtStubs.slang
+    STAGE closesthit ENTRY ptClosestHit TARGETS spirv VARIANT chit
+    OPT -O2 CAPABILITY ${_pt_rt_cap}
+    EXTRA_DEPENDS ${CMAKE_SOURCE_DIR}/shaders/PathTraceRtPayload.slang)
+# --- end Step 1 probe -----------------------------------------------------
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang
     STAGE compute ENTRY main TARGETS spirv)
