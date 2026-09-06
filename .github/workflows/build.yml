@@ -7,7 +7,10 @@ on:
   push:
     branches: [ main, integration/parallel-batch-1 ]
   pull_request:
-    branches: [ main, integration/parallel-batch-1 ]
+    # No base-branch filter: stacked PRs (a PR whose base is another PR
+    # branch) must get CI too. `push` stays filtered to avoid building every
+    # topic-branch push; nightly-release / the exhaustive sweep are gated on
+    # event type below, so PR runs never tag or publish.
   # Allow running from the Actions tab manually -- also useful for
   # forcing a nightly build outside the schedule.
   workflow_dispatch:
@@ -78,7 +81,24 @@ jobs:
         # excluded here and run in their own step so a render failure
         # produces a downloadable PNG artefact.
         shell: pwsh
-        run: ctest --test-dir build/win-debug --output-on-failure -LE golden
+        run: ctest --test-dir build/win-debug --output-on-failure -LE "golden|nightly"
+
+      # Exhaustive planetary sweep -- the pt_planet_terrain_exhaustive
+      # registration (see tests/CMakeLists.txt + the pt_planet_terrain_test.cpp
+      # header). Split out of pt_planet_terrain to keep the per-PR gate fast;
+      # runs here on the scheduled / manually-dispatched nightly against the
+      # Debug tree built above, so the exhaustive half still runs in CI on the
+      # Windows lane (where the 600 s timeout was tripping) too. A failure
+      # fails this job and therefore skips `nightly-release` (needs: windows).
+      #
+      # --no-tests=error: ctest's default when a label matches nothing is to
+      # log "No tests were found!!!" and exit 0, so a renamed label or a
+      # dropped registration would turn this step into a green no-op -- the
+      # "labelled test nobody executes" that tests/CMakeLists.txt warns about.
+      - name: Exhaustive planetary sweep (ctest, nightly only)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: ctest --test-dir build/win-debug --output-on-failure --no-tests=error -L nightly
 
       # Golden-image regression matrix (#45) -- software backend
       # only. The Windows runner has no usable Vulkan ICD beyond

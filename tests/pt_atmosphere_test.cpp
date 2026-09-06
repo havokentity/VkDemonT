@@ -1702,16 +1702,41 @@ TEST_CASE("shader mirror is still faithful") {
     CHECK(countOf(eng, "elseif(sky_mode_str==\"physical\"){") == 1u);
     CHECK(countOf(eng, "\"physical\"};") == 1u);   // the allowed_values list
 
-    // The star gate, in BOTH copies.  StarsComposite.slang imports no
-    // modules and carries a hand-written mirror of localUp() for that
-    // reason, so it carries a hand-written mirror of the body test too --
-    // and two copies of one gate is exactly the drift hazard this file
-    // exists to catch, so both are counted and the flat-Earth form is
-    // asserted GONE from each rather than merely outnumbered.
-    CHECK(countOf(pt, "boolstar_visible=(cosTheta>-0.05);") == 1u);
+    // The star gate, in every copy.  Two copies of one gate is exactly the
+    // drift hazard this file exists to catch, so all are counted and the
+    // flat-Earth form is asserted GONE from each rather than merely
+    // outnumbered.  PathTrace.slang now carries TWO copies of the
+    // flat-Earth-then-sphere-corrected gate (#333): the original mode-0..3
+    // gate in starsOnly() (origin pos_fovtan) and the mode-4 physical-sky gate
+    // in starsRadianceRaw() (origin ro -- so star visibility is judged from the
+    // same point starsPhysical() extincts from, camera or bounce).  Both are
+    // legitimate; both must be immediately sphere-corrected.  StarsComposite
+    // .slang imports no modules and carries a hand-written mirror of localUp(),
+    // so it mirrors the body test too, counted separately below.
+    CHECK(countOf(pt, "boolstar_visible=(cosTheta>-0.05);") == 2u);
+    // ...and EACH flat-Earth declaration is immediately overwritten by the
+    // sphere solve when there is a body -- the common tail appears exactly as
+    // many times as the declaration, so neither copy is a flat-Earth-only
+    // regression -- and the two copies solve from the two distinct origins.
+    CHECK(countOf(pt, "planet_center_radius.w,b0,b1)&&b0>0.0);") == 2u);
+    CHECK(countOf(pt, "star_visible=!(ptSphereRoots(pos_fovtan.xyz,rd,") == 1u);
+    CHECK(countOf(pt, "star_visible=!(ptSphereRoots(ro,rd,") == 1u);
+    // The day-faded exposure branches live ONLY in starsOnly() (modes 0..3);
+    // starsRadianceRaw() drops the `&& day` fade, so these stay at one copy.
     CHECK(countOf(pt, "if(star_visible&&exposure_pad.z>0.5&&day<0.6){") == 1u);
     CHECK(countOf(pt, "}elseif(star_visible&&exposure_pad.y>0.5&&day<0.6){") == 1u);
     CHECK(countOf(pt, "cosTheta>-0.05&&exposure_pad") == 0u);
+    // ...and the behaviour #333 is about, not just its gate geometry: the
+    // physical mode composes the EXTINCTED star term from the ray's own
+    // origin; skyColor() no longer composes the day-faded starsOnly() onto
+    // any of its mode branches (procSky's own mode-2 injection is a different
+    // call, `sky += starsOnly(rd, sun)`, and is untouched); and the (1 - day)
+    // fade multiplies exactly twice -- both inside starsOnly() -- so a fade
+    // cannot creep back into starsRadianceRaw() unnoticed.
+    CHECK(countOf(pt, "+starsPhysical(ro,rd,sky)") == 1u);
+    CHECK(countOf(pt, "float3star=s*sunSlantTransmittance(ro,rd);") == 1u);
+    CHECK(countOf(pt, "+starsOnly(rd,sun_and_mode.xyz)") == 0u);
+    CHECK(countOf(pt, "*(1.0-day);") == 2u);
     const std::string sc = tighten(PT_SHADER_STARSCOMPOSITE_PATH);
     REQUIRE_FALSE(sc.empty());
     CHECK(countOf(sc, "boolstarRayHitsBody(float3rd){") == 1u);

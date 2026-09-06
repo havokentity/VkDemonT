@@ -140,10 +140,40 @@ private:
     std::size_t    push_size_ = 0;
 };
 
+// What vkCreateDevice was actually asked for from the next-gen roadmap's
+// extension set (docs/NEXTGEN_PLAN.md, step 0). A flag is true only when the
+// extension was requested with its headline feature on, so a later step can
+// build on it without re-probing. Extensions the constructor merely logs as
+// present (cluster / partitioned acceleration structures, cooperative
+// vector / matrix, ...) are deliberately NOT recorded here: the step that
+// uses one enables it and latches what it needs then. Plain integers rather
+// than the Vk*Properties structs so this header stays independent of which
+// extensions the SDK it is compiled against knows about.
+struct VulkanNextGenCaps {
+    bool ray_tracing_pipeline          = false;   // VK_KHR_ray_tracing_pipeline, rayTracingPipeline
+    bool pipeline_library              = false;   // VK_KHR_pipeline_library
+    bool ray_tracing_maintenance1      = false;   // VK_KHR_ray_tracing_maintenance1, rayTracingMaintenance1
+    bool invocation_reorder            = false;   // VK_EXT_ray_tracing_invocation_reorder, rayTracingInvocationReorder
+    bool invocation_reorder_hint_reorders = false; // ...and the reordering hint is REORDER (not NONE)
+    bool position_fetch                = false;   // VK_KHR_ray_tracing_position_fetch, rayTracingPositionFetch
+    bool subgroup_uniform_control_flow = false;   // VK_KHR_shader_subgroup_uniform_control_flow
+    // VkPhysicalDeviceRayTracingPipelinePropertiesKHR, for SBT layout.
+    // Zero when ray_tracing_pipeline is false.
+    std::uint32_t shader_group_handle_size      = 0;
+    std::uint32_t shader_group_base_alignment   = 0;
+    std::uint32_t shader_group_handle_alignment = 0;
+    std::uint32_t max_ray_recursion_depth       = 0;
+    std::uint32_t max_ray_hit_attribute_size    = 0;
+};
+
 class VulkanDevice : public Device {
 public:
     explicit VulkanDevice(const NativeWindowHandle& w);
     ~VulkanDevice() override;
+
+    // Next-gen extensions enabled on device_ (see VulkanNextGenCaps).
+    // Meaningful once IsInitialized().
+    const VulkanNextGenCaps& NextGenCaps() const { return caps_; }
 
     // True iff the constructor finished without early-returning on a
     // missing required feature / failed Vulkan call. The factory in
@@ -404,6 +434,9 @@ private:
     int         height_      = 0;
     std::string device_name_ = "Vulkan Device";
     bool        rt_supported_ = false;
+    // Next-gen extensions actually enabled on device_ (docs/NEXTGEN_PLAN.md
+    // step 0); filled during construction, read via NextGenCaps().
+    VulkanNextGenCaps caps_{};
     // True iff the constructor ran to completion. The factory in
     // Device.cpp checks this and returns nullptr on partial init, so
     // Engine never sees a half-built device whose VkDevice handle is
@@ -424,6 +457,10 @@ private:
     bool        device_lost_  = false;
     std::uint32_t frame_index_ = 0;
     std::uint32_t max_push_constant_size_ = 128;
+    // Effective core version = min(apiVersion requested from the loader,
+    // version the physical device implements). Every version-gated feature
+    // struct in the constructor keys off this.
+    std::uint32_t api_version_ = 0;
 
     // Core handles
     VkInstance              instance_      = VK_NULL_HANDLE;

@@ -105,6 +105,15 @@ bool isSkyAlbedo(float3 a) {
     return (a.r + a.g + a.b) <= kAlbedoSkyEps;
 }
 
+// Demodulation guide -- G = T * A + (1 - T) with A = albedo_tex.rgb and
+// T = albedo_tex.a (camera->surface atmospheric transmittance, min over
+// RGB). Kept in lockstep with DenoiseTemporal.slang, which holds the
+// derivation; the multiply-back below must use the SAME guide the
+// temporal divide used.
+float3 demodGuide(float4 a) {
+    return lerp(float3(1.0), a.rgb, saturate(a.a));
+}
+
 // Read color_in[p] for the A-Trous filter. The input here is already
 // in demodulated lighting space (the temporal pass and any prior
 // A-Trous pass both write the demodulated signal when demod_enabled
@@ -322,14 +331,14 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // target) leave the signal demodulated so subsequent passes /
     // the next frame's temporal divide compose correctly.
     if (demod_enabled != 0u && final_remod != 0u) {
-        float3 a = albedo_tex[uint2(tid)].rgb;
-        if (!isSkyAlbedo(a)) {
+        float4 a = albedo_tex[uint2(tid)];
+        if (!isSkyAlbedo(a.rgb)) {
             // Multiply back by the SAME clamped divisor the demod pass
-            // used (max(a, kDemodEps) per channel) so demod<->remod is
-            // an exact round trip -- raw albedo darkened any channel
-            // below the eps floor 10x (kept in lockstep with
+            // used (max(demodGuide(a), kDemodEps) per channel) so
+            // demod<->remod is an exact round trip -- raw albedo darkened
+            // any channel below the eps floor 10x (kept in lockstep with
             // DenoiseRemod.slang).
-            filtered_color *= max(a, float3(kDemodEps, kDemodEps, kDemodEps));
+            filtered_color *= max(demodGuide(a), float3(kDemodEps, kDemodEps, kDemodEps));
         }
     }
     // Preserve the sample-count tag from the input so subsequent

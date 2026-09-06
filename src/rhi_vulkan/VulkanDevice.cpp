@@ -338,15 +338,39 @@ const char* VkResultToString(VkResult r) {
     }
 }
 
-bool DeviceSupportsExtension(VkPhysicalDevice pd, const char* name) {
-    std::uint32_t n = 0;
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> props(n);
-    vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, props.data());
-    for (auto& p : props) {
-        if (std::strcmp(p.extensionName, name) == 0) return true;
+// The physical device's extension list, enumerated once. The constructor
+// probes ~20 names (RT, mutable descriptors, the next-gen roadmap's
+// extensions); enumerating per probe was fine at four names but is
+// needless churn at twenty.
+class DeviceExtensionSet {
+public:
+    explicit DeviceExtensionSet(VkPhysicalDevice pd) {
+        std::uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, nullptr);
+        props_.resize(n);
+        vkEnumerateDeviceExtensionProperties(pd, nullptr, &n, props_.data());
     }
-    return false;
+    bool Has(const char* name) const {
+        for (const auto& p : props_) {
+            if (std::strcmp(p.extensionName, name) == 0) return true;
+        }
+        return false;
+    }
+
+private:
+    std::vector<VkExtensionProperties> props_;
+};
+
+// "1.4.351"-style rendering of a VK_MAKE_API_VERSION value for the log.
+std::string ApiVersionString(std::uint32_t v) {
+    return fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v),
+                       VK_API_VERSION_PATCH(v));
+}
+
+// Core version with the patch field cleared, for comparisons against the
+// VK_API_VERSION_1_x constants (which carry patch 0).
+constexpr std::uint32_t CoreApiVersion(std::uint32_t v) {
+    return VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(v), VK_API_VERSION_MINOR(v), 0);
 }
 
 }  // namespace
@@ -807,12 +831,34 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     height_ = nw.height;
 
     // ---- Instance ------------------------------------------------------
+    // Request the newest core version this loader offers, capped at 1.4 --
+    // the version whose promoted features (maintenance5/6, subgroup rotate)
+    // the next-gen roadmap's RT-pipeline step builds on
+    // (docs/NEXTGEN_PLAN.md, step 0). A loader older than 1.4 -- or SDK
+    // headers that predate 1.4 and so know neither the version constant nor
+    // VkPhysicalDeviceVulkan14Features -- gets the previous 1.3 request
+    // unchanged: 1.3 is the engine's floor (it chains
+    // VkPhysicalDeviceVulkan13Features). Since Vulkan 1.1 an instance may
+    // legally be created with an apiVersion above what the physical device
+    // implements; the effective version is the minimum of the two, resolved
+    // (and logged) once the device is picked below, and every version-gated
+    // feature struct keys off that effective value.
+    std::uint32_t loader_api = VK_API_VERSION_1_0;
+    vkEnumerateInstanceVersion(&loader_api);
+#if defined(VK_VERSION_1_4)
+    const std::uint32_t requested_api =
+        (CoreApiVersion(loader_api) >= VK_API_VERSION_1_4) ? VK_API_VERSION_1_4
+                                                           : VK_API_VERSION_1_3;
+#else
+    const std::uint32_t requested_api = VK_API_VERSION_1_3;
+#endif
+
     VkApplicationInfo ai{};
     ai.sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     ai.pApplicationName = "DeMonT Engine";
     ai.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
     ai.pEngineName      = "DeMonT";
-    ai.apiVersion       = VK_API_VERSION_1_3;
+    ai.apiVersion       = requested_api;
 
     std::uint32_t glfw_ext_n = 0;
     const char** glfw_exts = glfwGetRequiredInstanceExtensions(&glfw_ext_n);
@@ -888,6 +934,39 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     LOG_INFO("Vulkan device: {}", device_name_);
     LOG_INFO("  maxPushConstantsSize: {}", max_push_constant_size_);
 
+    // Effective core version = min(what we asked the loader for, what the
+    // device implements). Everything version-gated below (the 1.3 / 1.4
+    // promoted-feature structs) keys off this, never off requested_api.
+    const std::uint32_t device_api = CoreApiVersion(props.apiVersion);
+    api_version_ = std::min(requested_api, device_api);
+    const bool have_core_13 = api_version_ >= VK_API_VERSION_1_3;
+#if defined(VK_VERSION_1_4)
+    const bool have_core_14 = api_version_ >= VK_API_VERSION_1_4;
+#else
+    const bool have_core_14 = false;
+#endif
+    // VkPhysicalDeviceDriverProperties (core 1.2) carries the vendor's own
+    // version string ("616.56" on NVIDIA) -- the number a driver bug report
+    // is filed against, so it belongs in the startup log verbatim.
+    VkPhysicalDeviceDriverProperties driver_props{};
+    driver_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    if (device_api >= VK_API_VERSION_1_2) {
+        VkPhysicalDeviceProperties2 dp2{};
+        dp2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        dp2.pNext = &driver_props;
+        vkGetPhysicalDeviceProperties2(phys_device_, &dp2);
+    }
+    LOG_INFO("Vulkan API: loader {} device {} driver '{}' {} -> requested {} effective {}",
+             ApiVersionString(loader_api), ApiVersionString(props.apiVersion),
+             driver_props.driverName, driver_props.driverInfo,
+             ApiVersionString(requested_api), ApiVersionString(api_version_));
+    if (!have_core_14) {
+        LOG_WARN("Vulkan: core 1.4 unavailable (loader {} / device {} / headers {}); the 1.4 "
+                 "promoted features stay off and the engine runs its 1.3 configuration",
+                 ApiVersionString(loader_api), ApiVersionString(props.apiVersion),
+                 ApiVersionString(VK_HEADER_VERSION_COMPLETE));
+    }
+
     // --- Per-pass GPU timestamps capability (#320) ------------------------
     // timestampComputeAndGraphics guarantees every compute/graphics queue
     // family reports a non-zero timestampValidBits; we still read the chosen
@@ -933,9 +1012,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // ---- Logical device ----------------------------------------------
     // Probe for the optional extensions first; we'll degrade to "no
     // hardware RT" if the driver lacks them (e.g. very old card).
-    bool has_ray_query        = DeviceSupportsExtension(phys_device_, VK_KHR_RAY_QUERY_EXTENSION_NAME);
-    bool has_accel_struct     = DeviceSupportsExtension(phys_device_, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-    bool has_deferred_host_op = DeviceSupportsExtension(phys_device_, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    const DeviceExtensionSet phys_exts(phys_device_);
+    bool has_ray_query        = phys_exts.Has(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    bool has_accel_struct     = phys_exts.Has(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    bool has_deferred_host_op = phys_exts.Has(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     rt_supported_ = has_ray_query && has_accel_struct && has_deferred_host_op;
     // One-line log for the bringup gate so the cause of a missing RT
     // path is obvious in the console. On drivers without ray query /
@@ -946,6 +1026,137 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     LOG_INFO("Vulkan RT extension presence: ray_query={} accel_struct={} deferred_host_op={} -> hw_rt={}",
              has_ray_query, has_accel_struct, has_deferred_host_op, rt_supported_);
 
+    // ---- Next-gen capability probe (docs/NEXTGEN_PLAN.md, step 0) ---------
+    // Presence of every extension the roadmap's later steps depend on, plus
+    // the properties those steps size their data structures from. Each
+    // struct is guarded by its extension's spec macro so the tree still
+    // compiles against an SDK that predates it, and is chained only when
+    // the driver exposes the extension (the validation layers flag feature/
+    // property structs from unexposed extensions). Presence here is
+    // diagnostic; what actually gets ENABLED is decided further down, and
+    // is deliberately the low-risk subset -- cluster / partitioned
+    // acceleration structures and the cooperative vector/matrix family stay
+    // query-only until the step that uses them lands.
+    bool has_rt_pipeline = false, has_pipeline_library = false, has_rt_maint1 = false,
+         has_ser_ext = false, has_ser_nv = false, has_pos_fetch = false, has_sucf = false,
+         has_clas = false, has_ptlas = false, has_coopvec = false, has_coopmat = false,
+         has_coopmat2 = false, has_fp8 = false, has_bf16 = false, has_omm = false;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    has_rt_pipeline = phys_exts.Has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_pipeline_library)
+    has_pipeline_library = phys_exts.Has(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    has_rt_maint1 = phys_exts.Has(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    has_ser_ext = phys_exts.Has(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    has_ser_nv = phys_exts.Has(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    has_pos_fetch = phys_exts.Has(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    has_sucf = phys_exts.Has(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    has_clas = phys_exts.Has(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    has_ptlas = phys_exts.Has(VK_NV_PARTITIONED_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cooperative_vector)
+    has_coopvec = phys_exts.Has(VK_NV_COOPERATIVE_VECTOR_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    has_coopmat = phys_exts.Has(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    has_coopmat2 = phys_exts.Has(VK_NV_COOPERATIVE_MATRIX_2_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_shader_float8)
+    has_fp8 = phys_exts.Has(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    has_bf16 = phys_exts.Has(VK_KHR_SHADER_BFLOAT16_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    has_omm = phys_exts.Has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+#endif
+    // The RT-pipeline family layers on VK_KHR_acceleration_structure, so it
+    // is only meaningful (and only enabled below) on a hardware-RT device.
+    has_rt_pipeline = has_rt_pipeline && rt_supported_;
+    has_rt_maint1   = has_rt_maint1 && rt_supported_;
+    has_pos_fetch   = has_pos_fetch && rt_supported_;
+    has_ser_ext     = has_ser_ext && has_rt_pipeline;   // requires VK_KHR_ray_tracing_pipeline
+    has_ser_nv      = has_ser_nv && has_rt_pipeline;
+
+    // Properties. Plain locals are filled from the guarded structs so the
+    // log lines and caps_ below need no #ifdefs of their own; 0 / NONE
+    // means "extension absent or SDK too old to know about it".
+    VkPhysicalDeviceProperties2 ng_props2{};
+    ng_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    void** ng_props_next = &ng_props2.pNext;
+    auto chain_props = [&](void* node, void** node_next) {
+        *ng_props_next = node;
+        ng_props_next = node_next;
+    };
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtp_props{};
+    rtp_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
+    if (has_rt_pipeline) chain_props(&rtp_props, reinterpret_cast<void**>(&rtp_props.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT ser_ext_props{};
+    ser_ext_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_EXT;
+    if (has_ser_ext) chain_props(&ser_ext_props, reinterpret_cast<void**>(&ser_ext_props.pNext));
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderPropertiesNV ser_nv_props{};
+    ser_nv_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_PROPERTIES_NV;
+    if (has_ser_nv) chain_props(&ser_nv_props, reinterpret_cast<void**>(&ser_nv_props.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructurePropertiesNV clas_props{};
+    clas_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+    if (has_clas) chain_props(&clas_props, reinterpret_cast<void**>(&clas_props.pNext));
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    VkPhysicalDevicePartitionedAccelerationStructurePropertiesNV ptlas_props{};
+    ptlas_props.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_PROPERTIES_NV;
+    if (has_ptlas) chain_props(&ptlas_props, reinterpret_cast<void**>(&ptlas_props.pNext));
+#endif
+#if defined(VK_NV_cooperative_vector)
+    VkPhysicalDeviceCooperativeVectorPropertiesNV coopvec_props{};
+    coopvec_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_PROPERTIES_NV;
+    if (has_coopvec) chain_props(&coopvec_props, reinterpret_cast<void**>(&coopvec_props.pNext));
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR coopmat_props{};
+    coopmat_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    if (has_coopmat) chain_props(&coopmat_props, reinterpret_cast<void**>(&coopmat_props.pNext));
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    VkPhysicalDeviceCooperativeMatrix2PropertiesNV coopmat2_props{};
+    coopmat2_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_PROPERTIES_NV;
+    if (has_coopmat2) chain_props(&coopmat2_props, reinterpret_cast<void**>(&coopmat2_props.pNext));
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    VkPhysicalDeviceOpacityMicromapPropertiesEXT omm_props{};
+    omm_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
+    if (has_omm) chain_props(&omm_props, reinterpret_cast<void**>(&omm_props.pNext));
+#endif
+    if (ng_props2.pNext != nullptr) {
+        vkGetPhysicalDeviceProperties2(phys_device_, &ng_props2);
+    }
+
     // Query feature support before enabling anything in vkCreateDevice.
     VkPhysicalDeviceFeatures2 f2_supported{};
     f2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
@@ -953,6 +1164,15 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     VkPhysicalDeviceVulkan12Features v12_supported{};
     v12_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     f2_supported.pNext = &v12_supported;
+
+    // The 1.3 / 1.4 promoted-feature structs may only be chained on a
+    // device that implements that core version.
+    VkPhysicalDeviceVulkan13Features v13_supported{};
+    v13_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+#if defined(VK_VERSION_1_4)
+    VkPhysicalDeviceVulkan14Features v14_supported{};
+    v14_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+#endif
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_supported{};
     as_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -964,11 +1184,235 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         *supported_next = node;
         supported_next = node_next;
     };
+    if (have_core_13) {
+        chain_supported(&v13_supported, reinterpret_cast<void**>(&v13_supported.pNext));
+    }
+#if defined(VK_VERSION_1_4)
+    if (have_core_14) {
+        chain_supported(&v14_supported, reinterpret_cast<void**>(&v14_supported.pNext));
+    }
+#endif
     if (rt_supported_) {
         chain_supported(&as_supported, reinterpret_cast<void**>(&as_supported.pNext));
         chain_supported(&rq_supported, reinterpret_cast<void**>(&rq_supported.pNext));
     }
+    // Next-gen feature structs (same guard discipline as the properties).
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_supported{};
+    rtp_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    if (has_rt_pipeline) chain_supported(&rtp_supported, reinterpret_cast<void**>(&rtp_supported.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_supported{};
+    rtm1_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+    if (has_rt_maint1) chain_supported(&rtm1_supported, reinterpret_cast<void**>(&rtm1_supported.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_ext_supported{};
+    ser_ext_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+    if (has_ser_ext) chain_supported(&ser_ext_supported, reinterpret_cast<void**>(&ser_ext_supported.pNext));
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesNV ser_nv_supported{};
+    ser_nv_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_NV;
+    if (has_ser_nv) chain_supported(&ser_nv_supported, reinterpret_cast<void**>(&ser_nv_supported.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posfetch_supported{};
+    posfetch_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+    if (has_pos_fetch) chain_supported(&posfetch_supported, reinterpret_cast<void**>(&posfetch_supported.pNext));
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR sucf_supported{};
+    sucf_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    if (has_sucf) chain_supported(&sucf_supported, reinterpret_cast<void**>(&sucf_supported.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clas_supported{};
+    clas_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+    if (has_clas) chain_supported(&clas_supported, reinterpret_cast<void**>(&clas_supported.pNext));
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    VkPhysicalDevicePartitionedAccelerationStructureFeaturesNV ptlas_supported{};
+    ptlas_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PARTITIONED_ACCELERATION_STRUCTURE_FEATURES_NV;
+    if (has_ptlas) chain_supported(&ptlas_supported, reinterpret_cast<void**>(&ptlas_supported.pNext));
+#endif
+#if defined(VK_NV_cooperative_vector)
+    VkPhysicalDeviceCooperativeVectorFeaturesNV coopvec_supported{};
+    coopvec_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_VECTOR_FEATURES_NV;
+    if (has_coopvec) chain_supported(&coopvec_supported, reinterpret_cast<void**>(&coopvec_supported.pNext));
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopmat_supported{};
+    coopmat_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    if (has_coopmat) chain_supported(&coopmat_supported, reinterpret_cast<void**>(&coopmat_supported.pNext));
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    VkPhysicalDeviceCooperativeMatrix2FeaturesNV coopmat2_supported{};
+    coopmat2_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_2_FEATURES_NV;
+    if (has_coopmat2) chain_supported(&coopmat2_supported, reinterpret_cast<void**>(&coopmat2_supported.pNext));
+#endif
+#if defined(VK_EXT_shader_float8)
+    VkPhysicalDeviceShaderFloat8FeaturesEXT fp8_supported{};
+    fp8_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
+    if (has_fp8) chain_supported(&fp8_supported, reinterpret_cast<void**>(&fp8_supported.pNext));
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    VkPhysicalDeviceShaderBfloat16FeaturesKHR bf16_supported{};
+    bf16_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_BFLOAT16_FEATURES_KHR;
+    if (has_bf16) chain_supported(&bf16_supported, reinterpret_cast<void**>(&bf16_supported.pNext));
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    VkPhysicalDeviceOpacityMicromapFeaturesEXT omm_supported{};
+    omm_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
+    if (has_omm) chain_supported(&omm_supported, reinterpret_cast<void**>(&omm_supported.pNext));
+#endif
     vkGetPhysicalDeviceFeatures2(phys_device_, &f2_supported);
+
+    // Flatten the guarded results into plain values for the log block, the
+    // enable decisions and caps_. "feat_*" = the driver reports the
+    // extension's headline feature; "*_present" = extension exposed.
+    bool feat_rt_pipeline = false, feat_rt_maint1 = false, feat_ser_ext = false,
+         feat_ser_nv = false, feat_pos_fetch = false, feat_sucf = false, feat_clas = false,
+         feat_ptlas = false, feat_coopvec = false, feat_coopvec_training = false,
+         feat_coopmat = false, feat_coopmat2_wg = false, feat_coopmat2_flex = false,
+         feat_fp8 = false, feat_fp8_coopmat = false, feat_bf16_type = false,
+         feat_bf16_dot = false, feat_bf16_coopmat = false, feat_omm = false;
+    bool ser_ext_reorders = false, ser_nv_reorders = false;
+    std::uint32_t rtp_handle_size = 0, rtp_max_recursion = 0, rtp_max_hit_attr = 0,
+                  rtp_base_align = 0, rtp_handle_align = 0, rtp_max_dispatch = 0,
+                  ser_ext_max_sbt_index = 0;
+    std::uint32_t clas_max_verts = 0, clas_max_tris = 0, clas_scratch_align = 0,
+                  clas_align = 0, clas_template_align = 0, clas_blas_align = 0,
+                  clas_template_bounds_align = 0, clas_max_geom_index = 0;
+    std::uint32_t ptlas_max_partitions = 0, coopvec_max_components = 0,
+                  coopmat2_wg_max_size = 0, coopmat2_flex_max_dim = 0,
+                  omm_max_2state_subdiv = 0, omm_max_4state_subdiv = 0;
+    std::uint32_t coopvec_stages = 0, coopmat_stages = 0;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    feat_rt_pipeline  = rtp_supported.rayTracingPipeline == VK_TRUE;
+    rtp_handle_size   = rtp_props.shaderGroupHandleSize;
+    rtp_max_recursion = rtp_props.maxRayRecursionDepth;
+    rtp_max_hit_attr  = rtp_props.maxRayHitAttributeSize;
+    rtp_base_align    = rtp_props.shaderGroupBaseAlignment;
+    rtp_handle_align  = rtp_props.shaderGroupHandleAlignment;
+    rtp_max_dispatch  = rtp_props.maxRayDispatchInvocationCount;
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    feat_rt_maint1 = rtm1_supported.rayTracingMaintenance1 == VK_TRUE;
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    feat_ser_ext = ser_ext_supported.rayTracingInvocationReorder == VK_TRUE;
+    ser_ext_reorders = ser_ext_props.rayTracingInvocationReorderReorderingHint ==
+                       VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT;
+    ser_ext_max_sbt_index = ser_ext_props.maxShaderBindingTableRecordIndex;
+#endif
+#if defined(VK_NV_ray_tracing_invocation_reorder)
+    feat_ser_nv = ser_nv_supported.rayTracingInvocationReorder == VK_TRUE;
+    ser_nv_reorders = ser_nv_props.rayTracingInvocationReorderReorderingHint ==
+                      VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_NV;
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    feat_pos_fetch = posfetch_supported.rayTracingPositionFetch == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    feat_sucf = sucf_supported.shaderSubgroupUniformControlFlow == VK_TRUE;
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    feat_clas                  = clas_supported.clusterAccelerationStructure == VK_TRUE;
+    clas_max_verts             = clas_props.maxVerticesPerCluster;
+    clas_max_tris              = clas_props.maxTrianglesPerCluster;
+    clas_scratch_align         = clas_props.clusterScratchByteAlignment;
+    clas_align                 = clas_props.clusterByteAlignment;
+    clas_template_align        = clas_props.clusterTemplateByteAlignment;
+    clas_blas_align            = clas_props.clusterBottomLevelByteAlignment;
+    clas_template_bounds_align = clas_props.clusterTemplateBoundsByteAlignment;
+    clas_max_geom_index        = clas_props.maxClusterGeometryIndex;
+#endif
+#if defined(VK_NV_partitioned_acceleration_structure)
+    feat_ptlas           = ptlas_supported.partitionedAccelerationStructure == VK_TRUE;
+    ptlas_max_partitions = ptlas_props.maxPartitionCount;
+#endif
+#if defined(VK_NV_cooperative_vector)
+    feat_coopvec           = coopvec_supported.cooperativeVector == VK_TRUE;
+    feat_coopvec_training  = coopvec_supported.cooperativeVectorTraining == VK_TRUE;
+    coopvec_stages         = coopvec_props.cooperativeVectorSupportedStages;
+    coopvec_max_components = coopvec_props.maxCooperativeVectorComponents;
+#endif
+#if defined(VK_KHR_cooperative_matrix)
+    feat_coopmat   = coopmat_supported.cooperativeMatrix == VK_TRUE;
+    coopmat_stages = coopmat_props.cooperativeMatrixSupportedStages;
+#endif
+#if defined(VK_NV_cooperative_matrix2)
+    feat_coopmat2_wg     = coopmat2_supported.cooperativeMatrixWorkgroupScope == VK_TRUE;
+    feat_coopmat2_flex   = coopmat2_supported.cooperativeMatrixFlexibleDimensions == VK_TRUE;
+    coopmat2_wg_max_size = coopmat2_props.cooperativeMatrixWorkgroupScopeMaxWorkgroupSize;
+    coopmat2_flex_max_dim = coopmat2_props.cooperativeMatrixFlexibleDimensionsMaxDimension;
+#endif
+#if defined(VK_EXT_shader_float8)
+    feat_fp8         = fp8_supported.shaderFloat8 == VK_TRUE;
+    feat_fp8_coopmat = fp8_supported.shaderFloat8CooperativeMatrix == VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_bfloat16)
+    feat_bf16_type    = bf16_supported.shaderBFloat16Type == VK_TRUE;
+    feat_bf16_dot     = bf16_supported.shaderBFloat16DotProduct == VK_TRUE;
+    feat_bf16_coopmat = bf16_supported.shaderBFloat16CooperativeMatrix == VK_TRUE;
+#endif
+#if defined(VK_EXT_opacity_micromap)
+    feat_omm              = omm_supported.micromap == VK_TRUE;
+    omm_max_2state_subdiv = omm_props.maxOpacity2StateSubdivisionLevel;
+    omm_max_4state_subdiv = omm_props.maxOpacity4StateSubdivisionLevel;
+#endif
+
+    // The diagnostic block. One line per roadmap area, INFO like the RT
+    // presence line above, so the whole capability picture of the box is
+    // pasteable from the startup log.
+    LOG_INFO("Vulkan next-gen [rt pipeline]: ray_tracing_pipeline={} (feature={}, "
+             "maxRayRecursionDepth={}, shaderGroupHandleSize={}, maxRayHitAttributeSize={}, "
+             "shaderGroupBaseAlignment={}, shaderGroupHandleAlignment={}, "
+             "maxRayDispatchInvocationCount={}) pipeline_library={} "
+             "ray_tracing_maintenance1={} (feature={}) position_fetch={} (feature={})",
+             has_rt_pipeline, feat_rt_pipeline, rtp_max_recursion, rtp_handle_size,
+             rtp_max_hit_attr, rtp_base_align, rtp_handle_align, rtp_max_dispatch,
+             has_pipeline_library, has_rt_maint1, feat_rt_maint1, has_pos_fetch, feat_pos_fetch);
+    LOG_INFO("Vulkan next-gen [SER]: invocation_reorder EXT={} (feature={}, mode={}, "
+             "maxShaderBindingTableRecordIndex={}) NV={} (feature={}, mode={})",
+             has_ser_ext, feat_ser_ext, ser_ext_reorders ? "REORDER" : "NONE",
+             ser_ext_max_sbt_index, has_ser_nv, feat_ser_nv, ser_nv_reorders ? "REORDER" : "NONE");
+    LOG_INFO("Vulkan next-gen [mega geometry]: cluster_accel_struct={} (feature={}, "
+             "maxVerticesPerCluster={}, maxTrianglesPerCluster={}, clusterScratchByteAlignment={}, "
+             "clusterByteAlignment={}, clusterTemplateByteAlignment={}, "
+             "clusterBottomLevelByteAlignment={}, clusterTemplateBoundsByteAlignment={}, "
+             "maxClusterGeometryIndex={}) partitioned_accel_struct={} (feature={}, maxPartitionCount={})",
+             has_clas, feat_clas, clas_max_verts, clas_max_tris, clas_scratch_align, clas_align,
+             clas_template_align, clas_blas_align, clas_template_bounds_align, clas_max_geom_index,
+             has_ptlas, feat_ptlas, ptlas_max_partitions);
+    LOG_INFO("Vulkan next-gen [neural]: cooperative_vector={} (feature={}, training={}, "
+             "stages=0x{:x}, maxCooperativeVectorComponents={}) cooperative_matrix KHR={} "
+             "(feature={}, stages=0x{:x}) NV2={} (workgroupScope={} maxWorkgroupSize={}, "
+             "flexibleDimensions={} maxDimension={}) shader_float8={} (feature={}, coopmat={}) "
+             "shader_bfloat16={} (type={}, dot={}, coopmat={})",
+             has_coopvec, feat_coopvec, feat_coopvec_training, coopvec_stages,
+             coopvec_max_components, has_coopmat, feat_coopmat, coopmat_stages, has_coopmat2,
+             feat_coopmat2_wg, coopmat2_wg_max_size, feat_coopmat2_flex, coopmat2_flex_max_dim,
+             has_fp8, feat_fp8, feat_fp8_coopmat, has_bf16, feat_bf16_type, feat_bf16_dot,
+             feat_bf16_coopmat);
+    LOG_INFO("Vulkan next-gen [misc]: subgroup_uniform_control_flow={} (feature={}) "
+             "opacity_micromap={} (feature={}, maxOpacity2StateSubdivisionLevel={}, "
+             "maxOpacity4StateSubdivisionLevel={})",
+             has_sucf, feat_sucf, has_omm, feat_omm, omm_max_2state_subdiv, omm_max_4state_subdiv);
+
+    // SBT layout properties for step 1; zero unless the RT pipeline
+    // extension is present (and, below, enabled).
+    caps_.shader_group_handle_size         = rtp_handle_size;
+    caps_.shader_group_base_alignment      = rtp_base_align;
+    caps_.shader_group_handle_alignment    = rtp_handle_align;
+    caps_.max_ray_recursion_depth          = rtp_max_recursion;
+    caps_.max_ray_hit_attribute_size       = rtp_max_hit_attr;
 
     const bool supports_storage_image_rw_wo_format =
         f2_supported.features.shaderStorageImageReadWithoutFormat == VK_TRUE &&
@@ -1036,6 +1480,61 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dexts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         dexts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
+    // VK_EXT_mutable_descriptor_type: the shared descriptor-set layout is a
+    // single "god" layout that every compute kernel is dispatched against,
+    // Metal-style, with per-kernel binding *numbers* that mean different
+    // resource TYPES per kernel (e.g. binding 2 is the scene TLAS for
+    // PathTrace but a storage image -- clouds_color_prev / depth_tex -- for
+    // the cloud kernels, which the engine binds via BindStorageTexture(2,..)).
+    // A strictly-typed Vulkan layout can't express that; MoltenVK tolerated
+    // it (per-pipeline Metal argument buffers) but a native NVIDIA driver
+    // faults the GPU (DEVICE_LOST) on the first mismatched dispatch. Mutable
+    // descriptors let one binding hold any of a listed set of types, which
+    // is exactly the polymorphic-slot model this engine assumes. Optional:
+    // if the driver lacks it we fall back to the strict layout (binding 2
+    // stays acceleration-structure-only and the cloud kernels still fault --
+    // a follow-up would re-slot those shaders instead).
+    const bool supports_mutable_desc =
+        phys_exts.Has(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    // Only load-bearing where binding 2 is the (typed) acceleration structure,
+    // i.e. on hardware-RT builds; the norq layout omits binding 2 entirely.
+    const bool use_mutable_binding2 = supports_mutable_desc && rt_supported_;
+    if (use_mutable_binding2) {
+        dexts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    }
+    // Next-gen roadmap, step 0: enable the low-risk RT-pipeline family now so
+    // steps 1 (RT pipeline + SER) and 2 (cluster geometry, whose hit decode
+    // wants position fetch) never touch device creation again. Each is
+    // enabled only when the driver exposes the extension AND reports its
+    // headline feature; a device without them keeps today's compute +
+    // RayQuery configuration untouched. Nothing here changes how the
+    // existing kernels compile or dispatch -- the features are inert until
+    // a pipeline or shader asks for them.
+    const bool enable_rt_pipeline = has_rt_pipeline && feat_rt_pipeline;
+    const bool enable_rt_maint1   = has_rt_maint1 && feat_rt_maint1;
+    const bool enable_ser_ext     = enable_rt_pipeline && has_ser_ext && feat_ser_ext;
+    const bool enable_pos_fetch   = has_pos_fetch && feat_pos_fetch;
+    const bool enable_sucf        = has_sucf && feat_sucf;
+    // VK_KHR_pipeline_library has no feature struct; presence is enough.
+    const bool enable_pipeline_library = has_pipeline_library;
+#if defined(VK_KHR_ray_tracing_pipeline)
+    if (enable_rt_pipeline) dexts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_pipeline_library)
+    if (enable_pipeline_library) dexts.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    if (enable_rt_maint1) dexts.push_back(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    if (enable_ser_ext) dexts.push_back(VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    if (enable_pos_fetch) dexts.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    if (enable_sucf) dexts.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+#endif
 #if defined(PT_ENABLE_OPTIX)
     // CUDA-Vulkan interop for the OptiX denoiser. The base
     // VK_KHR_external_memory / VK_KHR_external_semaphore are core 1.1
@@ -1093,8 +1592,82 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         (v12_supported.timelineSemaphore == VK_TRUE) ? VK_TRUE : VK_FALSE;
 #endif
 
+    // Core-1.2 layout relaxations the NRC library's SPIR-V declares
+    // (docs/NEXTGEN_PLAN.md section 4); enabling them only widens what the
+    // driver accepts, it changes nothing about the layouts today's shaders
+    // already use.
+    v12.scalarBlockLayout           = v12_supported.scalarBlockLayout;
+    v12.uniformBufferStandardLayout = v12_supported.uniformBufferStandardLayout;
+
+    // Core 1.3: the three docs/NEXTGEN_PLAN.md step 0 lists, set from the
+    // supported struct so an implementation lacking one leaves it off
+    // rather than failing vkCreateDevice.
+    //   maintenance4 -- SPIR-V LocalSizeId, relaxed interface matching
+    //                   between stages, and a VkPipelineLayout that may be
+    //                   destroyed as soon as the pipeline it built exists
+    //                   (multi-stage RT pipelines).
+    //   synchronization2 -- vkCmdPipelineBarrier2 / vkQueueSubmit2 with the
+    //                   64-bit VK_PIPELINE_STAGE_2_* masks; the 1.0 entry
+    //                   points the existing barriers use stay valid
+    //                   alongside, so nothing recorded today changes.
+    //   shaderDemoteToHelperInvocation -- governs
+    //                   OpDemoteToHelperInvocation, a fragment-stage
+    //                   construct no compute / RT stage uses: inert here,
+    //                   enabled only so a later module may declare it
+    //                   without another device-creation change.
     VkPhysicalDeviceVulkan13Features v13{};
     v13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    v13.maintenance4                   = v13_supported.maintenance4;
+    v13.synchronization2               = v13_supported.synchronization2;
+    v13.shaderDemoteToHelperInvocation = v13_supported.shaderDemoteToHelperInvocation;
+
+    // Core 1.4, only when the effective version is 1.4: the pipeline
+    // plumbing and the subgroup ops the roadmap draws on.
+    //   maintenance5 -- VkPipelineCreateFlags2 / VkBufferUsageFlags2. It
+    //                   also pins vkGetDeviceProcAddr to NULL for functions
+    //                   of extensions that were not enabled (undefined
+    //                   before); checked: every proc the engine resolves is
+    //                   core or belongs to an extension it enabled.
+    //   maintenance6 -- vkCmdBindDescriptorSets2 / VkBindDescriptorSetsInfo,
+    //                   VK_NULL_HANDLE set layouts in a pipeline layout.
+    //   shaderSubgroupRotate(+Clustered) -- the wavefront-compaction passes
+    //                   of step 1's fallback.
+    // Everything else in VkPhysicalDeviceVulkan14Features is rasterisation
+    // plumbing (line styles, vertex divisors, dynamic-rendering local read,
+    // index-type uint8), hostImageCopy, pushDescriptor, or the robustness /
+    // protected-access pair: nothing on the roadmap needs them, so they
+    // stay off. Plain bools mirror what got set so the log line below needs
+    // no #ifdef of its own.
+    bool en_maintenance5 = false, en_maintenance6 = false, en_subgroup_rotate = false,
+         en_subgroup_rotate_clustered = false;
+#if defined(VK_VERSION_1_4)
+    VkPhysicalDeviceVulkan14Features v14{};
+    v14.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES;
+    if (have_core_14) {
+        v14.maintenance5                  = v14_supported.maintenance5;
+        v14.maintenance6                  = v14_supported.maintenance6;
+        v14.shaderSubgroupRotate          = v14_supported.shaderSubgroupRotate;
+        v14.shaderSubgroupRotateClustered = v14_supported.shaderSubgroupRotateClustered;
+    }
+    en_maintenance5              = v14.maintenance5 == VK_TRUE;
+    en_maintenance6              = v14.maintenance6 == VK_TRUE;
+    en_subgroup_rotate           = v14.shaderSubgroupRotate == VK_TRUE;
+    en_subgroup_rotate_clustered = v14.shaderSubgroupRotateClustered == VK_TRUE;
+#endif
+    // The core-feature side of what vkCreateDevice is about to be asked
+    // for, so a "feature not present" failure or a behaviour change is
+    // attributable from the startup log alone. Every field not named here
+    // is unchanged from before step 0.
+    LOG_INFO("Vulkan core features enabled: 1.2{{scalarBlockLayout={} "
+             "uniformBufferStandardLayout={} bufferDeviceAddress={} timelineSemaphore={}}} "
+             "1.3{{maintenance4={} synchronization2={} shaderDemoteToHelperInvocation={}}} "
+             "1.4{{maintenance5={} maintenance6={} shaderSubgroupRotate={} "
+             "shaderSubgroupRotateClustered={}}}",
+             v12.scalarBlockLayout == VK_TRUE, v12.uniformBufferStandardLayout == VK_TRUE,
+             v12.bufferDeviceAddress == VK_TRUE, v12.timelineSemaphore == VK_TRUE,
+             v13.maintenance4 == VK_TRUE, v13.synchronization2 == VK_TRUE,
+             v13.shaderDemoteToHelperInvocation == VK_TRUE, en_maintenance5, en_maintenance6,
+             en_subgroup_rotate, en_subgroup_rotate_clustered);
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR as_feat{};
     as_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -1105,17 +1678,91 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     rq_feat.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rq_feat.rayQuery = VK_TRUE;
 
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mut_feat{};
+    mut_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+    mut_feat.mutableDescriptorType = VK_TRUE;
+
+    // Next-gen extension feature structs, one headline feature each (the
+    // enable_* decisions above). Chained only when enabled, so an absent
+    // extension's struct never reaches vkCreateDevice.
+#if defined(VK_KHR_ray_tracing_pipeline)
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_feat{};
+    rtp_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
+    rtp_feat.rayTracingPipeline = VK_TRUE;
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_feat{};
+    rtm1_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR;
+    rtm1_feat.rayTracingMaintenance1 = VK_TRUE;
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT ser_ext_feat{};
+    ser_ext_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_INVOCATION_REORDER_FEATURES_EXT;
+    ser_ext_feat.rayTracingInvocationReorder = VK_TRUE;
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posfetch_feat{};
+    posfetch_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR;
+    posfetch_feat.rayTracingPositionFetch = VK_TRUE;
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR sucf_feat{};
+    sucf_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    sucf_feat.shaderSubgroupUniformControlFlow = VK_TRUE;
+#endif
+
     void** next_slot = &f2.pNext;
     auto chain = [&](void* node, void** node_next) {
         *next_slot = node;
         next_slot = node_next;
     };
     chain(&v12, reinterpret_cast<void**>(&v12.pNext));
-    chain(&v13, reinterpret_cast<void**>(&v13.pNext));
+    if (have_core_13) {
+        chain(&v13, reinterpret_cast<void**>(&v13.pNext));
+    }
+#if defined(VK_VERSION_1_4)
+    if (have_core_14) {
+        chain(&v14, reinterpret_cast<void**>(&v14.pNext));
+    }
+#endif
     if (rt_supported_) {
         chain(&as_feat, reinterpret_cast<void**>(&as_feat.pNext));
         chain(&rq_feat, reinterpret_cast<void**>(&rq_feat.pNext));
     }
+    if (use_mutable_binding2) {
+        chain(&mut_feat, reinterpret_cast<void**>(&mut_feat.pNext));
+    }
+#if defined(VK_KHR_ray_tracing_pipeline)
+    if (enable_rt_pipeline) chain(&rtp_feat, reinterpret_cast<void**>(&rtp_feat.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_maintenance1)
+    if (enable_rt_maint1) chain(&rtm1_feat, reinterpret_cast<void**>(&rtm1_feat.pNext));
+#endif
+#if defined(VK_EXT_ray_tracing_invocation_reorder)
+    if (enable_ser_ext) chain(&ser_ext_feat, reinterpret_cast<void**>(&ser_ext_feat.pNext));
+#endif
+#if defined(VK_KHR_ray_tracing_position_fetch)
+    if (enable_pos_fetch) chain(&posfetch_feat, reinterpret_cast<void**>(&posfetch_feat.pNext));
+#endif
+#if defined(VK_KHR_shader_subgroup_uniform_control_flow)
+    if (enable_sucf) chain(&sucf_feat, reinterpret_cast<void**>(&sucf_feat.pNext));
+#endif
+
+    caps_.ray_tracing_pipeline             = enable_rt_pipeline;
+    caps_.pipeline_library                 = enable_pipeline_library;
+    caps_.ray_tracing_maintenance1         = enable_rt_maint1;
+    caps_.invocation_reorder               = enable_ser_ext;
+    caps_.invocation_reorder_hint_reorders = enable_ser_ext && ser_ext_reorders;
+    caps_.position_fetch                   = enable_pos_fetch;
+    caps_.subgroup_uniform_control_flow    = enable_sucf;
+    // The extension side of what vkCreateDevice is about to be asked for
+    // (the core-feature line is above), so a "feature not present" failure
+    // or a behaviour change is attributable from the startup log alone.
+    LOG_INFO("Vulkan extensions enabled: ray_tracing_pipeline={} pipeline_library={} "
+             "ray_tracing_maintenance1={} invocation_reorder_ext={} position_fetch={} "
+             "subgroup_uniform_control_flow={} mutable_descriptor_type={}",
+             enable_rt_pipeline, enable_pipeline_library, enable_rt_maint1, enable_ser_ext,
+             enable_pos_fetch, enable_sucf, use_mutable_binding2);
 
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1231,7 +1878,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // adds pbr_atlas (binding 34) for a total of 17. Wave 9 god rays adds
     // godrays_mask (binding 37) for a total of 18.
     psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 18 + 4 });
-    if (rt_supported_) {
+    // Binding 2 is the one polymorphic slot on the shared layout (scene TLAS
+    // for PathTrace, storage image for the cloud kernels). When the mutable-
+    // descriptor extension is available it is declared MUTABLE_EXT (below);
+    // otherwise it stays a typed acceleration structure (strict fallback).
+    if (use_mutable_binding2) {
+        psizes.push_back({ VK_DESCRIPTOR_TYPE_MUTABLE_EXT, kTotalSets * 1 + 1 });
+    } else if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
     // 18 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
@@ -1258,8 +1911,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // Land cover (#300) adds land_albedo (47). 21 -> 22; slack retained.
     psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 22 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
+    // Type list for the MUTABLE_EXT slot(s): storage image (cloud kernels),
+    // storage buffer (defensive / future polymorphic uses), acceleration
+    // structure (PathTrace scene_tlas). The pool needs it so it can size the
+    // mutable descriptors (their size is the max over the listed types). The
+    // layout below declares the same list for binding 2.
+    static constexpr VkDescriptorType kMutableTypes[] = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+    };
+    VkMutableDescriptorTypeListEXT pool_mut_list{};
+    pool_mut_list.descriptorTypeCount = 3;
+    pool_mut_list.pDescriptorTypes    = kMutableTypes;
+    VkMutableDescriptorTypeCreateInfoEXT pool_mut{};
+    pool_mut.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
+    pool_mut.mutableDescriptorTypeListCount = 1;
+    pool_mut.pMutableDescriptorTypeLists    = &pool_mut_list;
+
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.pNext         = use_mutable_binding2 ? &pool_mut : nullptr;
     dpci.maxSets       = kTotalSets;
     dpci.poolSizeCount = static_cast<std::uint32_t>(psizes.size());
     dpci.pPoolSizes    = psizes.data();
@@ -1301,9 +1973,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // bindings 0-1: output + accum (storage image)
         add_binding(0,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         add_binding(1,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        // binding 2: scene_tlas (only when hw RT is supported)
+        // binding 2: polymorphic slot (only present when hw RT is supported).
+        // scene_tlas for PathTrace, but a storage image (clouds_color_prev /
+        // depth_tex) for the cloud kernels, which the engine binds to the
+        // same slot per-dispatch. Declared MUTABLE_EXT so the one shared
+        // layout accepts either type; strict acceleration-structure fallback
+        // when the extension is unavailable.
         if (rt_supported_) {
-            add_binding(2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+            add_binding(2, use_mutable_binding2
+                              ? VK_DESCRIPTOR_TYPE_MUTABLE_EXT
+                              : VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
         }
         // bindings 3-5: mesh_positions, mesh_indices, primitives (storage buffer)
         add_binding(3,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
@@ -1507,6 +2186,28 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
         bfci.bindingCount  = static_cast<std::uint32_t>(bind_flags.size());
         bfci.pBindingFlags = bind_flags.data();
+
+        // Per-binding mutable type lists. VkMutableDescriptorTypeCreateInfoEXT
+        // requires one list entry per layout binding (same order as pBindings);
+        // MUTABLE_EXT bindings get the {image, buffer, accel-struct} list, all
+        // others an empty list. Chained into dslci via bfci->pNext. Kept alive
+        // (function-scope vectors) until vkCreateDescriptorSetLayout returns.
+        std::vector<VkMutableDescriptorTypeListEXT> mut_lists;
+        VkMutableDescriptorTypeCreateInfoEXT layout_mut{};
+        if (use_mutable_binding2) {
+            mut_lists.assign(b.size(), VkMutableDescriptorTypeListEXT{0, nullptr});
+            for (std::size_t i = 0; i < b.size(); ++i) {
+                if (b[i].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+                    mut_lists[i].descriptorTypeCount = 3;      // kMutableTypes
+                    mut_lists[i].pDescriptorTypes    = kMutableTypes;
+                }
+            }
+            layout_mut.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
+            layout_mut.mutableDescriptorTypeListCount =
+                static_cast<std::uint32_t>(mut_lists.size());
+            layout_mut.pMutableDescriptorTypeLists = mut_lists.data();
+            bfci.pNext = &layout_mut;
+        }
 
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
