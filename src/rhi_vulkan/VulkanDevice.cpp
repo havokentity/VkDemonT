@@ -4213,6 +4213,14 @@ PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDe
     // dynamic: VUID-vkCmdTraceRaysKHR-None-08608 otherwise. Declared only
     // when both the query and the set entry points exist, since the launch
     // leaves the driver default in place without them.
+    //
+    // The validation layers report 08608 here ANYWAY, and that report is a
+    // layer bug, not a missing declaration -- do not "fix" it by dropping
+    // the explicit stack size. Measured on VVL 1.4.341.1: building this
+    // same pipeline with pDynamicState = nullptr (the genuinely illegal
+    // form) produces the identical message, wording and count, so the layer
+    // does not read pDynamicState off a ray-tracing pipeline create info.
+    // See docs/STEP1_PROBE_NOTES.md, "Validation layers".
     const bool dynamic_stack = pfn_GetRtGroupStackSize_ != nullptr && pfn_CmdSetRtStackSize_ != nullptr;
     const VkDynamicState kDynamicStack = VK_DYNAMIC_STATE_RAY_TRACING_PIPELINE_STACK_SIZE_KHR;
     VkPipelineDynamicStateCreateInfo dyn{};
