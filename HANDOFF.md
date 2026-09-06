@@ -15,15 +15,19 @@ Smooth planet-scale terrain streaming (fly in/out of orbit like MSFS / Star Citi
 - **Ocean**: Tessendorf FFT cascades, Cox–Munk slope→GGX, Pope & Fry / Morel / Petzold water optics, water-leaving radiance from outside the medium.
 - **Renderer**: megakernel path tracer, ReSTIR/NEE, in-house SVGF denoiser (+ OptiX HDR/temporal on NVIDIA), per-pass GPU timing (perf overlay tier 4). (The MetalFX denoiser finalizer went with the Metal backend — see the strip note below.)
 
-## Pending branches (unfinished polish, reviewed, NOT merged)
+## Pending polish branches — adversarially reviewed on native Vulkan, integrating on `integrate/polish-vulkan`
 
-Each was adversarially reviewed and had its over-claims corrected; each needs a live look on real hardware where noted:
+Each was rebased onto `fix/vulkan-native-bringup` (Mac strip + native-Vulkan fixes), rebuilt, and adversarially reviewed on the RTX 5090 (2026-09-05), then either integrated onto `integrate/polish-vulkan` (stacked on PR #2) or rejected:
 
-- `feat/sun-lensflare` — physical Hullin lens flare enabled from orbit. **Critical fp32 fix landed** (the vis-gate overflowed to NaN → black frame; now the overflow-safe reciprocal form, locked by a CI unit test built without `-ffast-math`). Occlusion is a real ray-vs-body test; flare carries the sun's chromaticity. **Flare is swapchain-only → verify visually on a real GPU.**
-- `fix/stars-in-space` — stars visible from orbit (Beer–Lambert extinction, not a sun-below-horizon flag) + daytime bright-star drown via Rose (1948) contrast. `K=8` is a documented veiling factor (see the filed follow-up to retire it via physical star radiometry). No goldens move.
-- `fix/clouds-transition` — cloud march step derived from the field not the ray span (kills fly-through shimmer). Moves one golden (`clouds_raymarched`, a 27% horizon de-aliasing toward the converged reference). **The deck-entry brightening is physical and persists — that is weather, not the fix.**
-- `fix/distant-water-magenta` — MetalFX-only demod overshoot on near-black albedo (floor the demod guide, empirical, with a data table + the repo's first MetalFX golden cell). **Metal-specific; re-evaluate for the Vulkan/DXR denoiser path here.**
-- `fix/terrain-test-split` — CI: split `pt_planet_terrain` into a fast per-PR core + a nightly exhaustive sweep (the exhaustive sweep was timing out at 600 s; core is ~70 s on Windows).
+- `fix/terrain-test-split` — **INTEGRATED with fixes.** The split holds (core = 68 s on CI's `win-debug`; per-PR ctest ~965 s → ~270 s). Review found the Windows lane was NOT failing on terrain alone: `pt_sky_units` timed out at 61 s against a 60 s default and `pt_planet_residency` ran 261/300 s — both budgets raised with measurements. Two per-PR sentinels the split had demoted to nightly were restored (#326 cull wiring, #284 "no converged leaf" — the nightly stand-ins could not see those bugs). Zero-match test filters now fail loudly.
+- `fix/distant-water-magenta` — **REWORKED for Vulkan and INTEGRATED** (the original was MetalFX-only; its golden cell died with the backend). The defect is real on the in-house SVGF path: it demodulates by raw albedo, but a planet's primary-hit radiance is `C = T·A·E + S` (attenuated surface + additive in-scatter), so `C/A` reaches >50× physical radiance on dark hazed surfaces — the magenta band. New guide `G = T·A + (1−T)`, with camera→surface transmittance `T` carried in `albedo_tex.a` — derived, not tuned; bit-identical for non-atmosphere scenes; red→green (20 failures → 167/167) via `pt_denoise_demod_guide`. Smoked on Vulkan with `svgf_atrous` engaged. **Owed: a live low-sun look, and a Vulkan SVGF golden (none exists; needs owner sign-off).**
+- `fix/stars-in-space` — **INTEGRATED with fixes.** Extinction is the real Simpson optical depth over the shell chord; "use `ro` consistently" fixed a genuine bug (bounce rays judged star occlusion from the camera). Corrected a WRONG citation: the veiling formula is a constant-Weber-contrast soft threshold (Blackwell 1946 / order-2 Naka-Rushton), not Rose (1948) as claimed; dropped a `1e-30` magic epsilon; added four behaviour pins, each shown red. "No goldens move" is only vacuously true — no committed golden runs the Vulkan sky path. **Measured on Vulkan:** day-side space above the limb now shows stars (the headline fix works), no daylight leak; **visible behaviour change:** `ground_night` stars dim by up to 78 levels from real horizon extinction in physical mode — correct, but the owner should know. K=8 stays honestly labelled (demont-engine #338 open).
+- `fix/clouds-transition` — **REJECTED for this tree (rework recommended).** The `clouds_raymarched` golden does not exist here (software cell only; software never runs Slang), so "moves one golden" is vacuous — and the pre-pass half of the branch is **unobservable on Vulkan**: `CloudsComposite`'s only call site sits inside the Metal-gated `use_engine_tonemap` block, so raymarched clouds never composite (the same dead-code gate that sinks the lens flare). Measured on the live inline path against a 4 m converged reference: the field-scale schedule is not "27% de-aliasing" but step-dependent **bias reduction** (42% closer in clear air, 76% in the horizon band) that is **39% farther mid-deck**, costs **+55–60% PathTrace time** under `-O0` (horizon steps 24–32 → 100–130), and its constants (0.07 / [8,160] m / 1.04) are admittedly tuned. The pop's root cause is the rectangle-rule cell weight `dens·seg·T_start` (over-counts by τ/(1−e^{−τ}) at τ≈0.5–1 per cell); the Beer–Lambert-exact weight `T_start·(1−exp(−dens·seg))` (Hillaire 2016) converges with the *existing* uniform march at no cost (old/new schedules then agree within 0.2 luminance) — a small, principled rework, but a **visible change (≈−15% clear-air toward the converged value) that is the owner's call**. "Deck-entry brightening is physical" is confirmed (converged luminance rises 136→143→198 into the deck), though the branch exaggerates it slightly more than base. Honest docs + a red→green step test (`pt_cloud_march_step`) are committed on `polish-rebased/clouds-transition` (tip `f5ed68b`); its shader commits are unchanged.
+- `feat/sun-lensflare` — **REJECTED for this tree (rework needed).** Rebases and builds clean, 11/11 tests pass, no goldens move — but the flare lives in `Tonemap.slang`, whose only dispatch is gated `use_engine_tonemap = … && backend_is_metal`, now compile-time false: **`Tonemap.slang` is dead code on Vulkan** (the swapchain is written by the denoiser finalize / inline tonemap), so "on by default from orbit" changes cvar state only. Also found: the "cannot overflow" vis-gate still yields +Inf (correctness rests on `1/(1+Inf)=0`); ghost radiance over-claims energy conservation (~80× on large ghosts); the occlusion ramp uses the true solar half-angle while the renderer draws a 2.06× disc; the chromaticity worked-example is wrong from orbit. Comment fixes are on `polish-rebased/sun-lensflare`. **Blocked on a Vulkan tonemap/flare dispatch — a new task the strip exposed.**
+
+**Systemic finding from the two rejections:** the engine's post-process chain — `Tonemap.slang`, the lens-flare composite, and `CloudsComposite` for raymarched clouds — is dispatched only inside `use_engine_tonemap = … && backend_is_metal`, which the strip made compile-time false. **That whole chain is dead on Vulkan.** A Vulkan dispatch path for it is now a first-class task: it unblocks the lens flare, raymarched clouds, and the engine tonemap operators.
+
+Known pre-existing, to file separately: `pt_math_sphere` bit-pin fails on the base tree; software goldens flake intermittently under heavy CPU load.
 
 ## The headline next task: smooth terrain streaming
 
@@ -42,7 +46,7 @@ Plan (path-tracer-appropriate — no per-frame BLAS rebuild, so no vertex geomor
 
 1. ~~Build with the Vulkan preset (`win-clang-release` / native Vulkan; drop the Metal/`rhi_metal` backend and Mac presets — "strip all Mac support").~~ **DONE** — see the strip note below; the tree configures, compiles, and links Vulkan-only on this box.
 2. Verify the Vulkan backend renders correctly on a real NVIDIA GPU (it was only exercised via MoltenVK on Mac before, which had latent regressions — pixel correctness on native Vulkan is unverified). **← next; needs a live look.**
-3. Merge the pending polish branches after a live check.
+3. ~~Merge the pending polish branches after a live check.~~ **Live check passed 2026-09-05; all five reviewed — three integrated on `integrate/polish-vulkan`, two rejected (see the section above).**
 4. Start P1 of the streaming plan.
 
 ### Mac-strip status (branch `chore/strip-mac-vulkan-only`)
@@ -124,10 +128,19 @@ the smoke test renders a correct frame (gradient sky + ground, 0
 - **FIXED in passing:** `-DPT_PLANET_ENABLED=OFF` compiles now (the
   `atmo_ms_lut` / `ptMsLutReady` hoist out of the planet `#if` gate, commit
   `4f36768`).
-- **Not yet re-verified:** the interactive swapchain (the smoke test captures
-  `accum_hdr`, not the presented image) — needs a live look on the box. And a
-  Vulkan **golden** image cell is still owed (goldens currently run on the
-  software/Embree backend, which `-O0` does not affect).
+- **Live-checked (2026-09-05):** the owner eyeballed and tested the
+  interactive app on the RTX 5090 — the presented swapchain renders correctly
+  (confirming the `rgba8` revert) and everything is back in working order.
+  That is the live check step 3 above was gated on, so the pending polish
+  branches can now be merged. Still owed: a Vulkan **golden** image cell
+  (goldens currently run on the software/Embree backend, which `-O0` does
+  not affect).
+
+### Next-gen roadmap progress (see `docs/NEXTGEN_PLAN.md`)
+
+- **Step 0 — DONE** (`feat/vulkan-step0-features`, PR #4): Vulkan 1.4 requested and effective; the promoted 1.2/1.3/1.4 features and the RT-pipeline family (`VK_KHR_ray_tracing_pipeline`, `pipeline_library`, `ray_tracing_maintenance1`, `VK_EXT_ray_tracing_invocation_reorder`, `position_fetch`, `subgroup_uniform_control_flow`) enabled; every next-gen extension queried and logged at startup — all present on the RTX 5090 / 616.56 (SER in REORDER mode, cluster-AS rev 4, PTLAS, coopvec/coopmat, FP8, OMM; only `shaderBFloat16DotProduct` absent). Rendering bit-identical (md5). `docs/NVIDIA_DRIVER_BUG_REPORT.md` is ready for the owner to file — record the bug ID here.
+- **Step 1 — design done** (`docs/STEP1_RT_PIPELINE_DESIGN.md`): 21 shader groups in 4 pipeline libraries, software tiers merged in raygen via portable `MakeMiss` records, 48 B payload, two SER reorder points, shared layout reused. Leads with a **2-day go/no-go probe** (raygen-only port at `-O2`, 16×16 soak) before the split; wavefront-compute is plan B. Note: `NEXTGEN_PLAN.md`'s `PathTrace.slang` line numbers are ~220 lines stale since the polish landed; the design cites current lines.
+- **Owed before 1b:** Vulkan golden cells for the planet fixtures (only `cornell_csg`, `sdf_smin_row`, `pbr_textured` have Vulkan pins today) and the determinism baseline for the A/B harness.
 
 ## Conventions (carried from the parent)
 

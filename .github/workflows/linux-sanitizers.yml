@@ -40,7 +40,10 @@ on:
   push:
     branches: [ main, integration/parallel-batch-1 ]
   pull_request:
-    branches: [ main, integration/parallel-batch-1 ]
+    # No base-branch filter: stacked PRs (a PR whose base is another PR
+    # branch) must get CI too. `push` stays filtered to avoid building every
+    # topic-branch push; nightly-release / the exhaustive sweep are gated on
+    # event type below, so PR runs never tag or publish.
   workflow_dispatch:
 
 # Cancel in-flight runs for the same branch when a newer push lands.
@@ -133,9 +136,22 @@ jobs:
         # diagnostics go to stderr from the test binary which ctest
         # captures here.
         #
-        # Per-test 60s timeout already set in tests/CMakeLists.txt;
-        # the sanitizer runtime ~2-5x's wall-clock time but our tests
-        # are sub-second so the budget stays generous.
+        # Per-test timeouts are set in tests/CMakeLists.txt (60 s
+        # default, higher for the planetary tests); the sanitizer
+        # runtime ~2-5x's wall-clock time.
+        #
+        # NO label filter, on purpose. build.yml's per-PR step excludes
+        # the `nightly` label (pt_planet_terrain_exhaustive, the slow
+        # half of the planetary residency sweep) and runs it only on the
+        # schedule; this lane has no schedule, so excluding it here would
+        # mean the exhaustive sweep NEVER runs under ASan/UBSan -- and it
+        # is the only thing that exercises the selector's eviction and
+        # paced-stream paths at scale. It fits: the combined test ran in
+        # 364 s here before the split, and the exhaustive half now has a
+        # 900 s budget of its own. This lane is not the PR bottleneck
+        # (the Windows lane is); if it ever becomes one, add
+        # `-LE nightly` here and give this workflow a schedule of its own
+        # rather than dropping the sanitizer coverage silently.
         run: ctest --test-dir build/linux-asan-ubsan-debug --output-on-failure
 
       # On failure, upload the ctest log + any test-emitted artefacts

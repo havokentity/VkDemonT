@@ -68,24 +68,33 @@ static const float kAlbedoSkyEps = 1.0 / 65536.0;
 // below must use the SAME clamped value the demod divide used.
 static const float kDemodEps = 0.01;
 
+// Demodulation guide -- G = T * A + (1 - T) with A = albedo_tex.rgb and
+// T = albedo_tex.a (camera->surface atmospheric transmittance, min over
+// RGB). Kept in lockstep with DenoiseTemporal.slang, which holds the
+// derivation; the multiply-back below must use the SAME guide the
+// temporal divide used.
+float3 demodGuide(float4 a) {
+    return lerp(float3(1.0), a.rgb, saturate(a.a));
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint2 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
     float4 demod = demod_in[tid];
-    float3 a     = albedo_tex[uint2(tid)].rgb;
+    float4 a     = albedo_tex[uint2(tid)];
     // Sky pixels: forward the upstream value (which was never
     // demodulated). Surface pixels: lighting * surface_color =
     // textured radiance. Preserve the sample-count tag in .a so
     // downstream consumers still see how converged the source pixel
     // was (matches the temporal / atrous passes upstream).
     // Multiply back by the SAME clamped divisor the demod pass used
-    // (max(a, kDemodEps) per channel). Using raw albedo here made
-    // demod<->remod lossy for any channel below the eps floor -- a
-    // saturated red with blue = 0.001 came back 10x too dark in blue,
-    // hue-shifting the whole denoised surface.
+    // (max(demodGuide(a), kDemodEps) per channel). Using raw albedo
+    // here made demod<->remod lossy for any channel below the eps floor
+    // -- a saturated red with blue = 0.001 came back 10x too dark in
+    // blue, hue-shifting the whole denoised surface.
     float3 rgb = (a.r + a.g + a.b > kAlbedoSkyEps)
-                     ? (demod.rgb * max(a, float3(kDemodEps, kDemodEps, kDemodEps)))
+                     ? (demod.rgb * max(demodGuide(a), float3(kDemodEps, kDemodEps, kDemodEps)))
                      : demod.rgb;
     color_out[tid] = float4(rgb, demod.a);
 }

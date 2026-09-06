@@ -4065,6 +4065,153 @@ float3 starsOnly(float3 rd, float3 sun) {
     return float3(0.0);
 }
 
+// --- Physical-mode stars (#333): the celestial background, no day flag ------
+//
+// starsOnly() above is a GROUND-OBSERVER model. Its `day` factor,
+// smoothstep(-0.10, 0.20, dot(localUp(camera), sun)), multiplies the whole
+// starfield by (1 - day) and gates the sample on `day < 0.6`, so stars vanish
+// whenever the SUN IS ABOVE THE OBSERVER'S LOCAL HORIZON. On the ground that
+// is a serviceable proxy for "the sky is too bright to see stars". It is wrong
+// the instant the observer leaves the air: from orbit dot(localUp, sun) is the
+// angle between the outward radial and the sun, so the entire day hemisphere
+// of any orbit reports day = 1 and the stars are switched off -- even for a
+// ray pointing into empty anti-solar space, where an astronaut plainly sees
+// them (they see stars against black on the sunlit side too, looking away from
+// the lit Earth). Measured on this build: an orbit camera looking at the same
+// patch of black space renders max luminance 14.9 with the sun below the local
+// horizon and 0.0 with it above -- the flag, not the sky, is doing it.
+//
+// The honest model is the one the physical sky already embodies: a star is a
+// point source on the celestial sphere, ALWAYS present, seen THROUGH the
+// atmosphere. What the eye actually receives along the ray is
+//
+//     L = L_star * T_view   +   L_inscatter
+//
+// where T_view is the Beer-Lambert transmittance of the air column the view
+// ray crosses (real extinction: ~1 in vacuum, ~0.8 at the ground zenith,
+// falling to the horizon) and L_inscatter = skyPhysical() is the scattered
+// sunlight glowing in FRONT of the star. skyColor() ADDS skyPhysical() on top
+// of this term, so an unlit column (night) or an empty one (space) leaves
+// L_inscatter ~ 0 and the star stands against black, while a lit column raises
+// L_inscatter and buries the star. No sun-elevation flag: the same physics that
+// blacks the sky in space is what hides the stars in daylight.
+//
+// WHY THE ADDITIVE SUM IS NOT ENOUGH ON ITS OWN, AND THE CONTRAST TERM (#333).
+// Two rendering realities make the raw sum leak the brightest stars into the
+// day sky:
+//   * skyPhysical is single-scatter-dominated and reads DARKER than the real
+//     sky (documented -- r_sky_mode's own docstring, and the planet_land_orbit
+//     fixture header). At noon the modelled L_inscatter at a bright-star pixel
+//     is ~13 W/m^2/sr against the star's ~2 after extinction -- 16%, where a
+//     correctly-bright sky would make it <<1% and invisible, as in life.
+//   * ACES tonemaps per channel. The day sky is blue-dominated and saturates
+//     BLUE first, leaving RED with headroom, so a broadband star pokes through
+//     as a warm dot even while it is a small fraction of the sky's luminance.
+// The remedy is a CONTRAST attenuation, not a brightness flag: a point source is
+// seen only when its luminance beats the veiling sky background by more than the
+// observer's threshold contrast. In the photopic (daylit) regime that threshold
+// is approximately a CONSTANT Weber contrast dL/L -- Blackwell 1946 (JOSA 36,
+// 624) measures ~1-3% for small targets at high background luminance -- so the
+// criterion is the ratio ls/lk against a fixed contrast, and starsPhysical()
+// scales the star by the order-2 soft threshold (Hill / Naka-Rushton form)
+//     vis = C^2 / (C^2 + K^2),   C = ls / lk,   ls = luma(star*T), lk = luma(sky)
+// photopic Rec.709 luma, K = kStarVeilK the threshold contrast in RASTER units
+// (see starsPhysical() below for what K is and why it is NOT parameter-free --
+// it is a veiling factor that balances a deliberate rendering choice, tracked
+// for removal by issue #338). The order 2 is a smoothness choice -- C^1 at
+// C = 0, no kink where a star fades in -- not a derived exponent. What this is
+// NOT: Rose (1948)'s shot-noise-limited law B C^2 alpha^2 = const, under which
+// the threshold contrast FALLS as 1/sqrt(B); that is the photon-starved
+// (scotopic) regime and is not modelled here. vis tends to 1 as the sky
+// in-scatter tends to 0 (space AND ground night: stars full, unchanged, for ANY
+// K) and to 0 as the sky brightens (daylight: stars drowned). It is applied to
+// all channels off the LUMINANCE contrast (not per channel) precisely so the
+// warm dot on the bright blue sky is pulled down with the rest.
+//
+// starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
+// kept a separate function (rather than sharing starsOnly's body) so modes
+// 0-3 and the StarsComposite.slang mirror stay bit-for-bit unchanged. The
+// body-occlusion gate (a ray into the planet has no stars behind it) is kept;
+// twinkle is kept. `ro` is the ray origin (camera at a primary miss, the bounce
+// point on a secondary ray) so the local-up / occlusion frame matches the
+// extinction origin starsPhysical() uses -- they must not judge visibility and
+// extinction from different points. Any change to the sampling must mirror
+// starsOnly() above.
+float3 starsRadianceRaw(float3 ro, float3 rd) {
+    float3 up       = localUp(ro);
+    float cosTheta  = clamp(dot(rd, up), -1.0, 1.0);
+    bool star_visible = (cosTheta > -0.05);
+    if (planet_center_radius.w > 0.0) {
+        float b0, b1;
+        star_visible = !(ptSphereRoots(ro, rd,
+                                       planet_center_radius.xyz,
+                                       planet_center_radius.w, b0, b1)
+                         && b0 > 0.0);
+    }
+    if (!star_visible) return float3(0.0);
+    if (exposure_pad.z > 0.5) {
+        // BSC starmap (real Yale Bright Star Catalog, J2000 frame). Verbatim
+        // mirror of starsOnly()'s BSC branch minus the day fade.
+        float3 j;
+        j.x = dot(w2j_row0.xyz, rd);
+        j.y = dot(w2j_row1.xyz, rd);
+        j.z = dot(w2j_row2.xyz, rd);
+        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+        if (u < 0.0) u += 1.0;
+        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+        uint2 dim;
+        star_map.GetDimensions(dim.x, dim.y);
+        int xi = int(floor(u * float(dim.x))) % int(dim.x);
+        if (xi < 0) xi += int(dim.x);
+        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
+        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        if (exposure_pad.w > 0.001) {
+            int3 q  = int3(floor(j * 38.0));
+            uint qh = uint(q.x + 128) * 65536u
+                    + uint(q.y + 128) * 256u
+                    + uint(q.z + 128);
+            uint h    = pcgHash(qh + 0xb7e1u);
+            float ph  = float(h & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_base = 1.0 + float((h >> 16) & 0xFFu) * (2.0 / 256.0);
+            uint h2   = pcgHash(h + 0xc0ffeeu);
+            float ph2 = float(h2 & 0xFFFFu) * (1.0 / 65536.0);
+            float fhz_mult = 2.7 + float((h2 >> 16) & 0xFFu) * (2.6 / 256.0);
+            float speed = exposure_pad.w;
+            float fhz1 = fhz_base * speed;
+            float fhz2 = fhz_base * fhz_mult * speed;
+            float t   = float(frame_index) * (1.0 / 60.0);
+            float w   = 1.0
+                      + 0.30 * sin(6.28318530718 * (ph  + t * fhz1))
+                      + 0.15 * sin(6.28318530718 * (ph2 + t * fhz2));
+            stars *= w;
+        }
+        return stars;
+    } else if (exposure_pad.y > 0.5) {
+        float2 ll = float2(atan2(rd.z, rd.x) * (1.0 / 6.28318530718) + 0.5,
+                           acos(clamp(rd.y, -1.0, 1.0)) * (1.0 / 3.14159265359));
+        ll *= float2(700.0, 350.0);
+        float2 cellI = floor(ll);
+        float2 cellF = ll - cellI;
+        float h  = frac(sin(dot(cellI, float2(127.1, 311.7))) * 43758.5453);
+        float h2 = frac(sin(dot(cellI, float2(269.5, 183.3)))  * 91842.1417);
+        if (h > 0.96) {
+            float2 starPos = float2(0.30 + h2 * 0.40,
+                                    0.30 + frac(h * 7.91) * 0.40);
+            float dist = length(cellF - starPos);
+            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float intensity = brightness * exp(-dist * dist * 100.0);
+            float colorMix = frac(h * 5.31);
+            float3 hot  = float3(0.85, 0.92, 1.10);
+            float3 mid  = float3(1.00, 0.98, 0.95);
+            float3 cool = float3(1.05, 0.85, 0.70);
+            float3 starColor = (colorMix < 0.33) ? hot
+                              : (colorMix < 0.80) ? mid : cool;
+            return intensity * starColor;
+        }
+    }
+    return float3(0.0);
+}
+
 // Star contribution at a primary-miss direction, regardless of which
 // sky path is active. HDRI mode bakes stars into the env_map so we
 // return 0 there (the env_map is sampled at primary miss anyway; we
@@ -6739,6 +6886,68 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
     float bright = max(sun_extra2.x, 0.0);         // r_sun_disc_brightness
     return T * (kPtSolarIrradiance / max(omega, 1.0e-12)) * bright;
 }
+
+// Physical-mode star term (#333). The raw celestial radiance, extincted by the
+// real air column in front of it, then attenuated by its CONTRAST against the
+// sky in-scatter that glows in front of it.
+//
+// sunSlantTransmittance(ro, rd) is a GENERIC to-space Beer-Lambert
+// transmittance along a direction -- it returns 0 when the ray runs into the
+// body (the same ptSphereRoots(planet_R) test starsRadianceRaw uses for
+// star_visible, so the two agree at the limb), 1 when the ray never touches the
+// shell (space), and the reddened column transmittance in between. It is not
+// sun-specific; the name is historical.
+//
+// `sky_inscatter` is the skyPhysical() radiance skyColor() already computed for
+// this ray (passed in rather than recomputed). vis is the order-2 soft Weber-
+// contrast threshold of the star against the veiling sky (the form, and what it
+// is not, are derived at starsRadianceRaw()) -- 1 where the sky is dark, ->0
+// where it is bright.
+//
+// kStarVeilK is a TUNED veiling factor, not a derived or parameter-free constant.
+// It exists to balance a DELIBERATE rendering choice against daytime contrast:
+// the Bright Star Catalog is rasterised on a NIGHT-VISIBILITY scale, not in
+// W/m^2/sr. A magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where its
+// true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x smaller -- and
+// the boost is intentional: a physically-scaled star renders as nothing under
+// the ACES tonemap, so the raster is pushed up until stars are visible at night.
+// That same boost makes a bright star (Sirius) read comparable to the (itself
+// single-scatter-underestimated) noon sky in linear light, so the raw contrast
+// leaks it into daylight. K is the multiplier on the sky's veiling luminance that
+// cancels the boost in the daytime contrast test. If the raster were physical, K
+// would tend to ~1; issue #338 tracks giving stars real radiometry + an exposure
+// model, after which this factor (and the raster boost) can be removed.
+//
+// K is NOT a day/night flag: at night and in space the sky in-scatter is ~0, so
+// K*lk is ~0 and vis is 1 for ANY K -- ground-night and orbit renders are
+// bit-identical across K (verified K = 1..20). K only sets how hard a LIT sky
+// washes stars out. K = 8 is a measured, conservative midpoint: K = 4 still
+// leaks a daytime dot at a low sun (+5 deg), K = 16 delays bright stars emerging
+// through twilight; 8 buries Sirius at noon (brightest daytime star +60 -> +0
+// sensor levels) while letting stars return by nautical/astronomical twilight as
+// the in-scatter falls. See starsRadianceRaw() for the surrounding rationale.
+//
+// fp32 FORM. Both luminances are normalised by the larger of the two before
+// the ratio is formed, so the denominator lies in [1, 2]: no 0/0 when a star
+// with s > 0 is extincted to ls = 0 against a dark sky (T -> 0 at the limb,
+// lk = 0 -- a case the s <= 0 early-out does NOT exclude), no overflow when
+// lk/ls is huge, and no epsilon. ls = 0 has nothing to veil and returns black,
+// which is what star * vis would be anyway. lk = 0 gives a = 1, b = 0 and
+// vis = 1 EXACTLY, which is the K-independence of night and space stated above.
+static const float kStarVeilK = 8.0;
+float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
+    float3 s = starsRadianceRaw(ro, rd);
+    if (all(s <= float3(0.0))) return float3(0.0);
+    float3 star = s * sunSlantTransmittance(ro, rd);
+    float ls = dot(star,         float3(0.2126, 0.7152, 0.0722));
+    float lk = dot(sky_inscatter, float3(0.2126, 0.7152, 0.0722)) * kStarVeilK;
+    if (!(ls > 0.0)) return float3(0.0);    // fully extinct: nothing to veil
+    float m = max(ls, lk);                  // > 0 because ls > 0
+    float a = ls / m;                       // in (0, 1]
+    float b = lk / m;                       // in [0, 1]; one of a, b is exactly 1
+    float vis = (a * a) / (a * a + b * b);  // denominator in [1, 2]
+    return star * vis;
+}
 // --- end Planetary P6 physical sky ------------------------------------------
 
 // `ro` is the ray's ORIGIN, and it is load-bearing only in mode 4
@@ -6760,8 +6969,16 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
     // as they do in the procedural and hosek modes, except that the sun
     // disc is the physical one.
     if (mode == 4u) {
-        return skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed)
-             + starsOnly(rd, sun_and_mode.xyz)
+        // Stars via starsPhysical(): the celestial background extincted by the
+        // real air column, NOT faded by a sun-elevation flag. The daytime
+        // wash-out is the additive skyPhysical() term below burying the star
+        // flux; in space that term is ~0, so stars show against black even
+        // with the sun up. This is the "stars aren't there in space" fix
+        // (#333) -- starsOnly()'s `day` gate switched them off across the
+        // whole sunlit hemisphere of any orbit.
+        float3 sky = skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed);
+        return sky
+             + starsPhysical(ro, rd, sky)
              + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
     }
@@ -7850,7 +8067,72 @@ void main(uint2 tid : SV_DispatchThreadID) {
         // RGBA16F write per pixel per frame on non-AOV
         // modes; the runtime gate keeps that free.
         if (write_albedo_gbuffer != 0u) {
-            albedo_tex[tid] = float4(hit_albedo, 0.0);
+            // .rgb = raw primary-hit albedo. .a = camera->surface
+            // atmospheric transmittance, the aerial-perspective term of
+            // the SVGF demodulation guide (DenoiseTemporal.slang
+            // `demodGuide`). This replaces the MetalFX-era albedo FLOOR
+            // that lived here: that floor was gated on the MetalFX
+            // specular G-buffer, which no Vulkan denoiser kind allocates,
+            // so on this tree it never ran.
+            //
+            // THE DEFECT. SVGF demodulates on the model C = A * E
+            // (radiance = albedo x incident lighting) and divides
+            // denoise_color by the albedo. On a planet the primary-hit
+            // radiance is
+            //     C = T * A * E + S
+            // with T the air's transmittance over the camera->hit segment
+            // (`radiance *= trans_atm_surf` after the bounce loop) and S
+            // the additive in-scatter march + HDRI haze, neither of which
+            // scales with A. C / A = T*E + S/A, and on a dark, spectrally
+            // skewed surface (MODIS ocean ~0.06 blue-skewed, forest
+            // 0.05-0.15) S/A is tens of times the physical radiance with
+            // the albedo's per-channel ratio INVERTED. The a-trous taps and
+            // the 2x2 history fetch are depth/normal-gated, not albedo-
+            // gated, so that signal blends into neighbours and reprojected
+            // history of a DIFFERENT albedo and is then re-multiplied by
+            // the centre albedo -- exact only when every blended sample
+            // shares it. The residue is the magenta / green band over
+            // distant water and ridges at a low sun. (The ocean shell
+            // writes albedo 1.0 and is never the dark side of that seam;
+            // the P3 body / land cover / rock ramp are.)
+            //
+            // THE GUIDE. Aerial perspective replaces a fraction (1 - T) of
+            // the surface radiance with sky-coloured in-scatter, and sky
+            // pixels are already demodulated with unit albedo (the
+            // float3(0) sentinel bypass). So the guide is the same blend:
+            //     G = T * A + (1 - T)
+            // Writing S = (1 - T) * L (L = the haze source radiance),
+            // C / G is a positive-weighted mean of E and L, so it is
+            // bounded by max(E, L) per channel for EVERY A in [0, 1] and
+            // EVERY T in [0, 1] -- no tuned constant -- and G = A exactly
+            // when T = 1. atmosphericTransmittance returns float3(1) when
+            // all three species scales are zero, so scenes without an
+            // atmosphere are bit-identical to before this write existed.
+            //
+            // ONE SCALAR. .rgb must stay the raw albedo: RestirFinal shades
+            // with it, and OptiX takes it as its albedo guide (the
+            // programming guide: "the fourth channel of this buffer is
+            // ignored"). So the guide is assembled in the denoiser from T
+            // stored here in .a. T is per channel (Rayleigh: T.b < T.g <
+            // T.r); the MIN is stored, because with Tm = min(T),
+            //     Tm*A_c + (1 - Tm) >= T_c*A_c + (1 - T_c)   for A_c <= 1
+            // in every channel c -- the guide never UNDER-states the hazed
+            // fraction, which is the blow-up direction. The cost is a mild
+            // under-demodulation of red on hazy pixels, bounded by
+            // (1 - T.b) / (1 - T.r).
+            //
+            // Sky / miss: .rgb stays the float3(0) sentinel the kernels
+            // key on; .a is written 0 and is not read for those pixels.
+            // Cost: one 8-step optical-depth integral per pixel per frame
+            // while a denoiser is active (the shading pass runs the same
+            // integral per sample); the no-medium early-out makes it free
+            // everywhere else.
+            float guide_trans = 0.0;
+            if (h0.hit) {
+                float3 T = atmosphericTransmittance(ro0, rd0, h0.t);
+                guide_trans = min(T.r, min(T.g, T.b));
+            }
+            albedo_tex[tid] = float4(hit_albedo, guide_trans);
         }
         // MetalFX specular-guidance G-buffers (issue #118). Three
         // textures fed to MTLFXTemporalDenoisedScaler so it can tell
