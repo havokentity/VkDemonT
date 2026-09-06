@@ -138,6 +138,11 @@ struct RayTracingPipelineDesc {
     std::string_view miss_kernel;
     std::string_view closest_hit_kernel;
     std::string_view debug_name;
+    // Ask the driver for per-stage statistics (register count, spill) via
+    // VK_KHR_pipeline_executable_properties when the device has it. Off by
+    // default: the capture flag can change how the driver compiles and
+    // caches the pipeline, and the probe measures compile time.
+    bool capture_statistics = false;
 };
 
 struct BarrierDesc {

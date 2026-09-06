@@ -427,6 +427,12 @@ namespace cvar {
             "Step 1 probe raygen slangc optimisation level under r_pt_pipeline "
             "rt: o0 | o2. The compute kernel is always -O0 (cmake/Slang.cmake); "
             "o2 is the experiment.", 0);
+    PT_CVAR(r_pt_rt_stats, "0",
+            "Step 1 probe: 1 = create the RT pipeline with "
+            "VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR and log the per-stage "
+            "statistics VK_KHR_pipeline_executable_properties returns. Off by "
+            "default because the flag can change how the driver compiles and "
+            "caches the pipeline, and the probe times that compile.", 0);
     // --- end Step 1 probe --------------------------------------------------
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on INDIRECT light contributions: env-NEE, skylight, bounce-to-sky, and NEE at bounce depth >= 1). Direct NEE at the primary hit is deliberately UNCLAMPED -- it is a low-variance estimate, and clamping it dimmed bright close lights and flattened the inverse-square falloff (the procedural sun NEE was always unclamped for the same reason). Camera-direct sky is also unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
@@ -6523,6 +6529,7 @@ bool Engine::ResolvePathTraceRtPipeline() {
         .miss_kernel        = "pathtrace_rt_miss",
         .closest_hit_kernel = "pathtrace_rt_chit",
         .debug_name         = key,
+        .capture_statistics = cvar_value("r_pt_rt_stats", "0") == "1",
     };
     const std::uint64_t id = device_->CreateRayTracingPipeline(desc).id;
     if (id == 0) {

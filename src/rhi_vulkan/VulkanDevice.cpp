@@ -4187,9 +4187,10 @@ PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDe
     groups[2].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
     groups[2].closestHitShader = kStageClosestHit;
 
+    const bool capture_stats = pipeline_exec_props_ && d.capture_statistics;
     VkRayTracingPipelineCreateInfoKHR ci{};
     ci.sType                        = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
-    ci.flags                        = pipeline_exec_props_
+    ci.flags                        = capture_stats
                                         ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u;
     ci.stageCount                   = kGroupCount;
     ci.pStages                      = stages;
@@ -4219,19 +4220,26 @@ PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDe
     LOG_INFO("Vulkan RT pipeline '{}': vkCreateRayTracingPipelinesKHR ok in {:.2f} s "
              "(raygen '{}' {} B, miss {} B, closest-hit {} B, capture_statistics={})",
              d.debug_name, create_s, d.raygen_kernel, rg->size, miss->size, chit->size,
-             pipeline_exec_props_);
+             capture_stats);
 
     // Per-stage statistics (design section 3: register count and spill
     // bytes are what every register-pressure claim is measured with).
-    if (pipeline_exec_props_) {
+    if (capture_stats) {
         VkPipelineInfoKHR pinfo{};
         pinfo.sType    = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
         pinfo.pipeline = pipe;
         std::uint32_t exec_count = 0;
-        pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, nullptr);
+        const VkResult pr = pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, nullptr);
         std::vector<VkPipelineExecutablePropertiesKHR> execs(exec_count);
         for (auto& e : execs) e.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
-        pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, execs.data());
+        if (exec_count > 0) {
+            pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, execs.data());
+        }
+        // A driver may report no executables at all for a ray-tracing
+        // pipeline; say so rather than logging nothing.
+        LOG_INFO("Vulkan RT pipeline '{}': vkGetPipelineExecutablePropertiesKHR -> {} ({}), "
+                 "{} executable(s)",
+                 d.debug_name, static_cast<int>(pr), VkResultToString(pr), exec_count);
         for (std::uint32_t i = 0; i < exec_count; ++i) {
             VkPipelineExecutableInfoKHR einfo{};
             einfo.sType           = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
