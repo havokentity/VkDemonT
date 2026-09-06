@@ -840,7 +840,7 @@ pt_add_test(pt_renderer_astronomy
 #   - Mallama et al. 2017 photometry against HORIZONS APmag, plus the
 #     Saturn ring-opening term that is worth a whole magnitude
 #   - the shared point-source scale: a rasterised catalogue star's peak texel
-#     must equal MagnitudeToFlux() of its magnitude, i.e. a planet and a star
+#     must equal MagnitudeToIrradianceWm2() of its magnitude, i.e. a planet and a star
 #     of the same magnitude are the same brightness by construction
 #   - B-V -> tint hue-only (unit luminance) and monotone in colour index
 #   - a StarsComposite.slang mirror pin that COUNTS occurrences, so a change

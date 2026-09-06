@@ -643,32 +643,81 @@ TEST_CASE("Saturn's rings dominate its brightness") {
 
 // --- the shared point-source photometric scale ---------------------------
 
-TEST_CASE("magnitude to flux follows Pogson's ratio exactly") {
-    // Each magnitude step is a factor 10^0.4 in flux. This is the curve
-    // both the catalogue stars and the planets ride.
-    const float f0 = pt::stars::MagnitudeToFlux(0.0f);
-    CHECK(f0 == doctest::Approx(4.0f));           // the engine's Vega gain
+TEST_CASE("magnitude to irradiance follows Pogson's ratio and the Vega zero point") {
+    // Each magnitude step is a factor 10^0.4 in flux (Pogson 1856). This is
+    // the curve both the catalogue stars and the planets ride.
+    const float f0 = pt::stars::MagnitudeToIrradianceWm2(0.0f);
+    // The zero point is now a REAL radiometric quantity, not a gain: a
+    // V = 0 source delivers 3.19e-9 W/m^2 over the V band (Bessell,
+    // Castelli & Plez 1998: 3.63e-11 W/m^2/nm at 545 nm across an 88 nm
+    // FWHM). RADIOMETRIC, matching kPtSolarIrradiance = 1360.8 W/m^2 and
+    // the W/m^2/sr skies -- quoting stars in lux would be off by the
+    // ~700x luminous-efficacy factor. The old value here was 4.0, an
+    // arbitrary "Vega gain" that existed only to compensate for a
+    // rasteriser that did not conserve energy.
+    CHECK(f0 == doctest::Approx(3.19e-9f).epsilon(1e-4));
     for (float m = -4.0f; m <= 8.0f; m += 1.0f) {
         CAPTURE(m);
-        const double a = pt::stars::MagnitudeToFlux(m);
-        const double b = pt::stars::MagnitudeToFlux(m + 1.0f);
+        const double a = pt::stars::MagnitudeToIrradianceWm2(m);
+        const double b = pt::stars::MagnitudeToIrradianceWm2(m + 1.0f);
         CHECK(a / b == doctest::Approx(2.51188643).epsilon(1e-5));
     }
     // Monotone, positive, finite over the whole range the sky uses.
     for (float m = -6.0f; m <= 12.0f; m += 0.25f) {
-        const double f = pt::stars::MagnitudeToFlux(m);
+        const double f = pt::stars::MagnitudeToIrradianceWm2(m);
         REQUIRE(finiteBits(f));
         CHECK(f > 0.0);
     }
 }
 
-TEST_CASE("a planet splat and a catalogue star of the same magnitude are the same brightness") {
-    // The point of exporting MagnitudeToFlux / SplatAngularRadiusRad from
-    // BscCatalog: the planetarium must not invent its own scale. Rasterise
-    // a one-star map with the star placed exactly on a texel centre, and
-    // the peak texel must be MagnitudeToFlux(vmag) times that star's tint
-    // -- the same number the engine hands the shader for a planet of the
-    // same magnitude.
+TEST_CASE("the point-spread sigma is optical, not magnitude-dependent") {
+    // A star is a point source: how far it spreads on the sky is a property
+    // of the optics, not of how bright it is. The previous tiered sigma
+    // (1.4e-3 for the brightest tier, 0.75e-3 for the rest) made a bright
+    // star carry (1.4/0.75)^2 = 3.5x more TOTAL energy than its magnitude
+    // specified -- applying the magnitude scale twice, once on purpose and
+    // once by accident.
+    CHECK(pt::stars::PsfSigmaRad(0.0f)
+          == doctest::Approx(4.36e-4f).epsilon(1e-3));   // 1.5 arcmin
+    // The sampling floor only ever widens, never narrows.
+    CHECK(pt::stars::PsfSigmaRad(1.0e-3f) == doctest::Approx(1.0e-3f));
+    CHECK(pt::stars::PsfSigmaRad(1.0e-5f)
+          == doctest::Approx(4.36e-4f).epsilon(1e-3));
+    // Degenerate floors must not poison the PSF.
+    CHECK(pt::stars::PsfSigmaRad(-1.0f)
+          == doctest::Approx(4.36e-4f).epsilon(1e-3));
+    CHECK(pt::stars::PsfSigmaRad(0.0f) > 0.0f);
+}
+
+// Total irradiance a rasterised map actually delivers for one star: the
+// sum over texels of radiance * that texel's solid angle. The equirect
+// texel solid angle is dphi * dtheta * sin(theta), and the sin(theta) is
+// why the poles do not accumulate spurious energy.
+static double MapTotalIrradiance(const std::vector<float>& map,
+                                  std::uint32_t W, std::uint32_t H,
+                                  int channel) {
+    const double kPi    = 3.14159265358979323846;
+    const double dphi   = (2.0 * kPi) / double(W);
+    const double dtheta = kPi / double(H);
+    double total = 0.0;
+    for (std::uint32_t y = 0; y < H; ++y) {
+        const double theta = (double(y) + 0.5) * dtheta;
+        const double omega = dphi * dtheta * std::sin(theta);
+        for (std::uint32_t x = 0; x < W; ++x) {
+            total += double(map[(std::size_t(y) * W + x) * 4 + channel]) * omega;
+        }
+    }
+    return total;
+}
+
+TEST_CASE("the rasteriser conserves each star's irradiance exactly") {
+    // THE contract of the map, and what replaced the old peak-amplitude
+    // one. The previous rasteriser wrote flux * exp(-ang2/sigma^2), a
+    // Gaussian at PEAK amplitude, so the energy a star actually delivered
+    // came out proportional to flux * sigma^2 -- it moved whenever sigma or
+    // the map resolution moved, and kFluxScale = 4.0 was the hand-tuned
+    // correction. Normalising against the discrete solid-angle-weighted sum
+    // makes the delivered irradiance exactly the catalogued one instead.
     constexpr std::uint32_t W = 720, H = 360;
     constexpr float kVmag = -2.7f;                // Jupiter near opposition
     const std::uint32_t tx = 100, ty = 80;
@@ -681,27 +730,88 @@ TEST_CASE("a planet splat and a catalogue star of the same magnitude are the sam
     pt::stars::RasteriseJ2000Map({s}, W, H, map);
     REQUIRE(map.size() == std::size_t(W) * H * 4);
 
-    double peak = 0.0;
-    for (std::size_t i = 0; i < std::size_t(W) * H; ++i) {
-        peak = std::max(peak, double(map[i * 4 + 0]));
-    }
     // The rasteriser tints the first star with its hot-blue palette entry
-    // (R = 0.85); the flux itself is the shared curve.
-    const double expect = double(pt::stars::MagnitudeToFlux(kVmag)) * 0.85;
-    CAPTURE(peak);
+    // (R = 0.85); the irradiance itself is the shared curve.
+    const double expect =
+        double(pt::stars::MagnitudeToIrradianceWm2(kVmag)) * 0.85;
+    const double got = MapTotalIrradiance(map, W, H, 0);
+    CAPTURE(got);
     CAPTURE(expect);
-    CHECK(peak == doctest::Approx(expect).epsilon(1e-4));
+    CHECK(got == doctest::Approx(expect).epsilon(1e-4));
+}
 
-    // And the splat footprint the planet path uses is the same tier
-    // function the map just used.
-    CHECK(pt::stars::SplatAngularRadiusRad(kVmag) == doctest::Approx(1.4e-3f));
-    CHECK(pt::stars::SplatAngularRadiusRad(0.0f)  == doctest::Approx(1.0e-3f));
-    CHECK(pt::stars::SplatAngularRadiusRad(5.0f)  == doctest::Approx(0.75e-3f));
+TEST_CASE("conserved irradiance is independent of map resolution") {
+    // The point of energy conservation: the same star baked at two very
+    // different resolutions delivers the same total light. Under the old
+    // peak-amplitude splat this tracked sigma^2 and drifted badly, which is
+    // exactly why the Vega gain had to be re-tuned when the map was bumped
+    // from 4Kx2K to 8Kx4K.
+    pt::stars::Star s{};
+    s.ra_deg = 123.4f; s.dec_deg = 41.7f; s.vmag = 1.25f;
+    const double expect =
+        double(pt::stars::MagnitudeToIrradianceWm2(s.vmag)) * 0.85;
+
+    const std::uint32_t sizes[3][2] = {{360, 180}, {720, 360}, {1440, 720}};
+    for (const auto& wh : sizes) {
+        CAPTURE(wh[0]);
+        std::vector<float> map;
+        pt::stars::RasteriseJ2000Map({s}, wh[0], wh[1], map);
+        const double got = MapTotalIrradiance(map, wh[0], wh[1], 0);
+        CHECK(got == doctest::Approx(expect).epsilon(1e-3));
+    }
+}
+
+TEST_CASE("conserved irradiance holds near the celestial pole") {
+    // Equirectangular texels collapse toward the poles, and the splat
+    // widens in longitude by 1/cos(dec) to compensate. Normalising against
+    // the discrete solid-angle-weighted sum -- rather than the analytic
+    // pi*sigma^2 -- is what keeps this exact where that distortion is
+    // worst.
+    const double expect0 =
+        double(pt::stars::MagnitudeToIrradianceWm2(2.0f)) * 0.85;
+    const float decs[5] = {0.0f, 45.0f, 80.0f, 89.5f, -89.5f};
+    for (float dec : decs) {
+        CAPTURE(dec);
+        pt::stars::Star s{};
+        s.ra_deg = 200.0f; s.dec_deg = dec; s.vmag = 2.0f;
+        std::vector<float> map;
+        pt::stars::RasteriseJ2000Map({s}, 720, 360, map);
+        const double got = MapTotalIrradiance(map, 720, 360, 0);
+        CHECK(got == doctest::Approx(expect0).epsilon(2e-2));
+    }
+}
+
+TEST_CASE("a planet splat and a catalogue star of the same magnitude are the same brightness") {
+    // The point of exporting MagnitudeToIrradianceWm2 / PsfSigmaRad from
+    // BscCatalog: the planetarium must not invent its own scale. Both paths
+    // now carry IRRADIANCE, and both normalise their Gaussian by pi*sigma^2
+    // (the map discretely, planetSplat() analytically), so equal magnitude
+    // means equal delivered light regardless of the sigma each is drawn at.
+    constexpr float kVmag = -2.7f;
+    const double star_E =
+        double(pt::stars::MagnitudeToIrradianceWm2(kVmag)) * 0.85;
+
+    std::vector<float> map;
+    pt::stars::Star s{};
+    s.ra_deg = 50.25f; s.dec_deg = 45.5f; s.vmag = kVmag;
+    pt::stars::RasteriseJ2000Map({s}, 720, 360, map);
+    const double map_E = MapTotalIrradiance(map, 720, 360, 0);
+
+    // The planet path hands the shader MagnitudeToIrradianceWm2(vmag)
+    // directly as df.w, which planetSplat() then spreads over a normalised
+    // PSF -- so the energy it delivers IS that number.
+    const double planet_E =
+        double(pt::stars::MagnitudeToIrradianceWm2(kVmag)) * 0.85;
+
+    CAPTURE(map_E);
+    CAPTURE(planet_E);
+    CHECK(map_E == doctest::Approx(star_E).epsilon(1e-4));
+    CHECK(planet_E == doctest::Approx(map_E).epsilon(1e-3));
 }
 
 TEST_CASE("B-V tints are hue-only and ordered by colour index") {
     // Unit luminance is the contract: the tint must not smuggle brightness
-    // past MagnitudeToFlux, or the magnitude scale stops meaning anything.
+    // past MagnitudeToIrradianceWm2, or the magnitude scale stops meaning anything.
     for (float bv = -0.4f; bv <= 2.0f; bv += 0.05f) {
         CAPTURE(bv);
         float c[3];
@@ -865,7 +975,20 @@ TEST_CASE("StarsComposite.slang still declares the planet path this test assumes
     // truncation (16 = K*K).
     CHECK(countOccurrences(src, "floatang2=2.0*(1.0-c);") == 1);
     CHECK(countOccurrences(src, "if(ang2>s2*16.0)continue;") == 1);
-    CHECK(countOccurrences(src, "acc+=ts.rgb*(df.w*exp(-ang2/s2));") == 1);
+    // NORMALISED by pi*sigma^2, which is what makes df.w the planet's
+    // total irradiance rather than a peak amplitude. Without the
+    // division the delivered energy scales with sigma^2, so a planet's
+    // brightness would depend on the size it happened to be drawn at --
+    // and it would no longer match a catalogue star of equal magnitude,
+    // since the map conserves energy. Pinned because the two halves of
+    // that equality live in different files.
+    CHECK(countOccurrences(
+        src, "acc+=ts.rgb*(df.w/(3.14159265358979*s2))*exp(-ang2/s2);") == 1);
+    // The PSF is floored at half a pixel before it is used. Widening a
+    // NORMALISED Gaussian is energy-preserving (the peak drops by the
+    // area ratio), so this anti-aliases a sub-pixel planet without
+    // changing its photometric brightness.
+    CHECK(countOccurrences(src, "sigma=max(sigma,0.5*ptPixelAngleRad());") == 1);
 
     // The day fade matches starsOnly's, so planets and stars wash out
     // together. Both the smoothstep and the 0.6 cutoff appear in

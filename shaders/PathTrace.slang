@@ -3930,6 +3930,84 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
 // procSky() for the legacy (star-split off / denoiser off) and
 // secondary-bounce paths, so stars still contribute to indirect
 // lighting in the scene.
+// --- point-source sampling (issue #338) -----------------------------------
+//
+// Angular size of one pixel, in radians. The camera is a pinhole whose
+// image plane spans 2*fovYTan vertically across `height` pixels, so this
+// is the same quantity the ray-cone texture-LOD path calls cone_spread.
+float ptPixelAngleRad() {
+    uint2 d;
+    output.GetDimensions(d.x, d.y);
+    return (2.0 * pos_fovtan.w) / float(max(d.y, 1u));
+}
+
+// Footprint-integrated star-map fetch.
+//
+// star_map holds radiance in nits at ITS OWN texel resolution, with each
+// star's illuminance spread across the texels it covers and conserved
+// exactly (pt::stars::RasteriseJ2000Map). A pixel's radiance is therefore
+// the solid-angle-weighted MEAN of the texels its footprint covers -- not
+// the value of whichever single texel the ray centre happened to land in.
+//
+// That distinction is the whole ballgame for point sources. A nearest
+// fetch hands a star's peak texel radiance to any ray that lands on it
+// and zero to every ray that does not, so a star's apparent brightness
+// depends on render resolution, and it aliases hard as the camera turns
+// (a star pops between full brightness and nothing as the ray crosses a
+// texel edge). Averaging over the real footprint yields E_star /
+// omega_pixel, which is resolution-independent and is what a pinhole
+// camera actually measures.
+//
+// The box is separable in (u, v). Its longitude half-extent widens by
+// 1/cos(dec), tracking the equirectangular grid's convergence toward the
+// poles -- the same 1/cos(dec) the host rasteriser uses when it lays the
+// energy down. Texels are weighted by sin(theta), their true solid angle.
+//
+// Bounds: the half-extents are capped (8 in v, 16 in u) so a near-pole
+// ray, where 1/cos(dec) diverges, cannot walk an entire map row. Inside
+// ~3.6 deg of a celestial pole the cap means the mean is taken over a
+// sub-region of the true footprint, which reads slightly bright; that is
+// a bounded error over a negligible sky area, and it is the safe
+// direction (clamping never fabricates energy that is not in the map).
+float3 ptStarMapFootprint(float3 j, float pix_ang) {
+    uint2 dim;
+    star_map.GetDimensions(dim.x, dim.y);
+
+    float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+    if (u < 0.0) u += 1.0;
+    float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+
+    float dtheta = 3.14159265358979 / float(max(dim.y, 1u));   // rad per v texel
+    float dphi   = 6.28318530718     / float(max(dim.x, 1u));  // rad per u texel
+
+    // j.z is sin(dec), so cos(dec) = sqrt(1 - j.z^2).
+    float cdec = sqrt(max(1.0 - j.z * j.z, 1e-6));
+
+    int hy = int(clamp(floor(0.5 * pix_ang / dtheta),          0.0,  8.0));
+    int hx = int(clamp(floor(0.5 * pix_ang / (dphi * cdec)),   0.0, 16.0));
+
+    int cx = int(floor(u * float(dim.x)));
+    int cy = int(floor(v * float(dim.y)));
+
+    float3 acc  = float3(0.0);
+    float  wsum = 0.0;
+    for (int dy = -hy; dy <= hy; ++dy) {
+        int yy = cy + dy;
+        if (yy < 0 || yy >= int(dim.y)) continue;
+        // Solid angle of a texel in this row, up to the constant
+        // dphi*dtheta that cancels in the weighted mean.
+        float om = sin((float(yy) + 0.5) * dtheta);
+        for (int dx = -hx; dx <= hx; ++dx) {
+            int xx = (cx + dx) % int(dim.x);
+            if (xx < 0) xx += int(dim.x);
+            acc  += star_map[uint2(uint(xx), uint(yy))].rgb * om;
+            wsum += om;
+        }
+    }
+    return (wsum > 0.0) ? acc / wsum : float3(0.0);
+}
+// --- end point-source sampling --------------------------------------------
+
 float3 starsOnly(float3 rd, float3 sun) {
     // Planetary P0 (#254): the observer's local up, not world +Y. Sky-dome
     // helpers are evaluated in the CAMERA's frame -- see procSky()'s
@@ -3977,15 +4055,12 @@ float3 starsOnly(float3 rd, float3 sun) {
         j.z = dot(w2j_row2.xyz, rd);
         // Equirectangular: u from atan2(y, x) (RA), v from asin(z) (dec).
         // Match the host rasteriser: u = ra/360 wraps, v = (90-dec)/180.
-        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
-        if (u < 0.0) u += 1.0;
-        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
-        uint2 dim;
-        star_map.GetDimensions(dim.x, dim.y);
-        int xi = int(floor(u * float(dim.x))) % int(dim.x);
-        if (xi < 0) xi += int(dim.x);
-        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
-        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Footprint-integrated, not nearest-texel: a star's radiance is
+        // its illuminance spread over the pixel's solid angle. See
+        // ptStarMapFootprint. Secondary rays reuse the primary pixel
+        // angle rather than their own (wider) cone -- an approximation
+        // consistent with how the rest of the sky is sampled on bounces.
+        float3 stars = ptStarMapFootprint(j, ptPixelAngleRad());
         // Twinkle. Hash on a coarse-quantised J2000 direction (~1.5
         // deg bins) so every texel covering a single star agrees on
         // phase + frequency, and the whole star modulates as one
@@ -4096,37 +4171,28 @@ float3 starsOnly(float3 rd, float3 sun) {
 // L_inscatter and buries the star. No sun-elevation flag: the same physics that
 // blacks the sky in space is what hides the stars in daylight.
 //
-// WHY THE ADDITIVE SUM IS NOT ENOUGH ON ITS OWN, AND THE CONTRAST TERM (#333).
-// Two rendering realities make the raw sum leak the brightest stars into the
-// day sky:
+// WHY THE ADDITIVE SUM IS NOW ENOUGH ON ITS OWN (#333, closed by #338).
+// It did not used to be. Two rendering realities made the raw sum leak the
+// brightest stars into the day sky, and a Weber-contrast veiling term
+// (kStarVeilK) was added to suppress them:
 //   * skyPhysical is single-scatter-dominated and reads DARKER than the real
 //     sky (documented -- r_sky_mode's own docstring, and the planet_land_orbit
-//     fixture header). At noon the modelled L_inscatter at a bright-star pixel
-//     is ~13 W/m^2/sr against the star's ~2 after extinction -- 16%, where a
-//     correctly-bright sky would make it <<1% and invisible, as in life.
+//     fixture header), so the modelled L_inscatter was too small to bury a star.
 //   * ACES tonemaps per channel. The day sky is blue-dominated and saturates
-//     BLUE first, leaving RED with headroom, so a broadband star pokes through
-//     as a warm dot even while it is a small fraction of the sky's luminance.
-// The remedy is a CONTRAST attenuation, not a brightness flag: a point source is
-// seen only when its luminance beats the veiling sky background by more than the
-// observer's threshold contrast. In the photopic (daylit) regime that threshold
-// is approximately a CONSTANT Weber contrast dL/L -- Blackwell 1946 (JOSA 36,
-// 624) measures ~1-3% for small targets at high background luminance -- so the
-// criterion is the ratio ls/lk against a fixed contrast, and starsPhysical()
-// scales the star by the order-2 soft threshold (Hill / Naka-Rushton form)
-//     vis = C^2 / (C^2 + K^2),   C = ls / lk,   ls = luma(star*T), lk = luma(sky)
-// photopic Rec.709 luma, K = kStarVeilK the threshold contrast in RASTER units
-// (see starsPhysical() below for what K is and why it is NOT parameter-free --
-// it is a veiling factor that balances a deliberate rendering choice, tracked
-// for removal by issue #338). The order 2 is a smoothness choice -- C^1 at
-// C = 0, no kink where a star fades in -- not a derived exponent. What this is
-// NOT: Rose (1948)'s shot-noise-limited law B C^2 alpha^2 = const, under which
-// the threshold contrast FALLS as 1/sqrt(B); that is the photon-starved
-// (scotopic) regime and is not modelled here. vis tends to 1 as the sky
-// in-scatter tends to 0 (space AND ground night: stars full, unchanged, for ANY
-// K) and to 0 as the sky brightens (daylight: stars drowned). It is applied to
-// all channels off the LUMINANCE contrast (not per channel) precisely so the
-// warm dot on the bright blue sky is pulled down with the rest.
+//     BLUE first, leaving RED with headroom, so a broadband star poked through
+//     as a warm dot even while it was a small fraction of the sky's luminance.
+// But the dominant cause was neither: the star raster itself was ~500x too
+// bright, riding a night-visibility scale (Vega = 4.0 "units") while the sky was
+// in real photometric units. Nothing additive can be correct across that gap,
+// which is why a contrast term had to be bolted on.
+//
+// The raster is physical now (pt::stars::MagnitudeToIrradianceWm2, energy
+// conserved by RasteriseJ2000Map), so the sum stands unaided: a star's ~3.5e-4
+// W/m^2/sr is ~1200x a TRUE moonless night sky and ~2e-5 of a noon sky. The
+// remaining
+// two effects above are real but second-order at that ratio, and both are
+// better fixed at their source (multiple scattering; the tonemapper) than
+// cancelled by a constant. The veiling term and its tuned K are gone.
 //
 // starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
 // kept a separate function (rather than sharing starsOnly's body) so modes
@@ -4156,15 +4222,12 @@ float3 starsRadianceRaw(float3 ro, float3 rd) {
         j.x = dot(w2j_row0.xyz, rd);
         j.y = dot(w2j_row1.xyz, rd);
         j.z = dot(w2j_row2.xyz, rd);
-        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
-        if (u < 0.0) u += 1.0;
-        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
-        uint2 dim;
-        star_map.GetDimensions(dim.x, dim.y);
-        int xi = int(floor(u * float(dim.x))) % int(dim.x);
-        if (xi < 0) xi += int(dim.x);
-        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
-        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Footprint-integrated, not nearest-texel: a star's radiance is
+        // its illuminance spread over the pixel's solid angle. See
+        // ptStarMapFootprint. Secondary rays reuse the primary pixel
+        // angle rather than their own (wider) cone -- an approximation
+        // consistent with how the rest of the sky is sampled on bounces.
+        float3 stars = ptStarMapFootprint(j, ptPixelAngleRad());
         if (exposure_pad.w > 0.001) {
             int3 q  = int3(floor(j * 38.0));
             uint qh = uint(q.x + 128) * 65536u
@@ -6898,55 +6961,50 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 // shell (space), and the reddened column transmittance in between. It is not
 // sun-specific; the name is historical.
 //
-// `sky_inscatter` is the skyPhysical() radiance skyColor() already computed for
-// this ray (passed in rather than recomputed). vis is the order-2 soft Weber-
-// contrast threshold of the star against the veiling sky (the form, and what it
-// is not, are derived at starsRadianceRaw()) -- 1 where the sky is dark, ->0
-// where it is bright.
+// There is no veiling term. Stars are ADDED to the sky radiance and nothing
+// suppresses them in daylight, because on a shared physical scale nothing needs
+// to: a star contributing ~3.5e-4 W/m^2/sr against a ~15 W/m^2/sr noon zenith
+// is already ~2e-5 of it.
 //
-// kStarVeilK is a TUNED veiling factor, not a derived or parameter-free constant.
-// It exists to balance a DELIBERATE rendering choice against daytime contrast:
-// the Bright Star Catalog is rasterised on a NIGHT-VISIBILITY scale, not in
-// W/m^2/sr. A magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where its
-// true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x smaller -- and
-// the boost is intentional: a physically-scaled star renders as nothing under
-// the ACES tonemap, so the raster is pushed up until stars are visible at night.
-// That same boost makes a bright star (Sirius) read comparable to the (itself
-// single-scatter-underestimated) noon sky in linear light, so the raw contrast
-// leaks it into daylight. K is the multiplier on the sky's veiling luminance that
-// cancels the boost in the daytime contrast test. If the raster were physical, K
-// would tend to ~1; issue #338 tracks giving stars real radiometry + an exposure
-// model, after which this factor (and the raster boost) can be removed.
-//
-// K is NOT a day/night flag: at night and in space the sky in-scatter is ~0, so
-// K*lk is ~0 and vis is 1 for ANY K -- ground-night and orbit renders are
-// bit-identical across K (verified K = 1..20). K only sets how hard a LIT sky
-// washes stars out. K = 8 is a measured, conservative midpoint: K = 4 still
-// leaks a daytime dot at a low sun (+5 deg), K = 16 delays bright stars emerging
-// through twilight; 8 buries Sirius at noon (brightest daytime star +60 -> +0
-// sensor levels) while letting stars return by nautical/astronomical twilight as
-// the in-scatter falls. See starsRadianceRaw() for the surrounding rationale.
-//
-// fp32 FORM. Both luminances are normalised by the larger of the two before
-// the ratio is formed, so the denominator lies in [1, 2]: no 0/0 when a star
-// with s > 0 is extincted to ls = 0 against a dark sky (T -> 0 at the limb,
-// lk = 0 -- a case the s <= 0 early-out does NOT exclude), no overflow when
-// lk/ls is huge, and no epsilon. ls = 0 has nothing to veil and returns black,
-// which is what star * vis would be anyway. lk = 0 gives a = 1, b = 0 and
-// vis = 1 EXACTLY, which is the K-independence of night and space stated above.
-static const float kStarVeilK = 8.0;
-float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
+// What used to be here was kStarVeilK = 8.0 and an order-2 Weber-contrast
+// factor. Its own comment named the reason it had to exist: "the Bright Star
+// Catalog is rasterised on a NIGHT-VISIBILITY scale, not in W/m^2/sr [...] a
+// magnitude-0 star is 4.0 units where its true per-pixel radiance at this FOV
+// is ~500x smaller", and "if the raster were physical, K would tend to ~1".
+// The raster IS physical now -- pt::stars::MagnitudeToIrradianceWm2 puts Vega
+// at its real 3.19e-9 W/m^2 and RasteriseJ2000Map conserves it -- so K has
+// nothing left to cancel and the whole contrast test goes with it. That closes
+// the removal issue #338 was opened for, by the route it proposed.
+float3 starsPhysical(float3 ro, float3 rd) {
     float3 s = starsRadianceRaw(ro, rd);
     if (all(s <= float3(0.0))) return float3(0.0);
-    float3 star = s * sunSlantTransmittance(ro, rd);
-    float ls = dot(star,         float3(0.2126, 0.7152, 0.0722));
-    float lk = dot(sky_inscatter, float3(0.2126, 0.7152, 0.0722)) * kStarVeilK;
-    if (!(ls > 0.0)) return float3(0.0);    // fully extinct: nothing to veil
-    float m = max(ls, lk);                  // > 0 because ls > 0
-    float a = ls / m;                       // in (0, 1]
-    float b = lk / m;                       // in [0, 1]; one of a, b is exactly 1
-    float vis = (a * a) / (a * a + b * b);  // denominator in [1, 2]
-    return star * vis;
+    // Atmospheric extinction along the slant path, and nothing else. The
+    // star's radiance is simply ADDED to the sky's by the caller, because
+    // both are now in the same physical units (W/m^2/sr) -- so daylight
+    // suppression is no longer something the renderer has to arrange.
+    //
+    // This is what retires kStarVeilK. That constant (8.0, admittedly
+    // "empirical" and tracked for removal by issue #338) existed to fake
+    // the disappearance of stars in daylight, which was necessary only
+    // because stars rode an arbitrary scale where Vega was 4.0 while the
+    // sky was in real nits: with mismatched units, no amount of adding
+    // could make a star both visible at night and invisible by day.
+    //
+    // On the shared scale the arithmetic does it unaided. Vega contributes
+    // ~3.5e-4 W/m^2/sr of pixel radiance at a 60 deg / 384 px framing.
+    // Against a TRUE ~2.9e-7 W/m^2/sr moonless night sky that is ~1200x --
+    // overwhelming. Against a ~15 W/m^2/sr noon zenith it is ~2e-5 --
+    // utterly lost, which is why you cannot see stars by day in reality.
+    //
+    // CAVEAT, and it is the live one: procSky's night floor is NOT that
+    // true night sky. It is a painted stand-in, (0.005, 0.010, 0.030) *
+    // kPtLegacySkyScale = 0.0589 W/m^2/sr of luma -- some 2e5 times a real
+    // moonless sky, which is the "five orders of magnitude" the golden
+    // matrix's own night-cell hold note records. Against THAT floor Vega
+    // is 0.6% of the background and stays invisible. Physical stars are a
+    // precondition for a night sky that reads correctly; they are not on
+    // their own sufficient, and the floor is the next thing to fix.
+    return s * sunSlantTransmittance(ro, rd);
 }
 // --- end Planetary P6 physical sky ------------------------------------------
 
@@ -6978,7 +7036,7 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
         // whole sunlit hemisphere of any orbit.
         float3 sky = skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed);
         return sky
-             + starsPhysical(ro, rd, sky)
+             + starsPhysical(ro, rd)
              + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
     }

@@ -1733,8 +1733,28 @@ TEST_CASE("shader mirror is still faithful") {
     // call, `sky += starsOnly(rd, sun)`, and is untouched); and the (1 - day)
     // fade multiplies exactly twice -- both inside starsOnly() -- so a fade
     // cannot creep back into starsRadianceRaw() unnoticed.
-    CHECK(countOf(pt, "+starsPhysical(ro,rd,sky)") == 1u);
-    CHECK(countOf(pt, "float3star=s*sunSlantTransmittance(ro,rd);") == 1u);
+    // starsPhysical lost its third argument in #338. It used to take the
+    // sky in-scatter in order to apply a Weber-contrast VEILING factor
+    // (kStarVeilK = 8.0) that faked stars out of the daylight sky. That
+    // was only ever needed because the star raster rode a night-visibility
+    // scale while the sky was in real W/m^2/sr; with both sides physical a
+    // star is ~2e-5 of a noon zenith and simply adding it is correct. The
+    // pinned INTENT is unchanged and is what these two lines still assert:
+    // the physical mode composes the EXTINCTED star term from the ray's
+    // own origin.
+    CHECK(countOf(pt, "+starsPhysical(ro,rd)") == 1u);
+    CHECK(countOf(pt, "returns*sunSlantTransmittance(ro,rd);") == 1u);
+    // The veiling factor must stay gone. A tuned constant that once had a
+    // reason to exist is exactly the kind of thing that creeps back, so
+    // its absence is asserted rather than assumed. Pinned on the
+    // DECLARATION, not the bare name: the comments that explain why it was
+    // removed still say it, and losing that history to satisfy a substring
+    // match would be the wrong trade. Nothing can use it undeclared.
+    CHECK(countOf(pt, "staticconstfloatkStarVeilK=") == 0u);
+    // Stars are sampled by FOOTPRINT, not by nearest texel -- the property
+    // that makes a star's brightness independent of render resolution.
+    // Two call sites (starsOnly for modes 0-3, starsRadianceRaw for mode 4).
+    CHECK(countOf(pt, "ptStarMapFootprint(j,ptPixelAngleRad())") == 2u);
     CHECK(countOf(pt, "+starsOnly(rd,sun_and_mode.xyz)") == 0u);
     CHECK(countOf(pt, "*(1.0-day);") == 2u);
     const std::string sc = tighten(PT_SHADER_STARSCOMPOSITE_PATH);

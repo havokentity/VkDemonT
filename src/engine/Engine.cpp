@@ -10810,17 +10810,22 @@ void Engine::RenderFrame() {
                 planet_dir_flux[slot][0] =  ce_p * std::sin(a_r);
                 planet_dir_flux[slot][1] =  se_p;
                 planet_dir_flux[slot][2] = -ce_p * std::cos(a_r);
-                // THE shared photometric scale. Same two functions every
-                // Bright Star Catalog entry goes through -- a planet at
-                // V = -2.7 must paint what a star at V = -2.7 paints.
+                // THE shared photometric scale, now in real lux. Same two
+                // functions every Bright Star Catalog entry goes through --
+                // a planet at V = -2.7 must paint what a star at V = -2.7
+                // paints.
                 const float vmag = static_cast<float>(pp.vmag);
                 planet_dir_flux[slot][3] =
-                    pt::stars::MagnitudeToFlux(vmag) * brightness;
+                    pt::stars::MagnitudeToIrradianceWm2(vmag) * brightness;
                 pt::stars::BvToLinearSrgbTint(
                     static_cast<float>(pt::astro::planetBvColorIndex(p)),
                     planet_tint_sigma[slot]);
+                // Optical PSF sigma -- magnitude-independent, exactly as
+                // for catalogue stars. planetSplat() floors it at half a
+                // pixel on its own (energy-preserving), so no sampling
+                // floor is imposed here.
                 planet_tint_sigma[slot][3] =
-                    pt::stars::SplatAngularRadiusRad(vmag) * size_mult;
+                    pt::stars::PsfSigmaRad(0.0f) * size_mult;
                 ++planet_slot_count;
             }
         }
