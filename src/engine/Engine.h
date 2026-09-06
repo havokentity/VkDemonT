@@ -694,6 +694,12 @@ private:
     // resolve becomes a single uint compare per pipeline (no mutex,
     // no map lookup).  Idempotent: safe to call from RenderFrame.
     void EnsurePipelineHandles();
+    // Step 1 probe: true iff this frame's PathTrace pass runs as the RT
+    // pipeline (r_pt_pipeline rt, device support, pipeline built). Builds
+    // the pipeline for the current variant / opt on first use --
+    // synchronously, blocking the frame for the driver compile, which is
+    // the probe's measurement -- and falls back to compute on failure.
+    bool ResolvePathTraceRtPipeline();
 
     // Predictive pipeline JIT prewarming. Signals every compute kernel
     // the engine knows about to Device::EnsurePipelineWarmed so the
@@ -1496,6 +1502,17 @@ private:
     std::uint64_t                               placeholder_storage_id_  = 0;
 
     std::uint64_t                               pathtrace_pipeline_id_ = 0;
+    // Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md): the PathTrace pass
+    // as a ray-tracing pipeline under r_pt_pipeline rt. The id is the
+    // pipeline built for pathtrace_rt_pipeline_key_ ("pathtrace_rt_<variant>_
+    // <opt>", from r_pt_rt_variant / r_pt_rt_opt); a key that failed to
+    // build is remembered so the fallback to compute is logged once, not
+    // every frame. Pipelines built for earlier keys are not destroyed --
+    // the probe switches variants between processes, not within one.
+    std::uint64_t                               pathtrace_rt_pipeline_id_ = 0;
+    std::string                                 pathtrace_rt_pipeline_key_;
+    std::string                                 pathtrace_rt_failed_key_;
+    bool                                        pathtrace_rt_unsupported_logged_ = false;
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;

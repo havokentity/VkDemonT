@@ -405,6 +405,29 @@ namespace cvar {
             CVAR_ARCHIVE);
     PT_CVAR(r_max_bounces,     "8",  "Max path bounces per ray",          CVAR_ARCHIVE);
     PT_CVAR(r_spp,             "1",  "Samples per pixel per dispatch (>=1). Higher = cleaner motion frames at proportional GPU cost.", CVAR_ARCHIVE);
+    // --- Step 1 go/no-go probe (docs/STEP1_RT_PIPELINE_DESIGN.md) ----------
+    // Which pipeline runs the PathTrace pass. `compute` is the megakernel as
+    // it has always been dispatched. `rt` binds the same source compiled as
+    // a VK_KHR_ray_tracing_pipeline raygen (shaders/PathTraceRaygen.slang)
+    // and launches it with TraceRays over the same binds and push
+    // constants; every pass downstream is unchanged. Vulkan only -- other
+    // backends have no RT pipeline and stay on compute with a one-shot
+    // warning. NOT archived: a probe knob, not a user preference.
+    PT_CVAR(r_pt_pipeline, "compute",
+            "PathTrace pass pipeline: compute (the megakernel dispatch) | rt "
+            "(the same kernel as a ray-tracing-pipeline raygen, Step 1 probe). "
+            "Vulkan only; falls back to compute elsewhere or when the pipeline "
+            "fails to build.", 0);
+    PT_CVAR(r_pt_rt_variant, "p2",
+            "Step 1 probe raygen variant under r_pt_pipeline rt: p0 (loop "
+            "skeleton + hardware trace + Lambert only) | p1 (p0 + every BSDF "
+            "branch + transmittance) | p2 (the full kernel). See "
+            "docs/STEP1_RT_PIPELINE_DESIGN.md section 1.", 0);
+    PT_CVAR(r_pt_rt_opt, "o2",
+            "Step 1 probe raygen slangc optimisation level under r_pt_pipeline "
+            "rt: o0 | o2. The compute kernel is always -O0 (cmake/Slang.cmake); "
+            "o2 is the experiment.", 0);
+    // --- end Step 1 probe --------------------------------------------------
     PT_CVAR(r_firefly_clamp,   "10",  "Per-contribution firefly clamp (per-channel ceiling on INDIRECT light contributions: env-NEE, skylight, bounce-to-sky, and NEE at bounce depth >= 1). Direct NEE at the primary hit is deliberately UNCLAMPED -- it is a low-variance estimate, and clamping it dimmed bright close lights and flattened the inverse-square falloff (the procedural sun NEE was always unclamped for the same reason). Camera-direct sky is also unbounded so the sun renders at full intensity. ACES saturates anything above ~5 to ~1.0 for SDR, so 10 preserves visible highlights and kills fireflies. 0 disables.", CVAR_ARCHIVE);
     PT_CVAR(r_quality,         "high",  "Master quality preset that drives r_spp, r_max_bounces, r_caustics, r_refract_bounces, etc. Options: low (fast, no caustics), medium (default-ish), high (caustics, more bounces), ultra (max). 'custom' leaves per-feature cvars as-is.", CVAR_ARCHIVE);
     PT_CVAR(r_caustics,        "1",  "Refractive shadow rays. 1 = NEE rays refract through dielectrics so glass/diamond produce caustic patterns; 0 = treat all dielectrics as opaque shadow blockers (faster, blocks any caustic). Path-tracer-correct in both modes.", CVAR_ARCHIVE);
@@ -6468,6 +6491,52 @@ void Engine::EnsureLightTreeUploaded() {
 }
 // --- end Light tree --------------------------------------------------------
 
+bool Engine::ResolvePathTraceRtPipeline() {
+    if (!device_) return false;
+    auto& C = pt::console::Console::Get();
+    auto cvar_value = [&](const char* name, const char* fallback) -> std::string {
+        auto* v = C.FindCVar(name);
+        return (v != nullptr && !v->value.empty()) ? v->value : std::string(fallback);
+    };
+    if (cvar_value("r_pt_pipeline", "compute") != "rt") return false;
+    if (!device_->SupportsRayTracingPipeline()) {
+        if (!pathtrace_rt_unsupported_logged_) {
+            pathtrace_rt_unsupported_logged_ = true;
+            LOG_WARN("r_pt_pipeline rt: this device has no ray-tracing pipeline "
+                     "(VK_KHR_ray_tracing_pipeline); staying on the compute kernel");
+        }
+        return false;
+    }
+    // The compute pipeline is the readiness signal: the Vulkan worker has
+    // loaded the pipeline cache and the scene resources exist by the time
+    // it lands, so building the RT pipeline here cannot race the worker.
+    if (pathtrace_pipeline_id_ == 0) return false;
+
+    const std::string key = "pathtrace_rt_" + cvar_value("r_pt_rt_variant", "p2")
+                          + "_" + cvar_value("r_pt_rt_opt", "o2");
+    if (pathtrace_rt_pipeline_id_ != 0 && key == pathtrace_rt_pipeline_key_) return true;
+    if (key == pathtrace_rt_failed_key_) return false;
+
+    LOG_INFO("r_pt_pipeline rt: building '{}' (blocks this frame for the driver compile)", key);
+    const pt::rhi::RayTracingPipelineDesc desc{
+        .raygen_kernel      = key,
+        .miss_kernel        = "pathtrace_rt_miss",
+        .closest_hit_kernel = "pathtrace_rt_chit",
+        .debug_name         = key,
+    };
+    const std::uint64_t id = device_->CreateRayTracingPipeline(desc).id;
+    if (id == 0) {
+        pathtrace_rt_failed_key_ = key;
+        LOG_ERROR("r_pt_pipeline rt: '{}' failed to build; the PathTrace pass stays on "
+                  "the compute kernel", key);
+        return false;
+    }
+    pathtrace_rt_pipeline_id_  = id;
+    pathtrace_rt_pipeline_key_ = key;
+    LOG_INFO("r_pt_pipeline rt: '{}' active for the PathTrace pass", key);
+    return true;
+}
+
 void Engine::EnsurePipelineHandles() {
     if (!device_) return;
     auto resolve = [&](std::uint64_t& cached, const char* name) {
@@ -8551,7 +8620,20 @@ void Engine::RenderFrame() {
         gpu_pass_labels_cur_->clear();
     }
     GpuPassMark(cb, "PathTrace");
-    cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
+    // Step 1 probe: the pass is either the compute megakernel or the same
+    // kernel as a ray-tracing-pipeline raygen (r_pt_pipeline rt). Only the
+    // bind here and the launch at the end of this block differ; every bind
+    // and the push constants in between are shared, which is the point of
+    // reusing the layout (docs/STEP1_RT_PIPELINE_DESIGN.md section 8).
+    const bool pathtrace_rt = ResolvePathTraceRtPipeline();
+    if (pathtrace_rt) {
+        cb->BindRayTracingPipeline(pt::rhi::PipelineHandle{pathtrace_rt_pipeline_id_});
+    } else {
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
+    }
+    const auto pathtrace_write_stage = pathtrace_rt
+        ? pt::rhi::BarrierDesc::Stage::RayTracingWrite
+        : pt::rhi::BarrierDesc::Stage::ComputeWrite;
     cb->BindStorageTexture(0, fc.swapchain_image);
     cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
 
@@ -12208,9 +12290,15 @@ void Engine::RenderFrame() {
     cb->PushConstants(&push, sizeof(push));
     accum_dirty_ = false;
 
-    auto wg_x = (fc.width  + 7) / 8;
-    auto wg_y = (fc.height + 7) / 8;
-    cb->Dispatch(wg_x, wg_y, 1);
+    if (pathtrace_rt) {
+        // One raygen invocation per pixel; the raygen keeps the kernel's
+        // `tid >= dim` guard, so the exact grid is what it expects.
+        cb->TraceRays(fc.width, fc.height, 1);
+    } else {
+        auto wg_x = (fc.width  + 7) / 8;
+        auto wg_y = (fc.height + 7) / 8;
+        cb->Dispatch(wg_x, wg_y, 1);
+    }
 
     // Wave 7 (#24): procedural-raymarched cloud pre-pass. Runs AFTER
     // PathTrace because (a) PathTrace has already been told via
@@ -12241,8 +12329,9 @@ void Engine::RenderFrame() {
     if (raymarched_clouds_dispatch) {
         GpuPassMark(cb, "CloudsRaymarch");
         // RAW barrier: PathTrace.slang wrote (or skipped) cloud_trans_tex;
-        // we're about to overwrite it.
-        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+        // we're about to overwrite it. The source stage is whichever
+        // pipeline the PathTrace pass ran as this frame.
+        cb->Barrier({pathtrace_write_stage,
                      pt::rhi::BarrierDesc::Stage::ComputeRead});
         cb->BindComputePipeline(pt::rhi::PipelineHandle{clouds_raymarch_pipeline_id_});
         // Output is the [active] ping-pong; history (read) is the OTHER one.
@@ -12788,8 +12877,9 @@ void Engine::RenderFrame() {
         // emit a global compute-write -> compute-read barrier. Metal
         // inserts the equivalent barrier automatically between dispatches
         // on a shared resource, so the Metal backend's Barrier() is a
-        // no-op.
-        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+        // no-op. The source is the PathTrace pass's own stage (compute or
+        // the RT pipeline under r_pt_pipeline rt).
+        cb->Barrier({pathtrace_write_stage,
                      pt::rhi::BarrierDesc::Stage::ComputeRead});
 
         cb->BindComputePipeline(pt::rhi::PipelineHandle{autoexpose_pipeline_id_});
@@ -13494,8 +13584,8 @@ void Engine::RenderFrame() {
             // emits the same global barrier when r_auto_exposure is
             // on; emit it unconditionally here to cover auto-exposure-
             // off too. (No-op on Metal -- but Metal never enters this
-            // branch.)
-            cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+            // branch.) Source stage = the PathTrace pass's pipeline.
+            cb->Barrier({pathtrace_write_stage,
                          pt::rhi::BarrierDesc::Stage::ComputeRead});
             if (bloom_can_run) {
                 dispatch_bloom_pyramid(denoise_color_tex_id_);
