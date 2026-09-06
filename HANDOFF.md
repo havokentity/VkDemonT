@@ -79,6 +79,56 @@ Vulkan build; each wants a compile/behaviour check as it lands):
   Frame); when the Metal shader blocks go, that expectation drops to `1`.
 - Assorted MoltenVK/Metal *comment* references in kept Vulkan/shader files.
 
+### Native-Vulkan bringup status (branch `fix/vulkan-native-bringup`) — **RENDERS on native Vulkan now**
+
+Step 2 above (native-Vulkan pixel correctness) was completed on a real RTX
+5090. The backend had **never actually worked on native Vulkan** — it was
+only exercised through MoltenVK, which hid several bugs. Symptom was a black
+screen then a GPU hang on the first frame. All three faults are now fixed and
+the smoke test renders a correct frame (gradient sky + ground, 0
+`DEVICE_LOST`) at 176×120 and 320×240.
+
+- **FIXED (committed, validated): descriptor binding-2 type collision.** One
+  shared `VkDescriptorSetLayout` served every kernel with per-kernel binding
+  *numbers* that mean different resource TYPES (binding 2 = scene TLAS for
+  PathTrace, storage image for the cloud kernels). Native Vulkan faulted;
+  fix = declare binding 2 `MUTABLE_EXT` + enable `VK_EXT_mutable_descriptor_type`
+  in `VulkanDevice.cpp`. `VUID-07990` 2→0.
+- **FIXED: swapchain storage-image format.** Commit `5687583` switched the
+  swapchain outputs from `rgba8` to `Unknown` format to satisfy a validation
+  warning — but on driver **32.0.16.1656** `Unknown`-format `OpImageWrite`
+  silently NO-OPS (the swapchain stays black), the exact 596.x-family
+  regression the `PathTrace.slang` top comment warns about. **Reverted the
+  swapchain outputs back to `rgba8`** (`output`, `swap_out`, `ldr_out`,
+  `out_image` in PathTrace / DenoiseFinalize / Tonemap / PerfOverlay /
+  EditorOverlay). The BGRA8-vs-rgba8 mismatch is only a validation warning,
+  not a fault.
+- **FIXED — the TDR hang was the megakernel being fully INLINED.** The hang
+  (Windows event **153**, `nvlddmkm` "GPU hung and reset") was
+  workload-independent — a 16×16 gradient frame with no planet/terrain/CSG,
+  bloom/clouds off, 1 bounce, 1 spp still hung, which rules out a per-pixel
+  compute-cost TDR (256 pixels cannot cross the 2 s watchdog). Root cause:
+  Slang **inlines the whole path tracer into a single ~6.6 MB SPIR-V `main`**,
+  and the NVIDIA driver miscompiles that blob into a **non-terminating ISA
+  loop** on the primary-ray-miss path (the executed source there is loop-free
+  — verified by bisection). Fix: compile the SPIR-V shaders with **`slangc
+  -O0`** (`PT_SLANGC_OPT` in `cmake/Slang.cmake`), which keeps functions
+  out-of-line — `PathTrace.spv` drops 6.6 MB → 336 KB and the driver compiles
+  it correctly. `-O1`+ re-inline and re-hang; `[noinline]` on individual
+  functions did not help (a mixed inline/out-of-line kernel still choked the
+  driver, and skyColor alone out-of-line never finished the pipeline build).
+  **Caveat / follow-up:** `-O0` leaves the megakernel un-optimised, so path
+  tracing is slower than it should be. The proper long-term fix is to
+  **split/shrink the megakernel** (the repo's standing plan) so it can run
+  optimised; `-O0` is what unblocks native-Vulkan bringup today.
+- **FIXED in passing:** `-DPT_PLANET_ENABLED=OFF` compiles now (the
+  `atmo_ms_lut` / `ptMsLutReady` hoist out of the planet `#if` gate, commit
+  `4f36768`).
+- **Not yet re-verified:** the interactive swapchain (the smoke test captures
+  `accum_hdr`, not the presented image) — needs a live look on the box. And a
+  Vulkan **golden** image cell is still owed (goldens currently run on the
+  software/Embree backend, which `-O0` does not affect).
+
 ## Conventions (carried from the parent)
 
 - Real physics, metric units, real *cited* constants. No magic epsilons — derive every tolerance. No heuristic shortcuts dressed as physics.

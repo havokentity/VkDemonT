@@ -1036,6 +1036,29 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         dexts.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         dexts.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
     }
+    // VK_EXT_mutable_descriptor_type: the shared descriptor-set layout is a
+    // single "god" layout that every compute kernel is dispatched against,
+    // Metal-style, with per-kernel binding *numbers* that mean different
+    // resource TYPES per kernel (e.g. binding 2 is the scene TLAS for
+    // PathTrace but a storage image -- clouds_color_prev / depth_tex -- for
+    // the cloud kernels, which the engine binds via BindStorageTexture(2,..)).
+    // A strictly-typed Vulkan layout can't express that; MoltenVK tolerated
+    // it (per-pipeline Metal argument buffers) but a native NVIDIA driver
+    // faults the GPU (DEVICE_LOST) on the first mismatched dispatch. Mutable
+    // descriptors let one binding hold any of a listed set of types, which
+    // is exactly the polymorphic-slot model this engine assumes. Optional:
+    // if the driver lacks it we fall back to the strict layout (binding 2
+    // stays acceleration-structure-only and the cloud kernels still fault --
+    // a follow-up would re-slot those shaders instead).
+    const bool supports_mutable_desc =
+        DeviceSupportsExtension(phys_device_,
+                                VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    // Only load-bearing where binding 2 is the (typed) acceleration structure,
+    // i.e. on hardware-RT builds; the norq layout omits binding 2 entirely.
+    const bool use_mutable_binding2 = supports_mutable_desc && rt_supported_;
+    if (use_mutable_binding2) {
+        dexts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
+    }
 #if defined(PT_ENABLE_OPTIX)
     // CUDA-Vulkan interop for the OptiX denoiser. The base
     // VK_KHR_external_memory / VK_KHR_external_semaphore are core 1.1
@@ -1105,6 +1128,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     rq_feat.sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
     rq_feat.rayQuery = VK_TRUE;
 
+    VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mut_feat{};
+    mut_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
+    mut_feat.mutableDescriptorType = VK_TRUE;
+
     void** next_slot = &f2.pNext;
     auto chain = [&](void* node, void** node_next) {
         *next_slot = node;
@@ -1115,6 +1142,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     if (rt_supported_) {
         chain(&as_feat, reinterpret_cast<void**>(&as_feat.pNext));
         chain(&rq_feat, reinterpret_cast<void**>(&rq_feat.pNext));
+    }
+    if (use_mutable_binding2) {
+        chain(&mut_feat, reinterpret_cast<void**>(&mut_feat.pNext));
     }
 
     VkDeviceCreateInfo dci{};
@@ -1231,7 +1261,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // adds pbr_atlas (binding 34) for a total of 17. Wave 9 god rays adds
     // godrays_mask (binding 37) for a total of 18.
     psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 18 + 4 });
-    if (rt_supported_) {
+    // Binding 2 is the one polymorphic slot on the shared layout (scene TLAS
+    // for PathTrace, storage image for the cloud kernels). When the mutable-
+    // descriptor extension is available it is declared MUTABLE_EXT (below);
+    // otherwise it stays a typed acceleration structure (strict fallback).
+    if (use_mutable_binding2) {
+        psizes.push_back({ VK_DESCRIPTOR_TYPE_MUTABLE_EXT, kTotalSets * 1 + 1 });
+    } else if (rt_supported_) {
         psizes.push_back({ VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, kTotalSets * 1 + 1 });
     }
     // 18 storage-buffer bindings per dispatch: mesh_positions, mesh_indices,
@@ -1258,8 +1294,27 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // Land cover (#300) adds land_albedo (47). 21 -> 22; slack retained.
     psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 22 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
+    // Type list for the MUTABLE_EXT slot(s): storage image (cloud kernels),
+    // storage buffer (defensive / future polymorphic uses), acceleration
+    // structure (PathTrace scene_tlas). The pool needs it so it can size the
+    // mutable descriptors (their size is the max over the listed types). The
+    // layout below declares the same list for binding 2.
+    static constexpr VkDescriptorType kMutableTypes[] = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+    };
+    VkMutableDescriptorTypeListEXT pool_mut_list{};
+    pool_mut_list.descriptorTypeCount = 3;
+    pool_mut_list.pDescriptorTypes    = kMutableTypes;
+    VkMutableDescriptorTypeCreateInfoEXT pool_mut{};
+    pool_mut.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
+    pool_mut.mutableDescriptorTypeListCount = 1;
+    pool_mut.pMutableDescriptorTypeLists    = &pool_mut_list;
+
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpci.pNext         = use_mutable_binding2 ? &pool_mut : nullptr;
     dpci.maxSets       = kTotalSets;
     dpci.poolSizeCount = static_cast<std::uint32_t>(psizes.size());
     dpci.pPoolSizes    = psizes.data();
@@ -1301,9 +1356,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // bindings 0-1: output + accum (storage image)
         add_binding(0,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
         add_binding(1,  VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-        // binding 2: scene_tlas (only when hw RT is supported)
+        // binding 2: polymorphic slot (only present when hw RT is supported).
+        // scene_tlas for PathTrace, but a storage image (clouds_color_prev /
+        // depth_tex) for the cloud kernels, which the engine binds to the
+        // same slot per-dispatch. Declared MUTABLE_EXT so the one shared
+        // layout accepts either type; strict acceleration-structure fallback
+        // when the extension is unavailable.
         if (rt_supported_) {
-            add_binding(2, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+            add_binding(2, use_mutable_binding2
+                              ? VK_DESCRIPTOR_TYPE_MUTABLE_EXT
+                              : VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
         }
         // bindings 3-5: mesh_positions, mesh_indices, primitives (storage buffer)
         add_binding(3,  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
@@ -1507,6 +1569,28 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         bfci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
         bfci.bindingCount  = static_cast<std::uint32_t>(bind_flags.size());
         bfci.pBindingFlags = bind_flags.data();
+
+        // Per-binding mutable type lists. VkMutableDescriptorTypeCreateInfoEXT
+        // requires one list entry per layout binding (same order as pBindings);
+        // MUTABLE_EXT bindings get the {image, buffer, accel-struct} list, all
+        // others an empty list. Chained into dslci via bfci->pNext. Kept alive
+        // (function-scope vectors) until vkCreateDescriptorSetLayout returns.
+        std::vector<VkMutableDescriptorTypeListEXT> mut_lists;
+        VkMutableDescriptorTypeCreateInfoEXT layout_mut{};
+        if (use_mutable_binding2) {
+            mut_lists.assign(b.size(), VkMutableDescriptorTypeListEXT{0, nullptr});
+            for (std::size_t i = 0; i < b.size(); ++i) {
+                if (b[i].descriptorType == VK_DESCRIPTOR_TYPE_MUTABLE_EXT) {
+                    mut_lists[i].descriptorTypeCount = 3;      // kMutableTypes
+                    mut_lists[i].pDescriptorTypes    = kMutableTypes;
+                }
+            }
+            layout_mut.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
+            layout_mut.mutableDescriptorTypeListCount =
+                static_cast<std::uint32_t>(mut_lists.size());
+            layout_mut.pMutableDescriptorTypeLists = mut_lists.data();
+            bfci.pNext = &layout_mut;
+        }
 
         VkDescriptorSetLayoutCreateInfo dslci{};
         dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
