@@ -136,6 +136,12 @@ the smoke test renders a correct frame (gradient sky + ground, 0
   (goldens currently run on the software/Embree backend, which `-O0` does
   not affect).
 
+### Next-gen roadmap progress (see `docs/NEXTGEN_PLAN.md`)
+
+- **Step 0 — DONE** (`feat/vulkan-step0-features`, PR #4): Vulkan 1.4 requested and effective; the promoted 1.2/1.3/1.4 features and the RT-pipeline family (`VK_KHR_ray_tracing_pipeline`, `pipeline_library`, `ray_tracing_maintenance1`, `VK_EXT_ray_tracing_invocation_reorder`, `position_fetch`, `subgroup_uniform_control_flow`) enabled; every next-gen extension queried and logged at startup — all present on the RTX 5090 / 616.56 (SER in REORDER mode, cluster-AS rev 4, PTLAS, coopvec/coopmat, FP8, OMM; only `shaderBFloat16DotProduct` absent). Rendering bit-identical (md5). `docs/NVIDIA_DRIVER_BUG_REPORT.md` is ready for the owner to file — record the bug ID here.
+- **Step 1 — design done** (`docs/STEP1_RT_PIPELINE_DESIGN.md`): 21 shader groups in 4 pipeline libraries, software tiers merged in raygen via portable `MakeMiss` records, 48 B payload, two SER reorder points, shared layout reused. Leads with a **2-day go/no-go probe** (raygen-only port at `-O2`, 16×16 soak) before the split; wavefront-compute is plan B. Note: `NEXTGEN_PLAN.md`'s `PathTrace.slang` line numbers are ~220 lines stale since the polish landed; the design cites current lines.
+- **Owed before 1b:** Vulkan golden cells for the planet fixtures (only `cornell_csg`, `sdf_smin_row`, `pbr_textured` have Vulkan pins today) and the determinism baseline for the A/B harness.
+
 ## Conventions (carried from the parent)
 
 - Real physics, metric units, real *cited* constants. No magic epsilons — derive every tolerance. No heuristic shortcuts dressed as physics.
