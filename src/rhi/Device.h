@@ -69,6 +69,16 @@ public:
     virtual AccelStructHandle CreateBLAS(const BLASDesc&)                 = 0;
     virtual AccelStructHandle CreateTLAS(const TLASDesc&)                 = 0;
 
+    // Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 7): build a
+    // VK_KHR_ray_tracing_pipeline from named stages. SYNCHRONOUS on the
+    // calling thread, unlike the compute pipelines the Vulkan worker builds
+    // at startup: the driver compile of the raygen is the measurement the
+    // probe exists to take, so it is timed and logged where it happens.
+    // Returns id 0 when SupportsRayTracingPipeline() is false, a stage name
+    // is unknown, or the driver rejected the pipeline. Default: no backend
+    // but Vulkan implements it.
+    virtual PipelineHandle CreateRayTracingPipeline(const RayTracingPipelineDesc&) { return {}; }
+
     // Re-point an existing TLAS at a new instance array WITHOUT a device
     // or queue drain (issue #254 P0; the verb #81 and the planetary
     // terrain streaming both block on).
@@ -237,6 +247,11 @@ public:
     // Capability + introspection.
     virtual BackendType  Type()             const = 0;
     virtual bool         SupportsHardwareRT() const = 0;
+    // True iff VK_KHR_ray_tracing_pipeline (or an equivalent) is enabled on
+    // the device, i.e. CreateRayTracingPipeline / TraceRays can work. Distinct
+    // from SupportsHardwareRT, which is the ray-QUERY family the compute
+    // kernel uses.
+    virtual bool         SupportsRayTracingPipeline() const { return false; }
     virtual const char*  DeviceName()       const = 0;
     virtual std::size_t  CurrentAllocatedBytes() const = 0;
 

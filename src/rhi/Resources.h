@@ -126,8 +126,27 @@ struct TLASDesc {
     std::string_view debug_name;
 };
 
+// Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 7): a ray-tracing
+// pipeline with ONE raygen, ONE miss and ONE closest-hit group. Like
+// ComputePipelineDesc, the stages are named, not supplied as bytecode: the
+// backend owns the embedded SPIR-V and resolves each name to a blob, and
+// the engine never sees shader bytes. The design's span-based
+// RtShaderDesc / RtLibraryDesc arrive with the pipeline-library split (1b);
+// this is the minimum the probe needs.
+struct RayTracingPipelineDesc {
+    std::string_view raygen_kernel;
+    std::string_view miss_kernel;
+    std::string_view closest_hit_kernel;
+    std::string_view debug_name;
+};
+
 struct BarrierDesc {
-    enum class Stage : std::uint8_t { ComputeRead, ComputeWrite, Transfer, Present };
+    // RayTracingRead / RayTracingWrite (Step 1 probe): the ray-tracing
+    // shader stages, for the edge after CommandBuffer::TraceRays. On
+    // Vulkan they map to VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR.
+    enum class Stage : std::uint8_t {
+        ComputeRead, ComputeWrite, Transfer, Present, RayTracingRead, RayTracingWrite
+    };
     Stage from = Stage::ComputeWrite;
     Stage to   = Stage::ComputeRead;
 };

@@ -46,6 +46,25 @@ extern const unsigned long shader_PathTrace_spirv_size;
 // bvh_params.z.
 extern const unsigned char shader_PathTrace_norq_spirv_data[];
 extern const unsigned long shader_PathTrace_norq_spirv_size;
+// Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md): the megakernel as a raygen,
+// three variants x two optimisation levels, plus the stub miss / closest-hit
+// pair. See the record block in src/rhi_vulkan/CMakeLists.txt.
+extern const unsigned char shader_PathTraceRaygen_p0_o0_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p0_o0_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p0_o2_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p0_o2_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p1_o0_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p1_o0_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p1_o2_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p1_o2_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p2_o0_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p2_o0_spirv_size;
+extern const unsigned char shader_PathTraceRaygen_p2_o2_spirv_data[];
+extern const unsigned long shader_PathTraceRaygen_p2_o2_spirv_size;
+extern const unsigned char shader_PathTraceRtStubs_miss_spirv_data[];
+extern const unsigned long shader_PathTraceRtStubs_miss_spirv_size;
+extern const unsigned char shader_PathTraceRtStubs_chit_spirv_data[];
+extern const unsigned long shader_PathTraceRtStubs_chit_spirv_size;
 extern const unsigned char shader_AutoExposure_spirv_data[];
 extern const unsigned long shader_AutoExposure_spirv_size;
 extern const unsigned char shader_PerfOverlay_spirv_data[];
@@ -431,10 +450,21 @@ void VulkanCommandBuffer::EndGpuPass() {
 
 void VulkanCommandBuffer::BindComputePipeline(PipelineHandle p) {
     bound_pipeline_ = p;
+    bound_pipeline_is_rt_ = false;
     if (cb_ == VK_NULL_HANDLE) return;
     auto pipe = device_->LookupPipeline(p);
     if (pipe != VK_NULL_HANDLE) {
         vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    }
+}
+
+void VulkanCommandBuffer::BindRayTracingPipeline(PipelineHandle p) {
+    bound_pipeline_ = p;
+    bound_pipeline_is_rt_ = true;
+    if (cb_ == VK_NULL_HANDLE) return;
+    VulkanDevice::RtPipelineEntry e;
+    if (device_->LookupRtPipeline(p, e) && e.pipeline != VK_NULL_HANDLE) {
+        vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, e.pipeline);
     }
 }
 
@@ -551,11 +581,10 @@ void VulkanCommandBuffer::ClearStorageTexture(TextureHandle t, const float rgba[
                          0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
-void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
-                                   std::uint32_t gz) {
-    if (cb_ == VK_NULL_HANDLE || !bound_pipeline_) return;
+bool VulkanCommandBuffer::BindSharedSetAndPush(VkPipelineBindPoint bind_point) {
+    if (cb_ == VK_NULL_HANDLE) return false;
     VkPipelineLayout layout = device_->SharedPipelineLayout();
-    if (layout == VK_NULL_HANDLE) return;
+    if (layout == VK_NULL_HANDLE) return false;
 
     VkDevice raw_dev = device_->RawDevice();
     // Each Dispatch grabs a fresh descriptor set from this frame's
@@ -733,8 +762,7 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     }
 
     vkUpdateDescriptorSets(raw_dev, wc, writes.data(), 0, nullptr);
-    vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, layout,
-                            0, 1, &dset, 0, nullptr);
+    vkCmdBindDescriptorSets(cb_, bind_point, layout, 0, 1, &dset, 0, nullptr);
 
     // Push constants: send only the on-chip prefix. The remainder lives
     // in the Frame UBO uploaded above. Clamp to the device's actual
@@ -742,18 +770,48 @@ void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
     // layout declares (max_push_constant_size_ may be < kPushSplitOffset
     // on devices with a tighter VkPhysicalDeviceLimits::maxPushConstantsSize,
     // or future increases of kPushSplitOffset would otherwise trigger
-    // VUID-vkCmdPushConstants-offset-01795).
+    // VUID-vkCmdPushConstants-offset-01795). The stage flags are the
+    // layout's own (COMPUTE, plus the RT stages when the RT pipeline is
+    // enabled): VUID-vkCmdPushConstants-offset-01796 requires them to match
+    // the push range exactly, so a hard-coded COMPUTE_BIT stopped being
+    // correct the day the range grew.
     if (push_size_ > 0) {
         const std::uint32_t layout_push_max = std::min<std::uint32_t>(
             VulkanDevice::kPushSplitOffset, device_->MaxPushConstantSize());
         std::uint32_t to_push = static_cast<std::uint32_t>(
             std::min<std::size_t>(push_size_, layout_push_max));
         if (to_push > 0) {
-            vkCmdPushConstants(cb_, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+            vkCmdPushConstants(cb_, layout, device_->SharedLayoutStageFlags(), 0,
                                to_push, push_buf_);
         }
     }
+    return true;
+}
+
+void VulkanCommandBuffer::Dispatch(std::uint32_t gx, std::uint32_t gy,
+                                   std::uint32_t gz) {
+    if (!bound_pipeline_ || bound_pipeline_is_rt_) return;
+    if (!BindSharedSetAndPush(VK_PIPELINE_BIND_POINT_COMPUTE)) return;
     vkCmdDispatch(cb_, gx, gy, gz);
+}
+
+void VulkanCommandBuffer::TraceRays(std::uint32_t w, std::uint32_t h, std::uint32_t d) {
+    if (!bound_pipeline_ || !bound_pipeline_is_rt_) return;
+    VulkanDevice::RtPipelineEntry e;
+    if (!device_->LookupRtPipeline(bound_pipeline_, e) || e.pipeline == VK_NULL_HANDLE) return;
+    auto trace = device_->CmdTraceRays();
+    if (trace == nullptr) return;
+    if (!BindSharedSetAndPush(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)) return;
+    // Explicit stack size (design section 7). The driver's default is a
+    // conservative bound derived from every group's declared usage; the
+    // queried sum is exact for this pipeline's recursion depth of 1. Left
+    // to the default when the query was unavailable at creation.
+    if (e.stack_size > 0) {
+        if (auto set_stack = device_->CmdSetRtStackSize()) {
+            set_stack(cb_, e.stack_size);
+        }
+    }
+    trace(cb_, &e.raygen, &e.miss, &e.hit, &e.callable, w, h, d);
 }
 
 void VulkanCommandBuffer::Barrier(const BarrierDesc& d) {
@@ -765,7 +823,19 @@ void VulkanCommandBuffer::Barrier(const BarrierDesc& d) {
     // pipeline stages, make writes visible to reads," which a global
     // memory barrier expresses cleanly without us tracking which
     // resource was last written by which dispatch.
-    auto stage_to_vk = [](BarrierDesc::Stage s,
+    // Step 1 probe: with the RT pipeline enabled, a "compute write" the
+    // engine names as a barrier SOURCE may have been a TraceRays (every
+    // site after the PathTrace pass says ComputeWrite today; the pass is a
+    // raygen under r_pt_pipeline rt). Widening the source stage mask to
+    // include the ray-tracing stage is a strict superset -- an idle stage
+    // in srcStageMask costs nothing -- so every existing site stays
+    // correct while the explicit RayTracingWrite stage is adopted at the
+    // sites that know they follow the trace.
+    const VkPipelineStageFlags shader_write_stages =
+        device_->SupportsRayTracingPipeline()
+            ? (VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR)
+            : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    auto stage_to_vk = [shader_write_stages](BarrierDesc::Stage s,
                           VkPipelineStageFlags& stage_mask,
                           VkAccessFlags& access_mask, bool is_dst) {
         switch (s) {
@@ -774,7 +844,18 @@ void VulkanCommandBuffer::Barrier(const BarrierDesc& d) {
                 access_mask = VK_ACCESS_SHADER_READ_BIT;
                 break;
             case BarrierDesc::Stage::ComputeWrite:
-                stage_mask  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                stage_mask  = is_dst ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                                     : shader_write_stages;
+                access_mask = is_dst ? (VK_ACCESS_SHADER_READ_BIT
+                                      | VK_ACCESS_SHADER_WRITE_BIT)
+                                     : VK_ACCESS_SHADER_WRITE_BIT;
+                break;
+            case BarrierDesc::Stage::RayTracingRead:
+                stage_mask  = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+                access_mask = VK_ACCESS_SHADER_READ_BIT;
+                break;
+            case BarrierDesc::Stage::RayTracingWrite:
+                stage_mask  = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
                 access_mask = is_dst ? (VK_ACCESS_SHADER_READ_BIT
                                       | VK_ACCESS_SHADER_WRITE_BIT)
                                      : VK_ACCESS_SHADER_WRITE_BIT;
@@ -1040,7 +1121,8 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     bool has_rt_pipeline = false, has_pipeline_library = false, has_rt_maint1 = false,
          has_ser_ext = false, has_ser_nv = false, has_pos_fetch = false, has_sucf = false,
          has_clas = false, has_ptlas = false, has_coopvec = false, has_coopmat = false,
-         has_coopmat2 = false, has_fp8 = false, has_bf16 = false, has_omm = false;
+         has_coopmat2 = false, has_fp8 = false, has_bf16 = false, has_omm = false,
+         has_exec_props = false;
 #if defined(VK_KHR_ray_tracing_pipeline)
     has_rt_pipeline = phys_exts.Has(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
 #endif
@@ -1085,6 +1167,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 #endif
 #if defined(VK_EXT_opacity_micromap)
     has_omm = phys_exts.Has(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_pipeline_executable_properties)
+    // Step 1 probe instrument: per-stage register / spill statistics for
+    // the ray-tracing pipelines (design section 3).
+    has_exec_props = phys_exts.Has(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
 #endif
     // The RT-pipeline family layers on VK_KHR_acceleration_structure, so it
     // is only meaningful (and only enabled below) on a hardware-RT device.
@@ -1271,6 +1358,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     omm_supported.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_FEATURES_EXT;
     if (has_omm) chain_supported(&omm_supported, reinterpret_cast<void**>(&omm_supported.pNext));
 #endif
+#if defined(VK_KHR_pipeline_executable_properties)
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exec_supported{};
+    exec_supported.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    if (has_exec_props) chain_supported(&exec_supported, reinterpret_cast<void**>(&exec_supported.pNext));
+#endif
     vkGetPhysicalDeviceFeatures2(phys_device_, &f2_supported);
 
     // Flatten the guarded results into plain values for the log block, the
@@ -1366,6 +1459,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     feat_omm              = omm_supported.micromap == VK_TRUE;
     omm_max_2state_subdiv = omm_props.maxOpacity2StateSubdivisionLevel;
     omm_max_4state_subdiv = omm_props.maxOpacity4StateSubdivisionLevel;
+#endif
+    bool feat_exec_props = false;
+#if defined(VK_KHR_pipeline_executable_properties)
+    feat_exec_props = exec_supported.pipelineExecutableInfo == VK_TRUE;
 #endif
 
     // The diagnostic block. One line per roadmap area, INFO like the RT
@@ -1517,6 +1614,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     const bool enable_sucf        = has_sucf && feat_sucf;
     // VK_KHR_pipeline_library has no feature struct; presence is enough.
     const bool enable_pipeline_library = has_pipeline_library;
+    // Statistics capture for the probe's RT pipelines; inert for every
+    // compute pipeline (those are created without the capture flag).
+    const bool enable_exec_props = has_exec_props && feat_exec_props;
+#if defined(VK_KHR_pipeline_executable_properties)
+    if (enable_exec_props) dexts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+#endif
 #if defined(VK_KHR_ray_tracing_pipeline)
     if (enable_rt_pipeline) dexts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
 #endif
@@ -1710,6 +1813,11 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     sucf_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
     sucf_feat.shaderSubgroupUniformControlFlow = VK_TRUE;
 #endif
+#if defined(VK_KHR_pipeline_executable_properties)
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exec_feat{};
+    exec_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    exec_feat.pipelineExecutableInfo = VK_TRUE;
+#endif
 
     void** next_slot = &f2.pNext;
     auto chain = [&](void* node, void** node_next) {
@@ -1747,6 +1855,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
 #if defined(VK_KHR_shader_subgroup_uniform_control_flow)
     if (enable_sucf) chain(&sucf_feat, reinterpret_cast<void**>(&sucf_feat.pNext));
 #endif
+#if defined(VK_KHR_pipeline_executable_properties)
+    if (enable_exec_props) chain(&exec_feat, reinterpret_cast<void**>(&exec_feat.pNext));
+#endif
+    pipeline_exec_props_ = enable_exec_props;
 
     caps_.ray_tracing_pipeline             = enable_rt_pipeline;
     caps_.pipeline_library                 = enable_pipeline_library;
@@ -1760,9 +1872,10 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // or a behaviour change is attributable from the startup log alone.
     LOG_INFO("Vulkan extensions enabled: ray_tracing_pipeline={} pipeline_library={} "
              "ray_tracing_maintenance1={} invocation_reorder_ext={} position_fetch={} "
-             "subgroup_uniform_control_flow={} mutable_descriptor_type={}",
+             "subgroup_uniform_control_flow={} mutable_descriptor_type={} "
+             "pipeline_executable_properties={}",
              enable_rt_pipeline, enable_pipeline_library, enable_rt_maint1, enable_ser_ext,
-             enable_pos_fetch, enable_sucf, use_mutable_binding2);
+             enable_pos_fetch, enable_sucf, use_mutable_binding2, enable_exec_props);
 
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1796,6 +1909,38 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         if (pfn_CreateAccelStruct_ == nullptr || pfn_CmdBuildAccelStructs_ == nullptr) {
             LOG_WARN("Vulkan: accel-struct extensions enabled but procs missing; disabling RT");
             rt_supported_ = false;
+        }
+    }
+    // Step 1 probe: the ray-tracing-pipeline entry points. Loaded only when
+    // the extension was enabled above; a missing proc drops the whole set so
+    // SupportsRayTracingPipeline() (which tests the creator) reports false.
+    if (caps_.ray_tracing_pipeline) {
+        pfn_CreateRtPipelines_ = reinterpret_cast<PFN_vkCreateRayTracingPipelinesKHR>(
+            vkGetDeviceProcAddr(device_, "vkCreateRayTracingPipelinesKHR"));
+        pfn_GetRtGroupHandles_ = reinterpret_cast<PFN_vkGetRayTracingShaderGroupHandlesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetRayTracingShaderGroupHandlesKHR"));
+        pfn_GetRtGroupStackSize_ = reinterpret_cast<PFN_vkGetRayTracingShaderGroupStackSizeKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetRayTracingShaderGroupStackSizeKHR"));
+        pfn_CmdSetRtStackSize_ = reinterpret_cast<PFN_vkCmdSetRayTracingPipelineStackSizeKHR>(
+            vkGetDeviceProcAddr(device_, "vkCmdSetRayTracingPipelineStackSizeKHR"));
+        pfn_CmdTraceRays_ = reinterpret_cast<PFN_vkCmdTraceRaysKHR>(
+            vkGetDeviceProcAddr(device_, "vkCmdTraceRaysKHR"));
+        if (pfn_CreateRtPipelines_ == nullptr || pfn_GetRtGroupHandles_ == nullptr
+            || pfn_CmdTraceRays_ == nullptr) {
+            LOG_WARN("Vulkan: VK_KHR_ray_tracing_pipeline enabled but procs missing; "
+                     "CreateRayTracingPipeline will refuse");
+            pfn_CreateRtPipelines_ = nullptr;
+        }
+    }
+    if (pipeline_exec_props_) {
+        pfn_GetPipelineExecProps_ = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetPipelineExecutablePropertiesKHR"));
+        pfn_GetPipelineExecStats_ = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+            vkGetDeviceProcAddr(device_, "vkGetPipelineExecutableStatisticsKHR"));
+        if (pfn_GetPipelineExecProps_ == nullptr || pfn_GetPipelineExecStats_ == nullptr) {
+            LOG_WARN("Vulkan: VK_KHR_pipeline_executable_properties enabled but procs "
+                     "missing; RT pipeline statistics unavailable");
+            pipeline_exec_props_ = false;
         }
     }
     if (rt_supported_) {
@@ -1958,6 +2103,20 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // roughness (R32F), specular_hit_distance (R32F). Binding 23 is
     // reserved for #115 SIGMA shadow visibility (parallel-agent
     // coordination -- this PR leaves it as a gap).
+    // Step 1 probe (design section 8): the ONE shared layout serves the
+    // compute and the ray-tracing bind points. A VkPipelineLayout is bind-
+    // point agnostic; the only per-stage facts in it are the binding and
+    // push-range stageFlags, so with the RT pipeline enabled every binding
+    // and the push range carry the ray-tracing stages too (ANY_HIT /
+    // INTERSECTION join when analytic prims move to AABBs). Without the
+    // extension the flags stay COMPUTE alone, exactly as before.
+    shared_layout_stages_ = VK_SHADER_STAGE_COMPUTE_BIT;
+    if (caps_.ray_tracing_pipeline) {
+        shared_layout_stages_ |= VK_SHADER_STAGE_RAYGEN_BIT_KHR
+                               | VK_SHADER_STAGE_MISS_BIT_KHR
+                               | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                               | VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+    }
     {
         std::vector<VkDescriptorSetLayoutBinding> b;
         b.reserve(33);   // Wave 8 #26 added bindings 31/32/33; #280 added 46;
@@ -1967,7 +2126,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             lb.binding         = binding;
             lb.descriptorType  = type;
             lb.descriptorCount = 1;
-            lb.stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+            lb.stageFlags      = shared_layout_stages_;
             b.push_back(lb);
         };
         // bindings 0-1: output + accum (storage image)
@@ -2222,7 +2381,7 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         }
 
         VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.stageFlags = shared_layout_stages_;
         pcr.offset     = 0;
         pcr.size       = std::min<std::uint32_t>(kPushSplitOffset, max_push_constant_size_);
         VkPipelineLayoutCreateInfo plci{};
@@ -2591,6 +2750,12 @@ void VulkanDevice::DestroyDevice() {
             }
             pipelines_.clear();
             named_pipelines_.clear();
+            // Step 1 probe: the RT pipelines. Their shader binding tables
+            // live in buffers_ and go with the buffer sweep below.
+            for (auto& [id, e] : rt_pipelines_) {
+                if (e.pipeline) vkDestroyPipeline(device_, e.pipeline, nullptr);
+            }
+            rt_pipelines_.clear();
             for (auto& [id, im] : images_) {
                 if (im.view)   vkDestroyImageView(device_, im.view, nullptr);
                 if (im.image)  vkDestroyImage(device_, im.image, nullptr);
@@ -3888,6 +4053,306 @@ PipelineHandle VulkanDevice::CreateComputePipeline(const ComputePipelineDesc& d)
     auto it = named_pipelines_.find(std::string(d.kernel_name));
     if (it == named_pipelines_.end()) return {0};
     return PipelineHandle{ it->second };
+}
+
+// ---- Step 1 probe: ray-tracing pipelines ---------------------------------
+//
+// docs/STEP1_RT_PIPELINE_DESIGN.md sections 7 and 10 (risk R1). One raygen,
+// one miss, one triangle hit group with a closest-hit shader; no pipeline
+// libraries, no callables, recursion depth 1 (nothing below the raygen
+// traces). The stage names map onto the embedded blobs here, in the same
+// spirit as the named compute pipelines: the engine asks for
+// "pathtrace_rt_p2_o2" and never sees SPIR-V.
+
+namespace {
+
+struct RtKernelBlob {
+    const char*          name;
+    const unsigned char* data;
+    std::size_t          size;
+};
+
+const RtKernelBlob* FindRtKernelBlob(std::string_view name) {
+    static const RtKernelBlob kBlobs[] = {
+        { "pathtrace_rt_p0_o0", shader_PathTraceRaygen_p0_o0_spirv_data, shader_PathTraceRaygen_p0_o0_spirv_size },
+        { "pathtrace_rt_p0_o2", shader_PathTraceRaygen_p0_o2_spirv_data, shader_PathTraceRaygen_p0_o2_spirv_size },
+        { "pathtrace_rt_p1_o0", shader_PathTraceRaygen_p1_o0_spirv_data, shader_PathTraceRaygen_p1_o0_spirv_size },
+        { "pathtrace_rt_p1_o2", shader_PathTraceRaygen_p1_o2_spirv_data, shader_PathTraceRaygen_p1_o2_spirv_size },
+        { "pathtrace_rt_p2_o0", shader_PathTraceRaygen_p2_o0_spirv_data, shader_PathTraceRaygen_p2_o0_spirv_size },
+        { "pathtrace_rt_p2_o2", shader_PathTraceRaygen_p2_o2_spirv_data, shader_PathTraceRaygen_p2_o2_spirv_size },
+        { "pathtrace_rt_miss",  shader_PathTraceRtStubs_miss_spirv_data,  shader_PathTraceRtStubs_miss_spirv_size },
+        { "pathtrace_rt_chit",  shader_PathTraceRtStubs_chit_spirv_data,  shader_PathTraceRtStubs_chit_spirv_size },
+    };
+    for (const auto& b : kBlobs) {
+        if (name == b.name) return &b;
+    }
+    return nullptr;
+}
+
+VkDeviceSize AlignUpSize(VkDeviceSize v, VkDeviceSize a) {
+    return (a == 0) ? v : ((v + a - 1) / a) * a;
+}
+
+// One line per VkPipelineExecutableStatisticKHR, in the driver's own units
+// (NVIDIA reports e.g. "Register Count", "Local Memory Usage" (spill bytes),
+// "Shader Instruction Count"). The value's format decides the rendering.
+std::string FormatExecStatistic(const VkPipelineExecutableStatisticKHR& s) {
+    switch (s.format) {
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+            return fmt::format("{}={}", s.name, s.value.b32 == VK_TRUE);
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+            return fmt::format("{}={}", s.name, s.value.i64);
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+            return fmt::format("{}={}", s.name, s.value.u64);
+        case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+            return fmt::format("{}={}", s.name, s.value.f64);
+        default:
+            return fmt::format("{}=?", s.name);
+    }
+}
+
+}  // namespace
+
+PipelineHandle VulkanDevice::CreateRayTracingPipeline(const RayTracingPipelineDesc& d) {
+    if (device_ == VK_NULL_HANDLE || !SupportsRayTracingPipeline()) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): VK_KHR_ray_tracing_pipeline is not "
+                  "enabled on this device", d.debug_name);
+        return {0};
+    }
+    const RtKernelBlob* rg   = FindRtKernelBlob(d.raygen_kernel);
+    const RtKernelBlob* miss = FindRtKernelBlob(d.miss_kernel);
+    const RtKernelBlob* chit = FindRtKernelBlob(d.closest_hit_kernel);
+    if (rg == nullptr || miss == nullptr || chit == nullptr) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): unknown stage name "
+                  "(raygen '{}' {}, miss '{}' {}, closest-hit '{}' {})",
+                  d.debug_name, d.raygen_kernel, rg != nullptr ? "ok" : "MISSING",
+                  d.miss_kernel, miss != nullptr ? "ok" : "MISSING",
+                  d.closest_hit_kernel, chit != nullptr ? "ok" : "MISSING");
+        return {0};
+    }
+
+    VkShaderModule mods[3] = {
+        MakeShaderModule(device_, rg->data,   rg->size),
+        MakeShaderModule(device_, miss->data, miss->size),
+        MakeShaderModule(device_, chit->data, chit->size),
+    };
+    auto destroy_modules = [&]() {
+        for (auto& m : mods) {
+            if (m != VK_NULL_HANDLE) vkDestroyShaderModule(device_, m, nullptr);
+            m = VK_NULL_HANDLE;
+        }
+    };
+    if (mods[0] == VK_NULL_HANDLE || mods[1] == VK_NULL_HANDLE || mods[2] == VK_NULL_HANDLE) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): vkCreateShaderModule failed", d.debug_name);
+        destroy_modules();
+        return {0};
+    }
+
+    // Stage order is the group order is the SBT record order: raygen 0,
+    // miss 1, hit group 2. Every module's entry point is named "main"
+    // regardless of the Slang entry it was compiled from (-entry ptMiss
+    // still yields `OpEntryPoint MissKHR %ptMiss "main"`: slangc renames
+    // the exported entry, which is the notice -Wno-40100 silences in
+    // cmake/Slang.cmake). Passing the Slang name here is a
+    // VK_ERROR_INITIALIZATION_FAILED from vkCreateRayTracingPipelinesKHR.
+    constexpr const char*   kSpirvEntryName = "main";
+    constexpr std::uint32_t kStageRaygen = 0, kStageMiss = 1, kStageClosestHit = 2;
+    constexpr std::uint32_t kGroupCount  = 3;
+    VkPipelineShaderStageCreateInfo stages[kGroupCount]{};
+    stages[kStageRaygen].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[kStageRaygen].stage  = VK_SHADER_STAGE_RAYGEN_BIT_KHR;
+    stages[kStageRaygen].module = mods[0];
+    stages[kStageRaygen].pName  = kSpirvEntryName;
+    stages[kStageMiss].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[kStageMiss].stage  = VK_SHADER_STAGE_MISS_BIT_KHR;
+    stages[kStageMiss].module = mods[1];
+    stages[kStageMiss].pName  = kSpirvEntryName;
+    stages[kStageClosestHit].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[kStageClosestHit].stage  = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
+    stages[kStageClosestHit].module = mods[2];
+    stages[kStageClosestHit].pName  = kSpirvEntryName;
+
+    VkRayTracingShaderGroupCreateInfoKHR groups[kGroupCount]{};
+    for (auto& g : groups) {
+        g.sType              = VK_STRUCTURE_TYPE_RAY_TRACING_SHADER_GROUP_CREATE_INFO_KHR;
+        g.generalShader      = VK_SHADER_UNUSED_KHR;
+        g.closestHitShader   = VK_SHADER_UNUSED_KHR;
+        g.anyHitShader       = VK_SHADER_UNUSED_KHR;
+        g.intersectionShader = VK_SHADER_UNUSED_KHR;
+    }
+    groups[0].type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[0].generalShader = kStageRaygen;
+    groups[1].type          = VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+    groups[1].generalShader = kStageMiss;
+    groups[2].type             = VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+    groups[2].closestHitShader = kStageClosestHit;
+
+    VkRayTracingPipelineCreateInfoKHR ci{};
+    ci.sType                        = VK_STRUCTURE_TYPE_RAY_TRACING_PIPELINE_CREATE_INFO_KHR;
+    ci.flags                        = pipeline_exec_props_
+                                        ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0u;
+    ci.stageCount                   = kGroupCount;
+    ci.pStages                      = stages;
+    ci.groupCount                   = kGroupCount;
+    ci.pGroups                      = groups;
+    // Nothing below the raygen calls TraceRay (shadow rays are inline
+    // RayQuery, design R3), so one level of recursion is the whole pipeline.
+    ci.maxPipelineRayRecursionDepth = 1;
+    ci.layout                       = shared_pipe_layout_;
+
+    // THE MEASUREMENT (design section 10, R1): wall time of the driver
+    // compile, logged in seconds. The 120 s abort criterion is applied by
+    // whoever runs the probe -- the call has no mid-flight abort.
+    const auto t0 = std::chrono::steady_clock::now();
+    VkPipeline pipe = VK_NULL_HANDLE;
+    const VkResult cr = pfn_CreateRtPipelines_(device_, VK_NULL_HANDLE, pipeline_cache_, 1, &ci,
+                                               nullptr, &pipe);
+    const double create_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    destroy_modules();
+    if (cr != VK_SUCCESS || pipe == VK_NULL_HANDLE) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): vkCreateRayTracingPipelinesKHR "
+                  "failed after {:.2f} s: {} ({})",
+                  d.debug_name, create_s, static_cast<int>(cr), VkResultToString(cr));
+        return {0};
+    }
+    LOG_INFO("Vulkan RT pipeline '{}': vkCreateRayTracingPipelinesKHR ok in {:.2f} s "
+             "(raygen '{}' {} B, miss {} B, closest-hit {} B, capture_statistics={})",
+             d.debug_name, create_s, d.raygen_kernel, rg->size, miss->size, chit->size,
+             pipeline_exec_props_);
+
+    // Per-stage statistics (design section 3: register count and spill
+    // bytes are what every register-pressure claim is measured with).
+    if (pipeline_exec_props_) {
+        VkPipelineInfoKHR pinfo{};
+        pinfo.sType    = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
+        pinfo.pipeline = pipe;
+        std::uint32_t exec_count = 0;
+        pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, nullptr);
+        std::vector<VkPipelineExecutablePropertiesKHR> execs(exec_count);
+        for (auto& e : execs) e.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+        pfn_GetPipelineExecProps_(device_, &pinfo, &exec_count, execs.data());
+        for (std::uint32_t i = 0; i < exec_count; ++i) {
+            VkPipelineExecutableInfoKHR einfo{};
+            einfo.sType           = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
+            einfo.pipeline        = pipe;
+            einfo.executableIndex = i;
+            std::uint32_t stat_count = 0;
+            pfn_GetPipelineExecStats_(device_, &einfo, &stat_count, nullptr);
+            std::vector<VkPipelineExecutableStatisticKHR> stats(stat_count);
+            for (auto& s : stats) s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+            pfn_GetPipelineExecStats_(device_, &einfo, &stat_count, stats.data());
+            std::string line;
+            for (std::uint32_t k = 0; k < stat_count; ++k) {
+                if (!line.empty()) line += ", ";
+                line += FormatExecStatistic(stats[k]);
+            }
+            LOG_INFO("Vulkan RT pipeline '{}' executable {} '{}' (stages 0x{:x}, subgroup {}): {}",
+                     d.debug_name, i, execs[i].name, execs[i].stages, execs[i].subgroupSize,
+                     line.empty() ? "no statistics" : line);
+        }
+    }
+
+    RtPipelineEntry entry{};
+    entry.pipeline = pipe;
+
+    // Stack size: raygen + max(miss, closest-hit). vkCmdSetRayTracingPipeline
+    // StackSizeKHR is optional; when the query is missing the driver's own
+    // default stays in force (stack_size 0).
+    if (pfn_GetRtGroupStackSize_ != nullptr) {
+        const VkDeviceSize rg_stack = pfn_GetRtGroupStackSize_(
+            device_, pipe, 0, VK_SHADER_GROUP_SHADER_GENERAL_KHR);
+        const VkDeviceSize miss_stack = pfn_GetRtGroupStackSize_(
+            device_, pipe, 1, VK_SHADER_GROUP_SHADER_GENERAL_KHR);
+        const VkDeviceSize chit_stack = pfn_GetRtGroupStackSize_(
+            device_, pipe, 2, VK_SHADER_GROUP_SHADER_CLOSEST_HIT_KHR);
+        entry.stack_size = static_cast<std::uint32_t>(rg_stack + std::max(miss_stack, chit_stack));
+        LOG_INFO("Vulkan RT pipeline '{}': group stack sizes raygen {} B, miss {} B, "
+                 "closest-hit {} B -> pipeline stack {} B",
+                 d.debug_name, rg_stack, miss_stack, chit_stack, entry.stack_size);
+    }
+
+    // Shader binding table (design section 7). No shader-record data, so
+    // each region holds one handle: stride = handle size rounded to the
+    // handle alignment (32 B on this driver), region base rounded to the
+    // group base alignment (64 B). The raygen region's size must equal its
+    // stride. Layout: raygen @0, miss @64, hit @128; no callables yet.
+    const VkDeviceSize handle_size  = caps_.shader_group_handle_size;
+    const VkDeviceSize handle_align = caps_.shader_group_handle_alignment;
+    const VkDeviceSize base_align   = caps_.shader_group_base_alignment;
+    if (handle_size == 0 || handle_align == 0 || base_align == 0) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): shader group properties unknown "
+                  "(handle {} align {} base {})", d.debug_name, handle_size, handle_align, base_align);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        return {0};
+    }
+    const VkDeviceSize record_stride = AlignUpSize(handle_size, handle_align);
+    const VkDeviceSize region_bytes  = AlignUpSize(record_stride, base_align);
+    const VkDeviceSize raygen_off = 0;
+    const VkDeviceSize miss_off   = region_bytes;
+    const VkDeviceSize hit_off    = 2 * region_bytes;
+    const VkDeviceSize sbt_bytes  = 3 * region_bytes;
+
+    std::vector<std::uint8_t> handles(static_cast<std::size_t>(kGroupCount * handle_size));
+    if (pfn_GetRtGroupHandles_(device_, pipe, 0, kGroupCount, handles.size(),
+                               handles.data()) != VK_SUCCESS) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): vkGetRayTracingShaderGroupHandlesKHR "
+                  "failed", d.debug_name);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        return {0};
+    }
+    std::vector<std::uint8_t> sbt(static_cast<std::size_t>(sbt_bytes), 0);
+    std::memcpy(sbt.data() + raygen_off, handles.data() + 0 * handle_size, handle_size);
+    std::memcpy(sbt.data() + miss_off,   handles.data() + 1 * handle_size, handle_size);
+    std::memcpy(sbt.data() + hit_off,    handles.data() + 2 * handle_size, handle_size);
+
+    BufferEntry sbt_buf{};
+    if (!CreateBufferImpl(sbt_bytes,
+                          VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR
+                            | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                            | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                          sbt_buf, /*persistent_map=*/false)
+        || sbt_buf.device_address == 0) {
+        LOG_ERROR("Vulkan CreateRayTracingPipeline('{}'): SBT buffer ({} B) failed",
+                  d.debug_name, sbt_bytes);
+        DestroyBufferImpl(sbt_buf);
+        vkDestroyPipeline(device_, pipe, nullptr);
+        return {0};
+    }
+    std::uint64_t sbt_id = 0;
+    {
+        std::lock_guard lock(resource_mutex_);
+        sbt_id = next_id_++;
+        buffers_.emplace(sbt_id, sbt_buf);
+    }
+    // The staged upload path (synchronous submit + wait); one-time cost.
+    WriteBuffer(BufferHandle{sbt_id}, sbt.data(), sbt.size(), 0);
+
+    entry.sbt_buffer_id   = sbt_id;
+    entry.raygen.deviceAddress = sbt_buf.device_address + raygen_off;
+    entry.raygen.stride        = record_stride;
+    entry.raygen.size          = record_stride;
+    entry.miss.deviceAddress   = sbt_buf.device_address + miss_off;
+    entry.miss.stride          = record_stride;
+    entry.miss.size            = record_stride;
+    entry.hit.deviceAddress    = sbt_buf.device_address + hit_off;
+    entry.hit.stride           = record_stride;
+    entry.hit.size             = record_stride;
+    entry.callable             = {};
+
+    std::lock_guard lock(resource_mutex_);
+    const auto id = next_id_++;
+    rt_pipelines_.emplace(id, entry);
+    return PipelineHandle{id};
+}
+
+bool VulkanDevice::LookupRtPipeline(PipelineHandle h, RtPipelineEntry& out) {
+    std::lock_guard lock(resource_mutex_);
+    auto it = rt_pipelines_.find(h.id);
+    if (it == rt_pipelines_.end()) return false;
+    out = it->second;
+    return true;
 }
 
 // ---- Predictive pipeline JIT prewarming ---------------------------------

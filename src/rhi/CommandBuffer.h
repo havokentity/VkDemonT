@@ -29,6 +29,17 @@ public:
     virtual void Dispatch(std::uint32_t gx, std::uint32_t gy,
                           std::uint32_t gz) = 0;
 
+    // Step 1 probe (docs/STEP1_RT_PIPELINE_DESIGN.md section 7): bind a
+    // pipeline from Device::CreateRayTracingPipeline and launch it. TraceRays
+    // consumes the same staged binds and push constants Dispatch does (the
+    // shared layout carries the ray-tracing stage flags, design section 8);
+    // w x h x d is the launch grid, one invocation per pixel, so the raygen
+    // sees DispatchRaysIndex where the compute kernel saw its thread id.
+    // Default no-op for backends without a ray-tracing pipeline.
+    virtual void BindRayTracingPipeline(PipelineHandle) {}
+    virtual void TraceRays(std::uint32_t /*w*/, std::uint32_t /*h*/,
+                           std::uint32_t /*d*/) {}
+
     virtual void CopyBufferToTexture(BufferHandle src, TextureHandle dst) = 0;
 
     // Clear a storage / colour-attachment texture to a uniform RGBA

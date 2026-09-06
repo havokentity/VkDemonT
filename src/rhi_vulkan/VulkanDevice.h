@@ -37,6 +37,11 @@ public:
     void BindAccelStruct(std::uint32_t slot, AccelStructHandle a) override;
     void PushConstants(const void* data, std::size_t size) override;
     void Dispatch(std::uint32_t gx, std::uint32_t gy, std::uint32_t gz) override;
+    // Step 1 probe: the ray-tracing-pipeline launch. Shares everything but
+    // the bind point and the final command with Dispatch (see
+    // BindSharedSetAndPush below).
+    void BindRayTracingPipeline(PipelineHandle p) override;
+    void TraceRays(std::uint32_t w, std::uint32_t h, std::uint32_t d) override;
     void CopyBufferToTexture(BufferHandle, TextureHandle) override {}
     void ClearStorageTexture(TextureHandle t, const float rgba[4]) override;
     void Barrier(const BarrierDesc& d) override;
@@ -57,9 +62,20 @@ public:
     std::uint32_t TimedPassCount() const { return ts_pass_count_; }
 
 private:
+    // The part of Dispatch and TraceRays that must not drift apart (design
+    // section 7): take a descriptor-ring slot, flush the staged binds into
+    // it, write this launch's Frame-UBO slice, bind the set at `bind_point`
+    // and push the on-chip prefix with the layout's stage flags. Returns
+    // false when nothing can be recorded (no command buffer / layout).
+    bool BindSharedSetAndPush(VkPipelineBindPoint bind_point);
+
     VulkanDevice*  device_ = nullptr;
     VkCommandBuffer cb_     = VK_NULL_HANDLE;
     PipelineHandle bound_pipeline_{0};
+    // True when bound_pipeline_ came from BindRayTracingPipeline. Dispatch
+    // refuses an RT pipeline and TraceRays refuses a compute one, so a
+    // mismatched bind is a logged no-op rather than a validation error.
+    bool           bound_pipeline_is_rt_ = false;
 
     // --- Per-pass GPU timestamps (#320) ----------------------------------
     static constexpr std::uint32_t kNoTimedSlot = ~0u;
@@ -226,6 +242,10 @@ public:
 
     BackendType  Type()             const override { return BackendType::Vulkan; }
     bool         SupportsHardwareRT() const override { return rt_supported_; }
+    bool         SupportsRayTracingPipeline() const override {
+        return caps_.ray_tracing_pipeline && pfn_CreateRtPipelines_ != nullptr;
+    }
+    PipelineHandle CreateRayTracingPipeline(const RayTracingPipelineDesc&) override;
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
     bool         IsDeviceLost() const override { return device_lost_; }
@@ -481,6 +501,28 @@ private:
     PFN_vkCmdBuildAccelerationStructuresKHR        pfn_CmdBuildAccelStructs_     = nullptr;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfn_GetAccelStructAddr_       = nullptr;
     PFN_vkGetBufferDeviceAddressKHR                pfn_GetBufferDeviceAddr_      = nullptr;
+    // VK_KHR_ray_tracing_pipeline entry points (Step 1 probe). Null unless
+    // caps_.ray_tracing_pipeline; SupportsRayTracingPipeline() checks the
+    // creator so a driver that exposes the extension without the procs
+    // degrades to "no RT pipeline" instead of a null call.
+    PFN_vkCreateRayTracingPipelinesKHR             pfn_CreateRtPipelines_        = nullptr;
+    PFN_vkGetRayTracingShaderGroupHandlesKHR       pfn_GetRtGroupHandles_        = nullptr;
+    PFN_vkGetRayTracingShaderGroupStackSizeKHR     pfn_GetRtGroupStackSize_      = nullptr;
+    PFN_vkCmdSetRayTracingPipelineStackSizeKHR     pfn_CmdSetRtStackSize_        = nullptr;
+    PFN_vkCmdTraceRaysKHR                          pfn_CmdTraceRays_             = nullptr;
+    // VK_KHR_pipeline_executable_properties, enabled when the driver has it
+    // so the probe can read the raygen's register count / spill bytes back
+    // (design section 3: the instrument for every register-pressure claim).
+    // Pipelines are created with CAPTURE_STATISTICS only when this is on.
+    bool                                           pipeline_exec_props_          = false;
+    PFN_vkGetPipelineExecutablePropertiesKHR       pfn_GetPipelineExecProps_     = nullptr;
+    PFN_vkGetPipelineExecutableStatisticsKHR       pfn_GetPipelineExecStats_     = nullptr;
+    // Stage flags every binding of the shared layout and its push range
+    // carry: COMPUTE alone on a device without the RT pipeline, COMPUTE |
+    // RAYGEN | MISS | CLOSEST_HIT | CALLABLE with it (design section 8: the
+    // same layout serves both bind points). vkCmdPushConstants must pass
+    // exactly these, which is why the command buffer reads them from here.
+    VkShaderStageFlags                             shared_layout_stages_         = VK_SHADER_STAGE_COMPUTE_BIT;
 
     // Swapchain
     VkSwapchainKHR              swapchain_     = VK_NULL_HANDLE;
@@ -830,8 +872,35 @@ public:
         return { dsets_[current_frame_][slice], slice };
     }
     VkPipelineLayout    SharedPipelineLayout() const { return shared_pipe_layout_; }
+    VkShaderStageFlags  SharedLayoutStageFlags() const { return shared_layout_stages_; }
     const BufferEntry&  CurrentFrameUbo() const { return frame_ubos_[current_frame_]; }
     std::uint32_t       MaxPushConstantSize() const { return max_push_constant_size_; }
+
+    // --- Step 1 probe: ray-tracing pipelines -----------------------------
+    // One entry per CreateRayTracingPipeline call: the pipeline, its shader
+    // binding table (a device-local buffer registered in buffers_ under
+    // sbt_buffer_id so the normal teardown frees it) and the four SBT
+    // regions vkCmdTraceRaysKHR takes. stack_size is what
+    // vkCmdSetRayTracingPipelineStackSizeKHR is given before each launch:
+    // raygen + max(miss, closest-hit), from vkGetRayTracingShaderGroupStack
+    // SizeKHR (the design's formula minus the callables that do not exist
+    // yet); 0 when the query is unavailable, in which case the driver's own
+    // default is left in place.
+    struct RtPipelineEntry {
+        VkPipeline                      pipeline      = VK_NULL_HANDLE;
+        std::uint64_t                   sbt_buffer_id = 0;
+        VkStridedDeviceAddressRegionKHR raygen  {};
+        VkStridedDeviceAddressRegionKHR miss    {};
+        VkStridedDeviceAddressRegionKHR hit     {};
+        VkStridedDeviceAddressRegionKHR callable{};
+        std::uint32_t                   stack_size    = 0;
+    };
+    bool LookupRtPipeline(PipelineHandle h, RtPipelineEntry& out);
+    PFN_vkCmdTraceRaysKHR                      CmdTraceRays()     const { return pfn_CmdTraceRays_; }
+    PFN_vkCmdSetRayTracingPipelineStackSizeKHR CmdSetRtStackSize() const { return pfn_CmdSetRtStackSize_; }
+
+private:
+    std::unordered_map<std::uint64_t, RtPipelineEntry> rt_pipelines_;
 };
 
 }  // namespace pt::rhi::vk
