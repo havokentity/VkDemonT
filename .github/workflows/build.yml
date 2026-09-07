@@ -33,6 +33,38 @@ jobs:
     # specific compilation breakage get caught here -- the regression
     # gate on PRs.
     runs-on: windows-latest
+    env:
+      # --- Heavyweight optional dependencies on this lane ------------------
+      #
+      # PT_ENABLE_NRD defaults ON and STAYS ON here, deliberately. NRD is not
+      # decoration: src/rhi_vulkan/CMakeLists.txt compiles
+      # VulkanNrdLibDenoiser.cpp and the NrdPack / NrdUnpack Slang kernels
+      # ONLY under PT_NRD_ACTIVE, so a CI configure with NRD off would not
+      # compile the largest source file in the denoiser at all. Building it
+      # IS the point of a compile-test lane. The cost is a from-source NRD
+      # build (MathLib + ShaderMake + HLSL -> SPIR-V) on every cold configure;
+      # that is accepted as the price of the coverage.
+      #
+      # PT_ENABLE_DLSS also defaults ON. This lane turns it OFF for PR/push
+      # runs and ON for the nightly. Reasoning, stated rather than implied:
+      #   * As of this commit NOTHING links it. `dlss_ngx`, PT_DLSS_ACTIVE
+      #     and PT_DLSS_RUNTIME_DLLS are produced by cmake/Dependencies.cmake
+      #     and consumed by no target and no source file, so a PR build with
+      #     it ON compiles byte-for-byte the same objects as one with it OFF.
+      #     It only spends the download.
+      #   * That download is a several-hundred-MB `git clone` of NVIDIA/DLSS
+      #     on every cold configure -- the SDK ships prebuilt DLLs (59.0 MB +
+      #     40.9 MB + 7.5 MB in rel/ alone, plus the dev/ variants).
+      #   * It is the ONLY fetch in the tree with no URL_HASH -- see the
+      #     "KNOWN GAP" note in cmake/Dependencies.cmake. Pulling an
+      #     unpinned, mutable upstream git tag on every PR from every
+      #     contributor is a supply-chain cost on top of the bandwidth one.
+      # The nightly keeps it ON so the fetch + imported-target block is still
+      # exercised daily: a flag CI never turns on is a flag CI never tests,
+      # and 24h latency on that signal is acceptable when zero object files
+      # depend on it. Make this unconditional ON the moment any target
+      # actually links dlss_ngx.
+      PT_CI_DLSS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'ON' || 'OFF' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -62,24 +94,70 @@ jobs:
           stripdown: true
 
       - name: Verify toolchain
+        # dxc.exe is checked explicitly because PT_ENABLE_NRD is ON by
+        # default as of the RELAX_DIFFUSE integration, and NRD's build
+        # spawns ShaderMake to compile its HLSL to SPIR-V -- which needs
+        # DirectX Shader Compiler from the Vulkan SDK's Bin/. Nothing in
+        # this repo needed an SDK *binary* before (we only ever used
+        # find_package(Vulkan) for headers + vulkan-1.lib), so the
+        # `stripdown: true` above has never been tested against that
+        # requirement. Failing here with the remedy named beats failing
+        # 200 lines deep inside NRD's configure with "Can't find DXC".
         shell: pwsh
         run: |
           ninja --version
           cmake --version
           echo "VULKAN_SDK = $env:VULKAN_SDK"
+          if (-not $env:VULKAN_SDK) {
+            Write-Host "::error::VULKAN_SDK is not set. The Install Vulkan SDK step is supposed to export it."
+            exit 1
+          }
+          $dxc = Join-Path $env:VULKAN_SDK "Bin\dxc.exe"
+          if (-not (Test-Path $dxc)) {
+            Write-Host "::error::dxc.exe not found at $dxc. NRD's ShaderMake needs it to emit SPIR-V. Remedy: set 'stripdown: false' on the Install Vulkan SDK step, or pin an SDK build that ships Bin/dxc.exe."
+            Get-ChildItem (Join-Path $env:VULKAN_SDK "Bin") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            exit 1
+          }
+          & $dxc --version
+
+      - name: Cache Slang toolchain
+        # cmake/SetupBinaries.cmake downloads the Slang release archive into
+        # third_party/slang/ -- the SOURCE tree, not the build tree, and
+        # gitignored. No build-directory cache can ever cover it, so without
+        # this step every single run re-downloads slangc. Keyed on
+        # SetupBinaries.cmake so a PT_SLANG_VERSION bump busts it.
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
 
       - name: Configure
+        # -DPT_ENABLE_DLSS overrides the preset's (absent) value and the
+        # option()'s ON default; command-line -D entries win over preset
+        # cacheVariables. See the PT_CI_DLSS comment at the top of this job.
+        #
+        # NOT cached deliberately. GitHub gives the whole repository a 10 GB
+        # cache budget and release.yml + linux-sanitizers.yml already spend
+        # it on two build trees; adding a third (a Debug tree that now
+        # carries NRD) invites LRU eviction of the caches that matter. A cold
+        # compile test is also the honest signal for a regression gate.
         shell: pwsh
-        run: cmake --preset win-debug
+        run: cmake --preset win-debug -DPT_ENABLE_DLSS=$env:PT_CI_DLSS
 
       - name: Build
         shell: pwsh
         run: cmake --build build/win-debug --parallel
 
       - name: Unit tests (ctest)
-        # See mac-debug job above for rationale. Golden cells are
-        # excluded here and run in their own step so a render failure
-        # produces a downloadable PNG artefact.
+        # -LE "golden|nightly" excludes two label groups:
+        #   golden  -- the golden-image matrix, which cannot run on this
+        #              runner at all (see the block below).
+        #   nightly -- pt_planet_terrain_exhaustive, run in its own step
+        #              on the schedule.
+        # Everything else is a CPU-side doctest binary and runs here.
+        # rhi_accel_vulkan registers on this lane but reports ***Skipped
+        # (SKIP_RETURN_CODE 125): VulkanDevice has no headless path and the
+        # runner has no ICD. That is expected, not a failure.
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure -LE "golden|nightly"
 
@@ -117,36 +195,25 @@ jobs:
       # LOCAL gate: `ctest -R golden` on a machine with the GPU. That is a real
       # reduction in CI coverage and is stated here rather than quietly
       # dropped. The unit tests above still run on every push.
-
-      # Kept so a future GPU runner has somewhere to publish diffs; it
-      # uploads nothing while the matrix does not run here.
-      - name: Upload golden-image diff artefacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: goldens-windows
-          path: |
-            build/win-debug/golden_actual/
-            build/win-debug/golden_diff/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Fail job if golden cell failed
-        if: steps.goldens.outputs.rc != '0'
-        shell: pwsh
-        run: |
-          Write-Host "::error::Golden-image cell failed (rc=${{ steps.goldens.outputs.rc }}); see goldens-windows artefact."
-          exit ${{ steps.goldens.outputs.rc }}
+      #
+      # The `golden_actual/` + `golden_diff/` artefact-upload step and its
+      # companion "fail the job if a cell failed" step were removed with the
+      # matrix. They referenced `steps.goldens.outputs.rc` -- an id no step
+      # has carried since the ctest golden step was deleted -- and the upload
+      # produced an `if-no-files-found: warn` annotation on every single run
+      # for directories that are never created. When a GPU runner lands, the
+      # ctest step, the artefact upload and the failure gate all come back
+      # together; a publisher with nothing to publish is not a head start.
 
       # Backend smoke tests intentionally NOT run on the GH-hosted
-      # windows-latest runner. The runner has no GPU hardware
-      # (no NVIDIA, no AMD, no software Vulkan ICD beyond what we
-      # don't install), so Vulkan init returns
-      # VK_ERROR_INCOMPATIBLE_DRIVER and Software backend would only
-      # exercise the CPU path. GitHub's paid Tesla-T4 GPU runners
-      # ARE Linux/Windows-only but are gated to Team / Enterprise
-      # plans, not available to public open-source repos. See PR #77
-      # for the full investigation.
+      # windows-latest runner. The runner has no GPU hardware and no
+      # Vulkan ICD, so instance/device creation returns
+      # VK_ERROR_INCOMPATIBLE_DRIVER. There is no longer a CPU fallback
+      # to run instead -- the software RHI was deleted along with Embree,
+      # so `vulkan` is the only backend this engine has.
+      # GitHub's paid Tesla-T4 GPU runners ARE Linux/Windows-only but are
+      # gated to Team / Enterprise plans, not available to public
+      # open-source repos. See PR #77 for the full investigation.
       #
       # Run manually on real RTX hardware when validating Vulkan:
       #   .\build\win-debug\src\app\demont.exe --smoke-frames=8 --r-backend=vulkan
@@ -220,9 +287,27 @@ jobs:
           cache: true
           stripdown: true
 
+      - name: Cache Slang toolchain
+        if: steps.nightly_check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
+
       - name: Configure (release)
         if: steps.nightly_check.outputs.skip != 'true'
-        run: cmake --preset win-release
+        # DLSS OFF here even though the `windows` compile job above turns it
+        # ON for the nightly. The asymmetry is deliberate: that job only has
+        # to COMPILE, this one PUBLISHES. Shipping DLSS would require two
+        # things this job does not do -- staging PT_DLSS_RUNTIME_DLLS next to
+        # demont.exe (nvngx_dlss.dll / nvngx_dlssd.dll; without them the
+        # feature cannot initialise), and the NVIDIA attribution that the
+        # RTX SDK licence requires of anything publicly redistributing those
+        # binaries. Until both land, an artefact built with DLSS "on" would
+        # be all licence exposure and no functionality. NRD stays ON: it is
+        # a static library, it needs no runtime redistributable, and it is
+        # a real feature of the shipped binary.
+        run: cmake --preset win-release -DPT_ENABLE_DLSS=OFF
 
       - name: Build
         if: steps.nightly_check.outputs.skip != 'true'
