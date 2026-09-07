@@ -159,8 +159,29 @@ The exact `slangc` command line for either configuration can be printed with
    (434 KB) -- same source, same defines, only the `-O` flag differs.
 2. The `slangc` command lines for both (from the `ninja -t commands` line
    above).
-3. `spirv-val --target-env vulkan1.4` output for both modules (run it before
-   filing so the report states whether both validate).
+3. `spirv-val --target-env vulkan1.4` output for both modules. ALREADY RUN,
+   2026-09-07, SDK 1.4.341.1: **both modules validate cleanly, no
+   diagnostics, exit 0**. State this in the report -- it rules out
+   malformed SPIR-V and puts the fault in the driver's compilation of a
+   valid module.
+
+   Current sizes on the tree as of that run (they have grown since the
+   original bisection, which recorded 6.6 MB / 336 KB -- quote the current
+   pair when filing):
+
+   | Build | `PathTrace.spv` |
+   |---|---|
+   | `-O2` | 8,663,272 bytes (8.66 MB) |
+   | `-O0` | 435,524 bytes (435 KB) |
+
+   The `-O2` module can be produced WITHOUT reconfiguring the build tree --
+   which matters, because a `-O2` build tree hangs the GPU on next run.
+   Take the `-O0` command line from `build.ninja` and change only `-O0` to
+   `-O2` and the `-o` path, e.g. from `build/win-clang-release/src/rhi_vulkan`:
+
+       ../../../../third_party/slang/bin/slangc.exe          ../../../../shaders/PathTrace.slang          -target spirv -entry main -stage compute          -DPT_TARGET_SPIRV -DPT_WATER_ENABLED=1 -DPT_LIGHT_TREE_ENABLED=1          -DPT_PLANET_ENABLED=1 -I ../../shaders -Wno-40100          -O2 -o /some/scratch/PathTrace_O2.spv
+
+   It takes about 52 s.
 4. The hang / no-hang matrix above.
 5. The System event-log entry (event ID 153, source `nvlddmkm`) from a
    failing run, and the engine's stderr from the same run (it contains the
