@@ -25,7 +25,31 @@ Each was rebased onto `fix/vulkan-native-bringup` (Mac strip + native-Vulkan fix
 - `fix/clouds-transition` — **REJECTED for this tree (rework recommended).** The `clouds_raymarched` golden does not exist here (software cell only; software never runs Slang), so "moves one golden" is vacuous — and the pre-pass half of the branch is **unobservable on Vulkan**: `CloudsComposite`'s only call site sits inside the Metal-gated `use_engine_tonemap` block, so raymarched clouds never composite (the same dead-code gate that sinks the lens flare). Measured on the live inline path against a 4 m converged reference: the field-scale schedule is not "27% de-aliasing" but step-dependent **bias reduction** (42% closer in clear air, 76% in the horizon band) that is **39% farther mid-deck**, costs **+55–60% PathTrace time** under `-O0` (horizon steps 24–32 → 100–130), and its constants (0.07 / [8,160] m / 1.04) are admittedly tuned. The pop's root cause is the rectangle-rule cell weight `dens·seg·T_start` (over-counts by τ/(1−e^{−τ}) at τ≈0.5–1 per cell); the Beer–Lambert-exact weight `T_start·(1−exp(−dens·seg))` (Hillaire 2016) converges with the *existing* uniform march at no cost (old/new schedules then agree within 0.2 luminance) — a small, principled rework, but a **visible change (≈−15% clear-air toward the converged value) that is the owner's call**. "Deck-entry brightening is physical" is confirmed (converged luminance rises 136→143→198 into the deck), though the branch exaggerates it slightly more than base. Honest docs + a red→green step test (`pt_cloud_march_step`) are committed on `polish-rebased/clouds-transition` (tip `f5ed68b`); its shader commits are unchanged.
 - `feat/sun-lensflare` — **REJECTED for this tree (rework needed).** Rebases and builds clean, 11/11 tests pass, no goldens move — but the flare lives in `Tonemap.slang`, whose only dispatch is gated `use_engine_tonemap = … && backend_is_metal`, now compile-time false: **`Tonemap.slang` is dead code on Vulkan** (the swapchain is written by the denoiser finalize / inline tonemap), so "on by default from orbit" changes cvar state only. Also found: the "cannot overflow" vis-gate still yields +Inf (correctness rests on `1/(1+Inf)=0`); ghost radiance over-claims energy conservation (~80× on large ghosts); the occlusion ramp uses the true solar half-angle while the renderer draws a 2.06× disc; the chromaticity worked-example is wrong from orbit. Comment fixes are on `polish-rebased/sun-lensflare`. **Blocked on a Vulkan tonemap/flare dispatch — a new task the strip exposed.**
 
-**Systemic finding from the two rejections:** the engine's post-process chain — `Tonemap.slang`, the lens-flare composite, and `CloudsComposite` for raymarched clouds — is dispatched only inside `use_engine_tonemap = … && backend_is_metal`, which the strip made compile-time false. **That whole chain is dead on Vulkan.** A Vulkan dispatch path for it is now a first-class task: it unblocks the lens flare, raymarched clouds, and the engine tonemap operators.
+**Systemic finding — nine GPU features are dead on Vulkan, not three.** Both polish
+rejections traced to the same cause, and a triage of the parent engine's open issues
+(2026-09-06) showed it is far wider than first recorded. `VulkanDevice.cpp:1756-1838`
+registers only `pathtrace`, `autoexpose`, `perfoverlay`, `editor_overlay`,
+`bloom_down/up`, `tonemap`, `stars_composite`, `clouds_raymarch`, `clouds_composite`
+and `accel_probe`. Everything below is built-but-never-dispatched, or never compiled
+for SPIR-V at all:
+
+| Feature | Evidence | Consequence |
+|---|---|---|
+| Engine tonemap + lens flare | `Engine.cpp:12873` `backend_is_metal = false` | built, never dispatched |
+| `CloudsComposite` | only call site is inside `use_engine_tonemap` | raymarched clouds never composite |
+| `AuroraComposite` | not compiled for SPIR-V; `Engine.cpp:6501` | **no aurora at all** |
+| `HeightFog` / `GodRays` | not compiled for SPIR-V; `Engine.cpp:6506` / `:6511` | **`r_fog` and god rays are silent no-ops** |
+| `SigmaShadow` | `Engine.cpp:6529` | **`r_shadow_demod` is a no-op** |
+| `OceanCascades` | compiled but unregistered; `Engine.cpp:25184-25195` | **the ocean FFT falls back to the CPU solver** |
+| ReSTIR DI (temporal / spatial / final) | `Engine.cpp:6533-6536` | **ReSTIR does not run** — the "r_restir=1 but ReSTIR NOT dispatching" log is a missing registration, not a gate |
+| `ParticleComposite` | not compiled for SPIR-V | no particle composite |
+
+Tracked as **#17**, which blocks #14, #15, #16, #18, #23, #25, #26. Check registration
+*first* when reviewing anything that touches these — two polish branches were rejected
+for exactly this. Note the knock-ons: the ocean-cascade cost argument ("the GPU FFT
+makes cascades free") is false while the FFT is on the CPU, and the `kPushSplitOffset`
+112-vs-128 push mismatch (#18) is latent only because neither shader compiles for
+SPIR-V today.
 
 Known pre-existing: `pt_math_sphere` bit-pin fails on the base tree (verified still failing on `origin/main` on 2026-09-07; spun out to its own task). The "software goldens flake under CPU load" note is retired with the software backend.
 
