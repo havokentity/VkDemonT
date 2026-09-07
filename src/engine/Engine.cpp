@@ -21785,6 +21785,21 @@ void Engine::RegisterCsgCommands() {
                            planet_terrain_->LeafBudget(),
                            planet_terrain_->TlasCapacity() - 1u,
                            st.held, st.starved);
+            // The hole diagnostics. A published cover that is INCOMPLETE
+            // is ground the selector wants and nothing is standing on.
+            // holds_refused counts substitutions declined because
+            // publishing them would have opened a two-level step -- the
+            // streamer preferring a hole to a crack -- and repair_rounds
+            // reaching kMaxRepairRounds means the backstop fired and
+            // every substitution was refused at once.
+            out.FormatLine("planet_stats: cut={} cut_resident={} "
+                           "holds_refused={} repair_rounds={} (peak {})",
+                           st.cut, st.cut_resident, st.holds_refused,
+                           st.repair_rounds, st.repair_rounds_peak);
+            out.FormatLine("planet_stats: holds_dropped={} "
+                           "retained_dropped={} evictions={}",
+                           st.holds_dropped, st.retained_dropped,
+                           st.evictions);
             out.FormatLine("planet_stats: dem={} site={:.4f},{:.4f} "
                            "tlas_capacity={}",
                            planet_terrain_->HasDem() ? "real" : "procedural",

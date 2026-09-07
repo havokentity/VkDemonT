@@ -1614,11 +1614,22 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     const bool enable_sucf        = has_sucf && feat_sucf;
     // VK_KHR_pipeline_library has no feature struct; presence is enough.
     const bool enable_pipeline_library = has_pipeline_library;
+    // RTX Mega Geometry. Step 0 detected and logged this and stopped
+    // there; enabling it is what lets the cluster build entry points
+    // resolve. Gated on the feature bit as well as the extension: a
+    // driver may advertise the extension and report the feature false.
+    const bool enable_clas = has_clas && feat_clas;
+    clas_enabled_   = enable_clas;
+    clas_max_verts_ = clas_max_verts;
+    clas_max_tris_  = clas_max_tris;
 #if defined(VK_KHR_ray_tracing_pipeline)
     if (enable_rt_pipeline) dexts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
 #endif
 #if defined(VK_KHR_pipeline_library)
     if (enable_pipeline_library) dexts.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    if (enable_clas) dexts.push_back(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME);
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     if (enable_rt_maint1) dexts.push_back(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
@@ -1786,6 +1797,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_feat{};
     rtp_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rtp_feat.rayTracingPipeline = VK_TRUE;
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clas_feat{};
+    clas_feat.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+    clas_feat.clusterAccelerationStructure = VK_TRUE;
+#endif
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_feat{};
@@ -1831,6 +1848,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
 #if defined(VK_KHR_ray_tracing_pipeline)
     if (enable_rt_pipeline) chain(&rtp_feat, reinterpret_cast<void**>(&rtp_feat.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    if (enable_clas) chain(&clas_feat, reinterpret_cast<void**>(&clas_feat.pNext));
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     if (enable_rt_maint1) chain(&rtm1_feat, reinterpret_cast<void**>(&rtm1_feat.pNext));
@@ -1929,6 +1949,37 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             vkGetDeviceProcAddr(device_, "vkDestroyAccelerationStructureKHR"));
         pfn_CmdBuildAccelStructs_ = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
             vkGetDeviceProcAddr(device_, "vkCmdBuildAccelerationStructuresKHR"));
+#if defined(VK_NV_cluster_acceleration_structure)
+        // RTX Mega Geometry. Two entry points carry the whole feature:
+        // one size query and one indirect build that can produce MANY
+        // cluster structures from a single command. That "many per
+        // command" is the entire reason it exists here -- the current
+        // path is one vkCmdBuildAccelerationStructuresKHR, one submit
+        // and one fence PER CHUNK.
+        if (clas_enabled_) {
+            pfn_GetClusterAccelSizes_ = reinterpret_cast<
+                PFN_vkGetClusterAccelerationStructureBuildSizesNV>(
+                vkGetDeviceProcAddr(
+                    device_,
+                    "vkGetClusterAccelerationStructureBuildSizesNV"));
+            pfn_CmdBuildClusterAccel_ = reinterpret_cast<
+                PFN_vkCmdBuildClusterAccelerationStructureIndirectNV>(
+                vkGetDeviceProcAddr(
+                    device_,
+                    "vkCmdBuildClusterAccelerationStructureIndirectNV"));
+            if (pfn_GetClusterAccelSizes_ == nullptr ||
+                pfn_CmdBuildClusterAccel_ == nullptr) {
+                LOG_WARN("Vulkan: VK_NV_cluster_acceleration_structure was "
+                         "enabled but its entry points did not resolve -- "
+                         "cluster builds stay off.");
+                clas_enabled_ = false;
+            } else {
+                LOG_INFO("Vulkan: cluster acceleration structures ready "
+                         "(max {} verts / {} tris per cluster)",
+                         clas_max_verts_, clas_max_tris_);
+            }
+        }
+#endif
         pfn_GetAccelStructAddr_ = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
             vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureDeviceAddressKHR"));
         if (pfn_CreateAccelStruct_ == nullptr || pfn_CmdBuildAccelStructs_ == nullptr) {

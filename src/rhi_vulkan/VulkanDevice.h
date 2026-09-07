@@ -527,6 +527,23 @@ private:
     PFN_vkCreateAccelerationStructureKHR           pfn_CreateAccelStruct_        = nullptr;
     PFN_vkDestroyAccelerationStructureKHR          pfn_DestroyAccelStruct_       = nullptr;
     PFN_vkCmdBuildAccelerationStructuresKHR        pfn_CmdBuildAccelStructs_     = nullptr;
+#if defined(VK_NV_cluster_acceleration_structure)
+    // --- RTX Mega Geometry (VK_NV_cluster_acceleration_structure) ------
+    //
+    // The whole feature is two calls: a size query, and ONE indirect
+    // build that emits many cluster structures. That plurality is the
+    // point. The path this replaces is one build command, one queue
+    // submit and one fence wait PER TERRAIN CHUNK, which measured 7.6 ms
+    // apiece in a loaded frame and admitted a single chunk per frame.
+    PFN_vkGetClusterAccelerationStructureBuildSizesNV
+        pfn_GetClusterAccelSizes_ = nullptr;
+    PFN_vkCmdBuildClusterAccelerationStructureIndirectNV
+        pfn_CmdBuildClusterAccel_ = nullptr;
+#endif
+    // True once the extension is enabled AND its entry points resolved.
+    bool          clas_enabled_    = false;
+    std::uint32_t clas_max_verts_  = 0;
+    std::uint32_t clas_max_tris_   = 0;
     PFN_vkGetAccelerationStructureDeviceAddressKHR pfn_GetAccelStructAddr_       = nullptr;
     PFN_vkGetBufferDeviceAddressKHR                pfn_GetBufferDeviceAddr_      = nullptr;
 
