@@ -78,9 +78,11 @@ public:
     // ---- Upscaler seam --------------------------------------------------
     const char* Name() const override { return "DLSS (NGX)"; }
     bool        Available() const override { return ready_ && !failed_; }
+    bool        RayReconstructionAvailable() override;
     bool        QueryOptimalSettings(UpscalerMode mode,
                                      std::uint32_t display_width,
                                      std::uint32_t display_height,
+                                     bool          ray_reconstruction,
                                      UpscalerSettings& out) override;
     bool        Evaluate(const UpscaleDesc& d) override;
     void        ReleaseFeature() override;
@@ -118,6 +120,14 @@ private:
     // (Re)create the DLSS feature for `mode` at the given extents,
     // recording the creation into `cb`. Returns false and latches
     // failed_ on an NGX error.
+    //
+    // `ray_reconstruction` picks the feature: DLSS-RR
+    // (NVSDK_NGX_Feature_RayReconstruction, created through
+    // NGX_VULKAN_CREATE_DLSSD_EXT1) rather than DLSS-SR. Only ONE of the
+    // two is ever live, because RR is documented to override SR outright
+    // ("when DLSS-RR is enabled, it effectively overrides DLSS-SR
+    // execution" -- DLSS-RR Integration Guide SS3.2), so holding both
+    // would burn a feature's worth of VRAM on one that never runs.
     bool CreateFeature(VkCommandBuffer cb,
                        UpscalerMode    mode,
                        std::uint32_t   render_w,
@@ -125,7 +135,15 @@ private:
                        std::uint32_t   display_w,
                        std::uint32_t   display_h,
                        bool            hdr,
-                       bool            auto_exposure);
+                       bool            auto_exposure,
+                       bool            ray_reconstruction);
+
+    // The DLSS-SR and DLSS-RR halves of Evaluate(). Split because they
+    // fill different eval-params structs through different helpers; the
+    // shared work (validation, the create-invariant, the barriers) stays
+    // in Evaluate() so it cannot drift between the two.
+    bool EvaluateSuperResolution(VkCommandBuffer cb, const UpscaleDesc& d);
+    bool EvaluateRayReconstruction(VkCommandBuffer cb, const UpscaleDesc& d);
 
     VulkanDevice* device_ = nullptr;
 
@@ -133,7 +151,21 @@ private:
     // the top of this header keep the NGX headers out of every TU that
     // includes VulkanDevice.h.
     NVSDK_NGX_Parameter* caps_params_    = nullptr;  // GetCapabilityParameters
-    NVSDK_NGX_Parameter* feature_params_ = nullptr;  // AllocateParameters
+    NVSDK_NGX_Parameter* feature_params_ = nullptr;  // AllocateParameters (SR)
+    // A SECOND parameter set, for Ray Reconstruction only, allocated
+    // lazily on the first RR create.
+    //
+    // Not an optimisation -- a correctness guard. An NGX parameter set is
+    // a persistent string-keyed bag, and nothing clears a key once set.
+    // The RR create writes DLSS.Denoise.Mode, DLSS.Roughness.Mode and
+    // DLSS.Use.HW.Depth into it; the RR evaluate adds a dozen DLSSD.*
+    // resource pointers. Reusing one set would leave all of that behind
+    // when the user toggles r_dlss_rr back to 0 and a Super Resolution
+    // feature is created from the same bag -- with a stale
+    // "DLSS.Denoise.Mode = DLUnified" sitting in it, and stale pointers
+    // to stack-local resource descriptors from an earlier frame. Two
+    // sets make that impossible rather than merely unlikely.
+    NVSDK_NGX_Parameter* rr_params_      = nullptr;  // AllocateParameters (RR)
     NVSDK_NGX_Handle*    feature_        = nullptr;
 
     // What the live feature was CREATED with. Evaluate() compares the
@@ -147,11 +179,23 @@ private:
     std::uint32_t created_display_h_ = 0;
     bool          created_hdr_       = true;
     bool          created_auto_exp_  = true;
+    // SR vs RR. Part of the create-invariant for the same reason the
+    // extents are: they are two different features behind one handle,
+    // and evaluating one through the other's helper is not an error NGX
+    // is obliged to catch.
+    bool          created_rr_        = false;
 
     bool init_attempted_ = false;   // Init() ran (successfully or not)
     bool ngx_inited_     = false;   // NVSDK_NGX_VULKAN_Init succeeded
     bool ready_          = false;   // caps say the feature is usable
     bool failed_         = false;   // latched: never try again this session
+
+    // Ray Reconstruction capability, probed lazily and latched. Separate
+    // from ready_/failed_ because RR failing is NOT Super Resolution
+    // failing: the SR path must keep working on a machine whose driver
+    // or DLL cannot do RR.
+    bool rr_probed_    = false;
+    bool rr_available_ = false;
 };
 
 }  // namespace pt::rhi::vk

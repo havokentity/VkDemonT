@@ -1992,11 +1992,14 @@ private:
     // Specular-guidance G-buffers. Added for MetalFX (issue #118) and gated
     // on the MetalFX denoiser kinds, which no live backend could ever
     // select -- so they were allocated, written and read by nobody until the
-    // MetalFX removal repointed the gate at DlssRayReconstructionRequested().
-    // The only consumer now is DLSS Ray Reconstruction, which is handed all
-    // three at feature-creation time. Allocated only while RR is requested;
-    // 0 for every other configuration, including the default. Same
-    // allocation lifecycle as normal_tex_id_ / albedo_tex_id_.
+    // MetalFX removal repointed the gate at Ray Reconstruction. The only
+    // consumer now is DLSS-RR, and the gate is the RESOLVED kind
+    // (denoiser_kind_ == DlssRayReconstruction) rather than the cvar, so a
+    // GPU that cannot do RR does not carry them. Note the naming: only
+    // specular_albedo and roughness are handed over at feature-creation
+    // time in spirit; all of them are bound per-evaluate. Same allocation
+    // lifecycle as normal_tex_id_ / albedo_tex_id_, which RR also needs --
+    // those two are MANDATORY guides for it, these are the specular half.
     //
     //   specular_albedo_tex_id_       -- RGBA16F. The SPLIT-SUM INTEGRATED
     //                                    specular reflectance
@@ -2101,6 +2104,10 @@ private:
     pt::rhi::UpscalerMode     dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
     std::uint32_t             dlss_query_display_w_ = 0;
     std::uint32_t             dlss_query_display_h_ = 0;
+    // Part of the cache KEY, not of the answer: Super Resolution and Ray
+    // Reconstruction are asked through different runtime entry points, so
+    // a cached SR extent is not an answer to an RR question.
+    bool                      dlss_query_rr_        = false;
     pt::rhi::UpscalerSettings dlss_settings_{};
     // Display-extent linear-HDR target DLSS writes. Allocated only while
     // DLSS is engaged and freed the moment it is not, same lifecycle as
@@ -2136,7 +2143,20 @@ private:
     std::uint32_t         dlss_logged_render_w_  = 0;
     std::uint32_t         dlss_logged_render_h_  = 0;
     bool dlss_hdr_conflict_logged_  = false;
-    bool dlss_rr_pending_logged_    = false;
+    // Ray Reconstruction capability, probed through the backend once and
+    // cached. Tri-state on purpose: the probe brings the NGX runtime up,
+    // so it must not run before a frame has a device, and its answer
+    // cannot change afterwards without a restart.
+    //   -1 = not asked yet, 0 = unsupported, 1 = supported.
+    int  dlss_rr_supported_         = -1;
+    // One-shot transition logs. rr_engaged: RR took over as the denoiser.
+    // rr_degraded: RR was asked for and the GPU/driver/runtime said no.
+    // rr_inert_denoiser: r_denoiser named a kind that RR is overriding --
+    // plan SS5.1 requires this be said out loud rather than silently
+    // ignored, and the docstring on r_dlss_rr promises it.
+    bool dlss_rr_engaged_logged_        = false;
+    bool dlss_rr_degraded_logged_       = false;
+    bool dlss_rr_inert_denoiser_logged_ = false;
     // --- end DLSS ----------------------------------------------------------
 
     // Physical lens flare (Hullin paraxial). LensSystem + traced
@@ -2451,19 +2471,43 @@ private:
     // backend could ever select them. Their one lasting consequence is
     // recorded at want_specular_guidance_gbuffers -- the specular G-buffer
     // trio was gated on those kinds, which made it dead code on Vulkan.
+    //   DlssRayReconstruction = NVIDIA DLSS-RR. A denoiser AND an upscaler
+    //                          in one NGX feature, so it REPLACES the
+    //                          whole chain above rather than composing
+    //                          with it (docs/DLSS_INTEGRATION_PLAN.md
+    //                          SS5.1). Selected by `r_dlss_rr`, NOT by
+    //                          `r_denoiser` -- mode and denoiser are two
+    //                          independent axes, and folding RR into
+    //                          r_denoiser could not express "Performance-
+    //                          mode SR with SVGF" versus "Performance-mode
+    //                          RR". While this kind is live `r_denoiser`
+    //                          is latched but inert, and the engine says
+    //                          so once on the transition.
     enum class DenoiserKind : std::uint8_t {
         Off, SvgfBasic, SvgfAtrous, Nrd,
         OptixHdr, OptixHdrAov,
         OptixTemporalHdr, OptixTemporalHdrAov,
+        DlssRayReconstruction,
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     // True when the user has asked for DLSS Ray Reconstruction: r_dlss is not
     // `off` AND r_dlss_rr is set. Reads the cvars rather than a resolved state
     // because the specular guidance G-buffers it gates must be allocated
     // BEFORE the NGX feature is created -- DLSS-RR is handed its guide buffers
-    // at creation time, not per frame. Returns false while the NGX calls are
-    // unwired, which is correct: nothing consumes the buffers yet.
+    // at creation time, not per frame.
+    //
+    // REQUESTED, not RESOLVED: this says what the user asked for, and is
+    // deliberately true even on a GPU with no RR support. The resolved
+    // answer is `denoiser_kind_ == DlssRayReconstruction`, which
+    // additionally requires the backend to have said yes. The G-buffer
+    // gates below use the RESOLVED form, so a machine that degrades to
+    // Super Resolution does not pay for guide buffers nothing reads.
     bool DlssRayReconstructionRequested() const;
+    // Resolved counterpart: RR is what the user asked for AND the backend
+    // reports the NGX Ray Reconstruction feature usable. Cached per
+    // session in dlss_rr_supported_, because the backend probe brings the
+    // NGX runtime up and its answer cannot change without a restart.
+    bool DlssRayReconstructionActive();
     // Ask the backend what render extent `mode` wants for a display of
     // `display_w` x `display_h`, caching the answer per (mode, extent)
     // so NGX is asked once per mode change or resize rather than per
