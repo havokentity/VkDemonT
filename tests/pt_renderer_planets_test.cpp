@@ -710,6 +710,115 @@ static double MapTotalIrradiance(const std::vector<float>& map,
     return total;
 }
 
+// WHY THERE IS A PEAK TEST AS WELL AS A TOTAL-ENERGY TEST.
+//
+// MapTotalIrradiance below sums L*omega using the SAME solid-angle weights
+// RasteriseJ2000Map normalises against. Since the rasteriser writes
+// L = E * w / sum(w_j * omega_j), the sum comes back as
+// E * sum(w*omega) / sum(w_j*omega_j) == E identically -- for ANY set of
+// visited texels, including a truncated one. The total-energy assertions are
+// therefore an algebraic restatement of the normalisation and CANNOT FAIL.
+//
+// They are kept, because they still pin that the normalisation exists and that
+// tint and magnitude compose as claimed. But they were the only check on the
+// splat's footprint, and they hid a real defect: a `max(cos(dec), 0.05)` floor
+// on the longitude sweep truncated the footprint above |dec| 87.13 deg,
+// inflating the PEAK by up to 6.27x near the pole while total energy stayed
+// exact to nine digits. The pole test aimed at exactly that declination and
+// passed with room to spare.
+//
+// The peak is the independent quantity. For a normalised Gaussian the central
+// radiance is E / (pi * sigma^2) -- derived from the continuous integral, NOT
+// from the discrete sum -- so truncating the footprint shrinks the divisor,
+// inflates `norm`, and shows up here immediately.
+static double AnalyticPeakRadiance(float vmag, std::uint32_t H, double tint) {
+    const double kPi    = 3.14159265358979323846;
+    const double dtheta = kPi / double(H);
+    const double sigma  = double(pt::stars::PsfSigmaRad(0.75f * float(dtheta)));
+    const double E      = double(pt::stars::MagnitudeToIrradianceWm2(vmag));
+    return tint * E / (kPi * sigma * sigma);
+}
+
+static double MapPeak(const std::vector<float>& map,
+                      std::uint32_t W, std::uint32_t H, int channel) {
+    double peak = 0.0;
+    for (std::size_t i = 0; i < std::size_t(W) * H; ++i) {
+        peak = std::max(peak, double(map[i * 4 + std::size_t(channel)]));
+    }
+    return peak;
+}
+
+// GRID CHOICE MATTERS HERE, and getting it wrong is how the first version of
+// this test passed against the very bug it was written for.
+//
+// The star must sit on a TEXEL CENTRE, or sub-texel centring alone drops the
+// sampled peak to ~0.65 of analytic and swamps the signal. And the grid must
+// be fine enough in LATITUDE that the 4-sigma footprint clears row 0 -- once
+// rows clamp at the pole, the splat drops energy it cannot place (it does not
+// wrap over the pole) and the renormalisation inflates the survivors, which is
+// a SECOND effect that masks the one under test.
+//
+// 512x2048 satisfies both at 16 MB: deliberately non-square, because only the
+// latitude resolution needs to be fine. Measured on this grid at dec 89.6045,
+// with the star texel-centred and rows unclamped:
+//
+//     longitude floor present : peak / analytic = 1.6704
+//     floor removed           : peak / analytic = 0.9922
+//
+// so a 1.15 bound separates them with room on both sides.
+static const std::uint32_t kPoleW = 512, kPoleH = 2048;
+
+// Texel-centred position: row 4 of kPoleH, column 100 of kPoleW.
+static double PoleTestDec() { return 90.0 - (4 + 0.5) * 180.0 / double(kPoleH); }
+static double PoleTestRa()  { return (100 + 0.5) * 360.0 / double(kPoleW); }
+
+TEST_CASE("the splat's peak matches the analytic normalised Gaussian") {
+    // Independent of the normalisation, which is the entire point: it compares
+    // against pi*sigma^2 from the CONTINUOUS integral, not against the discrete
+    // sum the rasteriser divided by. The total-energy tests below cannot
+    // distinguish a correct footprint from a truncated one; this can.
+    pt::stars::Star s{};
+    s.ra_deg  = float(PoleTestRa());
+    s.dec_deg = 45.0f;                 // far from the pole: no grid pathology
+    s.vmag    = 1.0f;
+    std::vector<float> map;
+    pt::stars::RasteriseJ2000Map({s}, kPoleW, kPoleH, map);
+    const double got    = MapPeak(map, kPoleW, kPoleH, 0);
+    const double expect = AnalyticPeakRadiance(s.vmag, kPoleH, 0.85);
+    CAPTURE(got);
+    CAPTURE(expect);
+    // 8% covers discrete-vs-continuous sampling plus the residual centring
+    // error in longitude (the star is column-centred, but 45 deg is not a row
+    // centre for this H).
+    CHECK(got == doctest::Approx(expect).epsilon(0.08));
+}
+
+TEST_CASE("the near-pole splat does not inflate its peak") {
+    // THE REGRESSION THE ENERGY TESTS COULD NOT SEE. RasteriseJ2000Map used to
+    // floor the longitude sweep at max(cos(dec), 0.05), which stopped the
+    // footprint short of 4 sigma above |dec| 87.13 deg. Total energy stayed
+    // exact to nine digits -- the renormalisation guarantees that -- while the
+    // peak inflated, because the same energy went into fewer texels. On the
+    // production 8192x4096 map that is 1.41x at dec 89.5 and 31.7x at 89.99.
+    //
+    // One-sided on purpose: a peak BELOW analytic means the star is spread too
+    // wide, which is a different defect and not what the floor did.
+    const double expect = AnalyticPeakRadiance(2.0f, kPoleH, 0.85);
+    for (double dec : {PoleTestDec(), 85.0, -PoleTestDec()}) {
+        CAPTURE(dec);
+        pt::stars::Star s{};
+        s.ra_deg  = float(PoleTestRa());
+        s.dec_deg = float(dec);
+        s.vmag    = 2.0f;
+        std::vector<float> map;
+        pt::stars::RasteriseJ2000Map({s}, kPoleW, kPoleH, map);
+        const double got = MapPeak(map, kPoleW, kPoleH, 0);
+        CAPTURE(got);
+        CAPTURE(expect);
+        CHECK(got < expect * 1.15);
+    }
+}
+
 TEST_CASE("the rasteriser conserves each star's irradiance exactly") {
     // THE contract of the map, and what replaced the old peak-amplitude
     // one. The previous rasteriser wrote flux * exp(-ang2/sigma^2), a

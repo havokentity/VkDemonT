@@ -297,9 +297,25 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
         // pole exactly (the entire row is "within range" angularly,
         // and we'd visit W texels per star).
         const float half_v = float(K) * r_ang / float(dtheta);
-        const double cos_dec_safe = std::max(std::cos(dec), 0.05);   // ~3 deg from pole
+        // Longitude half-extent widens by 1/cos(dec) because equirectangular
+        // columns converge toward the poles.
+        //
+        // There used to be a `max(cos(dec), 0.05)` floor here, nominally "~3
+        // deg from pole". It TRUNCATED the sweep: above |dec| 87.13 deg the
+        // visited span was narrower than the star's true 4-sigma footprint.
+        // Energy stayed exact -- the normalisation below divides by whatever
+        // was actually visited -- but the PEAK inflated, because the same
+        // energy was packed into fewer texels. Measured against a full sweep:
+        // 1.16x at Polaris, 6.27x at dec 89.9 on the production 8192x4096 map.
+        //
+        // The floor was also redundant. half_u is already bounded by W/2
+        // below, which is the CORRECT bound: a star close enough to the pole
+        // genuinely spans every longitude, and W/2 sweeps exactly that once
+        // and no more. Removing the floor makes the near-pole case correct
+        // and leaves the worst case unchanged.
+        const double cos_dec = std::max(std::cos(dec), 1e-9);  // 1e-9 guards 1/0 only
         const float half_u = std::min(
-            float(K) * r_ang / (float(dphi) * float(cos_dec_safe)),
+            float(K) * r_ang / (float(dphi) * float(cos_dec)),
             float(W) * 0.5f);
 
         const int iy0 = std::max(0, int(std::floor(fy - half_v)));
