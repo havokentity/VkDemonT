@@ -34,37 +34,26 @@ jobs:
     # gate on PRs.
     runs-on: windows-latest
     env:
-      # --- Heavyweight optional dependencies on this lane ------------------
+      # DLSS: unconditionally ON.
       #
-      # PT_ENABLE_NRD defaults ON and STAYS ON here, deliberately. NRD is not
-      # decoration: src/rhi_vulkan/CMakeLists.txt compiles
-      # VulkanNrdLibDenoiser.cpp and the NrdPack / NrdUnpack Slang kernels
-      # ONLY under PT_NRD_ACTIVE, so a CI configure with NRD off would not
-      # compile the largest source file in the denoiser at all. Building it
-      # IS the point of a compile-test lane. The cost is a from-source NRD
-      # build (MathLib + ShaderMake + HLSL -> SPIR-V) on every cold configure;
-      # that is accepted as the price of the coverage.
+      # This was OFF on PR/push for one commit, on the grounds that no object
+      # file depended on the SDK -- a CI build with it ON compiled byte-identical
+      # objects and only paid a several-hundred-megabyte download. That comment
+      # said to flip it "the moment any target actually links dlss_ngx".
       #
-      # PT_ENABLE_DLSS also defaults ON. This lane turns it OFF for PR/push
-      # runs and ON for the nightly. Reasoning, stated rather than implied:
-      #   * As of this commit NOTHING links it. `dlss_ngx`, PT_DLSS_ACTIVE
-      #     and PT_DLSS_RUNTIME_DLLS are produced by cmake/Dependencies.cmake
-      #     and consumed by no target and no source file, so a PR build with
-      #     it ON compiles byte-for-byte the same objects as one with it OFF.
-      #     It only spends the download.
-      #   * That download is a several-hundred-MB `git clone` of NVIDIA/DLSS
-      #     on every cold configure -- the SDK ships prebuilt DLLs (59.0 MB +
-      #     40.9 MB + 7.5 MB in rel/ alone, plus the dev/ variants).
-      #   * It is the ONLY fetch in the tree with no URL_HASH -- see the
-      #     "KNOWN GAP" note in cmake/Dependencies.cmake. Pulling an
-      #     unpinned, mutable upstream git tag on every PR from every
-      #     contributor is a supply-chain cost on top of the bandwidth one.
-      # The nightly keeps it ON so the fetch + imported-target block is still
-      # exercised daily: a flag CI never turns on is a flag CI never tests,
-      # and 24h latency on that signal is acceptable when zero object files
-      # depend on it. Make this unconditional ON the moment any target
-      # actually links dlss_ngx.
-      PT_CI_DLSS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'ON' || 'OFF' }}
+      # That moment arrived in the very next merge. src/rhi_vulkan/CMakeLists.txt
+      # now links dlss_ngx and compiles VulkanNgxUpscaler.cpp (647 lines) behind
+      # PT_DLSS_ACTIVE, so leaving it OFF would mean CI never builds the DLSS
+      # integration at all -- exactly the hole that let PT_ENABLE_NRD ship two
+      # hard CMake errors while nobody noticed.
+      #
+      # The supply-chain objection from that commit still stands and is NOT
+      # resolved by this: DLSS remains the only fetch in the tree without a
+      # URL_HASH (cmake/Dependencies.cmake calls that a KNOWN GAP itself), so
+      # every run now pulls a mutable upstream git tag. Pinning that hash is
+      # the outstanding follow-up, and it matters more now that this is ON
+      # everywhere rather than nightly-only.
+      PT_CI_DLSS: 'ON'
     steps:
       - uses: actions/checkout@v4
 
