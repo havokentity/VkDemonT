@@ -3,7 +3,7 @@
 //
 // pt_render_one_frame: thin harness CLI for the golden-image regression
 // matrix (issue #45). Translates a stable test-facing flag set
-//   --scene <path> --backend {software|metal|vulkan} --denoiser <kind>
+//   --scene <path> --backend vulkan --denoiser <kind>
 //   --spp <N> --frames <N> --out <png-path> [--extra "<cvar> <value>; ..."]
 // into the engine's existing smoke-test plumbing
 //   demont --smoke-frames=N --r-backend=X --smoke-exec=<path> \
@@ -64,7 +64,7 @@ void PrintUsage(std::FILE* out) {
         "Required:\n"
         "  --scene PATH         Path to a console-script .cfg fixture\n"
         "                       (loaded by the engine before backend init).\n"
-        "  --backend NAME       One of software | vulkan.\n"
+        "  --backend NAME       Must be vulkan (the only backend).\n"
         "  --out PATH           Destination PNG for the final frame.\n"
         "\n"
         "Optional:\n"
@@ -180,22 +180,17 @@ bool ParseArgs(int argc, char** argv, Args& a) {
         std::fprintf(stderr, "pt_render_one_frame: --out is required\n");
         return false;
     }
-#if defined(__APPLE__)
-    if (a.backend != "software" && a.backend != "metal") {
+    // vulkan is the only backend. Metal was retired with the macOS build
+    // and software with the move to GPU-exclusive rendering; both are
+    // rejected BY NAME rather than by a generic "unknown backend" so an old
+    // script or a stale golden cell says WHY it stopped working.
+    if (a.backend != "vulkan") {
         std::fprintf(stderr,
-            "pt_render_one_frame: --backend must be one of "
-            "{software,metal}; Vulkan is Windows/Linux-only; got '%s'\n",
+            "pt_render_one_frame: --backend must be vulkan (got '%s'). "
+            "The software and metal backends have been removed.\n",
             a.backend.c_str());
         return false;
     }
-#else
-    if (a.backend != "software" && a.backend != "metal" && a.backend != "vulkan") {
-        std::fprintf(stderr,
-            "pt_render_one_frame: --backend must be one of "
-            "{software,metal,vulkan}; got '%s'\n", a.backend.c_str());
-        return false;
-    }
-#endif
     // Validate --denoiser against the full superset of r_denoiser
     // values the engine accepts (per the PT_CVAR description in
     // src/engine/Engine.cpp). The engine does NOT have an

@@ -118,12 +118,10 @@ jobs:
 
       - name: Configure
         # The preset disables Vulkan + OptiX so no SDK install is
-        # needed; Embree gets auto-fetched as a prebuilt tarball
-        # from the vendored/embree-* release (see EmbreeBinary.cmake).
-        # Even though Embree is ray-tracing code, it stays linked in
-        # because pt_renderer / pt_csg pull it transitively for CPU-
-        # side scene-build helpers; the sanitizer flags propagate into
-        # the project code linking against it.
+        # needed. Embree is gone with the software RHI, so this job no
+        # longer fetches it -- one fewer dependency and a faster configure.
+        # What remains here is exactly what it always really was: a
+        # host-code sanitizer run over the CPU-side unit tests.
         run: cmake --preset linux-asan-ubsan-debug
 
       - name: Build

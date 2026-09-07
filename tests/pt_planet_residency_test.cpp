@@ -75,6 +75,7 @@
 
 #include "engine/PlanetTerrain.h"
 #include "renderer/Planet/TerrainResidency.h"
+#include <GLFW/glfw3.h>
 #include "rhi/Device.h"
 
 #include <algorithm>
@@ -308,12 +309,46 @@ struct FlightPlan {
     double zoom_top_m           = kAltStart_m;
 };
 
+// A hidden GLFW window, purely so the Vulkan device has a surface to
+// create. The software backend used to accept a null handle because it had
+// no VkSurfaceKHR to make; when the software RHI was removed and these
+// cases moved to Vulkan, a null handle started failing device creation and
+// the whole suite silently SKIPPED.
+//
+// GLFW_NO_API is the load-bearing hint: without it GLFW builds an OpenGL
+// context and glfwCreateWindowSurface then fails, which is exactly the
+// error that skip was reporting.
+struct HiddenWindow {
+    GLFWwindow* w = nullptr;
+    HiddenWindow() {
+        if (!glfwInit()) return;
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_VISIBLE,    GLFW_FALSE);
+        w = glfwCreateWindow(64, 64, "pt_planet_residency", nullptr, nullptr);
+    }
+    ~HiddenWindow() {
+        if (w) glfwDestroyWindow(w);
+        glfwTerminate();
+    }
+    HiddenWindow(const HiddenWindow&)            = delete;
+    HiddenWindow& operator=(const HiddenWindow&) = delete;
+};
+
 FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
                              const FlightPlan& plan) {
     FlightResult fr;
 
+    // Declared BEFORE the device so it is destroyed AFTER it: tearing GLFW
+    // down while a VkSurfaceKHR built from its window is still alive would
+    // be a use-after-free.
+    HiddenWindow hw;
+    if (!hw.w) {
+        fr.skip_reason = "could not create a hidden GLFW window on this host";
+        return fr;
+    }
+
     pt::rhi::NativeWindowHandle window{};
-    window.opaque = nullptr;
+    window.opaque = hw.w;
     window.width  = 64;
     window.height = 64;
     auto dev = pt::rhi::Device::Create(backend, window);
@@ -678,7 +713,7 @@ FlightResult g_flight;
 }  // namespace
 
 TEST_CASE("paced residency: coverage never regresses while chunks stream") {
-    g_flight = FlyThePacedPath(pt::rhi::BackendType::Software, FlightPlan{});
+    g_flight = FlyThePacedPath(pt::rhi::BackendType::Vulkan, FlightPlan{});
     if (!g_flight.ran) {
         MESSAGE("SKIPPED: " << g_flight.skip_reason);
         return;
@@ -853,7 +888,7 @@ TEST_CASE("paced residency: zooming out never uncovers ground") {
     // of BLAS budget, so the budget has to be the one a session runs at.
     plan.blas_budget_ms = 2.0;
     plan.frame_sleep_ms = 4;
-    const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Software, plan);
+    const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Vulkan, plan);
     if (!f.ran) {
         MESSAGE("SKIPPED: " << f.skip_reason);
         return;
@@ -1005,7 +1040,7 @@ TEST_CASE("paced residency: a teleport into a tight arena never overruns it") {
     // also more honest here: 2 ms is what a session actually runs at.
     plan.blas_budget_ms = 2.0;
     plan.frame_sleep_ms = 4;
-    const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Software, plan);
+    const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Vulkan, plan);
     if (!f.ran) {
         MESSAGE("SKIPPED: " << f.skip_reason);
         return;

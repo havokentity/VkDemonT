@@ -1031,7 +1031,6 @@ function(pt_add_accel_cell _backend)
 endfunction()
 
 if(WIN32)
-    pt_add_accel_cell(software)
 endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     # Skips by default even here -- VulkanDevice has no headless path.
@@ -1129,7 +1128,7 @@ function(pt_add_golden_cell)
     # SetDIBitsToDevice analog implemented for Linux). Registering a
     # software cell on Linux would fail at runtime when the engine
     # rejects r_backend software; skip it at configure time.
-    if(PT_CELL_BACKEND STREQUAL "software" AND NOT WIN32)
+    if(FALSE)
         return()
     endif()
 
@@ -1328,7 +1327,6 @@ endfunction()
 # they're absent so a `PT_BUILD_TESTS=ON, PT_BUILD_TOOLS=OFF` configure
 # succeeds. The doctest unit tests above don't depend on the tools.
 if(TARGET pt_render_one_frame AND TARGET imgdiff)
-    pt_add_golden_cell(SCENE cornell_csg BACKEND software DENOISER off)
     pt_add_golden_cell(SCENE cornell_csg BACKEND vulkan   DENOISER off)
 
     # --- SDF Phase 1 (#97) -------------------------------------------------
@@ -1339,8 +1337,6 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # trace's per-pixel iteration count is more sensitive to FP order
     # across backends than the analytic-sphere path. Tightening once
     # cross-backend variance is measured is fine.
-    pt_add_golden_cell(SCENE sdf_smin_row BACKEND software DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     pt_add_golden_cell(SCENE sdf_smin_row BACKEND vulkan   DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end SDF Phase 1 ---------------------------------------------------
@@ -1515,61 +1511,45 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         lunar_night
         bsc_night_clouds)
     foreach(_scene IN LISTS _sky_scenes_night)
-        # NIGHT. The #280 hold is DISCHARGED as of #338: the airglow floor
-        # is no longer a painted stand-in (kPtNightSkyRadiance = 2.5e-7
-        # W/m^2/sr, from V = 22.0 mag/arcsec^2 of dark-site sky) and the
-        # star path has real radiometry with a conserved-energy splat. The
-        # moon disc is still painted, which is why lunar_night carries its
-        # own exposure note.
+        # NIGHT, on the GPU. The #280 hold is DISCHARGED as of #338: the
+        # airglow floor is no longer a painted stand-in
+        # (kPtNightSkyRadiance = 2.5e-7 W/m^2/sr, from V = 22.0 mag/arcsec^2
+        # of dark-site sky) and the star path has real radiometry with a
+        # conserved-energy splat. The moon disc is still painted, which is
+        # why lunar_night carries its own exposure note in the fixture.
         #
-        # EXPOSURE OVERRIDE, and it is load-bearing. These are SOFTWARE
-        # cells, and the software tracer paints its own sky with no
-        # atmospheric physics -- it never runs the shader whose units #338
-        # fixed. The fixtures now state the physically-derived night
-        # exposure (~2000, anchored on the V = 6 naked-eye limit), which is
-        # correct for the GPU backends and meaningless here: applied to a
-        # painted sky it renders 255 EVERYWHERE, a flat white frame that
-        # would pin nothing and pass forever. That is precisely the failure
-        # mode #257 caught with the planet-free sunset cells.
+        # These were software cells until the software RHI was dropped.
+        # They could never have validated a sky in the first place -- that
+        # tracer painted its own and ran none of the shader #338 fixed --
+        # so moving them to vulkan turns a host-code control into an actual
+        # sky guard.
         #
-        # So each software night cell is pinned at the exposure its own
-        # painted sky was authored against. Their role is unchanged and is
-        # not sky validation -- they are the control that says a change did
-        # not leak into host code -- and this keeps them able to do it.
-        # Detecting a night SKY regression needs a GPU cell; see the
-        # vulkan night cell added below.
-        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
-            EXTRA "r_exposure 0.2646")
+        # DENOISER svgf_atrous is mandatory, not preferred: r_star_split
+        # routes the stars through StarsComposite.slang AFTER the denoiser,
+        # so an `off` cell would pin a starless frame and pass forever --
+        # the same trap #257 caught, and the reason the ReSTIR and aurora
+        # cells also force a denoiser on.
+        #
+        # PIXEL-EXACT (0/0/0), and that is measured rather than stylistic.
+        # bsc_night is a black sky carrying ~64 star pixels, so the
+        # regression these cells exist to catch is tiny in every aggregate.
+        # Rendering with the composite disabled and diffing against the
+        # pinned golden gives:
+        #
+        #     bad=861  max_delta=156.5  mean_delta=0.0193  bad_percent=0.4379
+        #
+        # A COMPLETE star wipeout is a mean delta of 0.019 over 0.44% of
+        # pixels: the matrix's usual 32/4/2 would pass it without blinking.
+        # Threshold 0 is reachable because the render is bit-identical run
+        # to run on this host (two consecutive renders, matching md5), the
+        # standard docs/DETERMINISM_BASELINE.md already set for Vulkan.
+        #
+        # A driver update legitimately re-pins these. If one fails with a
+        # visually identical diff, regenerate rather than loosen, or the
+        # guard loses the teeth measured above.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND vulkan DENOISER svgf_atrous
+            MAX_DELTA 0 MEAN_DELTA 0 FAIL_PERCENT 0)
     endforeach()
-
-    # NIGHT SKY, ON THE GPU (#338). The software cells above cannot see a
-    # sky regression at all -- the software tracer paints its own sky and
-    # runs none of the shader whose radiometry #338 fixed -- so until this
-    # cell there was NOTHING in the matrix that would catch the night sky
-    # breaking. Every committed Windows golden is a software cell.
-    #
-    # DENOISER svgf_atrous is mandatory, not a preference: r_star_split
-    # routes the stars through StarsComposite.slang AFTER the denoiser, and
-    # a `off` override disables the denoiser and takes the composite with
-    # it, so the cell would pin a starless frame and pass forever (the same
-    # trap #257 caught, and the reason the ReSTIR and aurora cells also
-    # force a denoiser).
-    #
-    # TOLERANCES ARE PIXEL-EXACT, and that is the whole point. This frame is
-    # a black sky (background 0.07/255) with about 64 star pixels on it, so
-    # losing EVERY star moves only 0.03% of pixels and a mean delta of
-    # ~0.016. The matrix's usual 32/4/2 would pass a total star wipeout
-    # without blinking. Measured on this host, the render is bit-identical
-    # run to run (two consecutive renders, same md5), which is what
-    # docs/DETERMINISM_BASELINE.md established for this backend -- so
-    # threshold 0 is achievable and is the only setting that actually
-    # guards the thing this cell exists for.
-    #
-    # A driver update legitimately re-pins this cell. If it starts failing
-    # with a diff that is visually identical, that is what happened;
-    # regenerate rather than loosening, so the guard keeps its teeth.
-    pt_add_golden_cell(SCENE bsc_night BACKEND vulkan DENOISER svgf_atrous
-        MAX_DELTA 0 MEAN_DELTA 0 FAIL_PERCENT 0)
 
     # DAY. Software cells keep the defaults (16 / 2 / 1) and keep their
     # ROLE, which is not what it looks like: the software tracer paints its
@@ -1579,7 +1559,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # #280's unit rebase alone every software cell moved by at most one
     # 8-bit level, which is what that control is for.
     foreach(_scene IN ITEMS procedural_noon procedural_evening procedural_dawn)
-        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
+        pt_add_golden_cell(SCENE ${_scene} BACKEND vulkan DENOISER off)
     endforeach()
     # Metal + SVGF a-trous, thresholds measured per cell (#280).
     #   procedural_noon    smallest signal 2.06 (ozone off) -> 4.1x clear
@@ -1738,7 +1718,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # cross-host / cross-driver variance and none of it is masking noise.
     set(_sunset_scenes sunset_horizon sunset_altitude sunset_altitude_planar)
     foreach(_scene IN LISTS _sunset_scenes)
-        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
+        pt_add_golden_cell(SCENE ${_scene} BACKEND vulkan DENOISER off
             MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     endforeach()
     # --- end curved-Earth sunset fixtures ----------------------------------
@@ -2381,7 +2361,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # sky cells -- bright HDR sky pixels exaggerate cross-backend FP
     # roundoff, and the analytic Hosek fit has more transcendental ops
     # (exp/pow per channel) than the procedural gradient.
-    pt_add_golden_cell(SCENE sky_hosek BACKEND software DENOISER off
+    pt_add_golden_cell(SCENE sky_hosek BACKEND vulkan DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Wave 9 hosek-sky ----------------------------------------------
 
@@ -2396,7 +2376,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the new smoke ssbo binding. Tolerances are widened because the
     # in-cloud single-scatter path is more sensitive to per-backend FP
     # ordering than primary-hit Lambert.
-    pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND software DENOISER off
+    pt_add_golden_cell(SCENE smoke_emitter_basic BACKEND vulkan DENOISER off
         MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
     # --- end Fluid Phase 1 ------------------------------------------------
 
@@ -3174,7 +3154,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # below the scene body, so the absolute value wins the last-writer
     # race before Init's end-of-Init late-exec reader fires). Mirrors
     # the phys_rb_smoke wiring.
-    pt_add_golden_cell(SCENE motion_blur_mesh BACKEND software DENOISER off
+    pt_add_golden_cell(SCENE motion_blur_mesh BACKEND vulkan DENOISER off
         MAX_DELTA 64 MEAN_DELTA 8 FAIL_PERCENT 5
         EXTRA "pt_smoke_late_exec ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/motion_blur_mesh_late.cfg")
     # --- end Mesh motion blur fixture -------------------------------------
@@ -3265,8 +3245,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # MoltenVK/RTX path and pbr_textured__vulkan__off.png is captured +
     # committed from that host. See project_full_audit_paused.md (feature
     # "material-editor-and-textures").
-    pt_add_golden_cell(SCENE pbr_textured BACKEND software DENOISER off
-        MAX_DELTA 32 MEAN_DELTA 4 FAIL_PERCENT 2)
+
     # Vulkan cell: golden deferred to #71 (Mac-Vulkan pixel correctness) --
     # registers on Vulkan hosts, no-op on macOS. See the note above.
     pt_add_golden_cell(SCENE pbr_textured BACKEND vulkan   DENOISER off
@@ -3346,18 +3325,21 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the path tracer's accumulator noise floor, same as the sibling ACES
     # cell. Metal/Vulkan apply the identical curve; a dedicated GPU cell can
     # be added later if cross-backend operator drift ever needs pinning.
-    pt_add_golden_cell(SCENE procedural_noon BACKEND software DENOISER off
+    pt_add_golden_cell(SCENE procedural_noon BACKEND vulkan DENOISER off
         TAG agx     EXTRA "r_tonemap_op agx")
-    pt_add_golden_cell(SCENE procedural_noon BACKEND software DENOISER off
+    pt_add_golden_cell(SCENE procedural_noon BACKEND vulkan DENOISER off
         TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
-    # The r_exposure override is the same one the sibling night cells
-    # carry, and for the same reason: these render the software tracer's
-    # painted sky, which the fixture's physically-derived ~2000 night
-    # exposure blows to flat white. See the night-cell block above.
-    pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
-        TAG agx     EXTRA "r_tonemap_op agx" "r_exposure 0.2646")
-    pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
-        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral" "r_exposure 0.2646")
+    # DENOISER svgf_atrous, matching the sibling night cells: r_star_split
+    # puts the stars through StarsComposite.slang AFTER the denoiser, so an
+    # `off` cell here would pin a STARLESS night frame and then happily
+    # validate whichever tone-mapping operator was applied to an empty sky.
+    # The r_exposure override these carried while they were software cells
+    # is gone with the software backend -- on the GPU the fixture's own
+    # physically-derived night exposure is the correct one.
+    pt_add_golden_cell(SCENE bsc_night       BACKEND vulkan DENOISER svgf_atrous
+        TAG agx     EXTRA "r_tonemap_op agx")
+    pt_add_golden_cell(SCENE bsc_night       BACKEND vulkan DENOISER svgf_atrous
+        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
     # --- end Wave 9 tone-mapping operators --------------------------------
 
     # --- Wave 10 bloom + lens dirt ----------------------------------------
@@ -3474,7 +3456,7 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         if(_backend STREQUAL "metal")
             return()
         endif()
-        if(_backend STREQUAL "software" AND NOT WIN32)
+        if(FALSE)
             return()
         endif()
         set(_cell worldframe_${_name}__${_backend})
@@ -3524,9 +3506,9 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
             LABELS  "golden;golden_${_backend};worldframe")
     endfunction()
 
-    pt_add_worldframe_pair(equivalence software
+    pt_add_worldframe_pair(equivalence vulkan
         worldframe_origin worldframe_ecef 0)
-    pt_add_worldframe_pair(rebase software
+    pt_add_worldframe_pair(rebase vulkan
         worldframe_ecef   worldframe_ecef_rebased 0)
     # Metal measures 0 bad pixels on both pairs on an M4 Max, and the
     # fixture is bit-reproducible run-to-run there (verified: same
@@ -3550,33 +3532,33 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the one the golden was captured on (measured: 2 pixels at L2 1 on
     # an M4 Max, present on main too), and that has nothing to do with
     # the switch under test. The committed-golden comparison is still
-    # made -- by golden_cornell_csg__software__off_diff, which is the
+    # made -- by golden_cornell_csg__vulkan__off_diff, which is the
     # cell that owns it.
     if(WIN32)
-        set(_rb_png ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__software__off__rebaseoff.png)
-        set(_rb_wd  ${CMAKE_BINARY_DIR}/golden_workdir/golden_cornell_csg__software__off__rebaseoff)
+        set(_rb_png ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__vulkan__off__rebaseoff.png)
+        set(_rb_wd  ${CMAKE_BINARY_DIR}/golden_workdir/golden_cornell_csg__vulkan__off__rebaseoff)
         file(MAKE_DIRECTORY ${_rb_wd})
-        add_test(NAME golden_cornell_csg__software__off__rebaseoff_render
+        add_test(NAME golden_cornell_csg__vulkan__off__rebaseoff_render
             COMMAND $<TARGET_FILE:pt_render_one_frame>
                 --scene    ${CMAKE_SOURCE_DIR}/tests/goldens/scenes/cornell_csg.cfg
-                --backend  software
+                --backend  vulkan
                 --denoiser off
                 --frames   64
                 --out      ${_rb_png}
                 --extra    "r_origin_rebase_radius 0"
             WORKING_DIRECTORY ${_rb_wd})
-        set_tests_properties(golden_cornell_csg__software__off__rebaseoff_render
-            PROPERTIES TIMEOUT 300 LABELS "golden;golden_software;worldframe")
-        add_test(NAME golden_cornell_csg__software__off__rebaseoff_diff
+        set_tests_properties(golden_cornell_csg__vulkan__off__rebaseoff_render
+            PROPERTIES TIMEOUT 300 LABELS "golden;golden_vulkan;worldframe")
+        add_test(NAME golden_cornell_csg__vulkan__off__rebaseoff_diff
             COMMAND $<TARGET_FILE:imgdiff>
                 ${_rb_png}
-                ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__software__off.png
+                ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__vulkan__off.png
                 --max-delta 0 --mean-delta 0 --fail-percent 0
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-        set_tests_properties(golden_cornell_csg__software__off__rebaseoff_diff
+        set_tests_properties(golden_cornell_csg__vulkan__off__rebaseoff_diff
             PROPERTIES TIMEOUT 30
-            DEPENDS "golden_cornell_csg__software__off__rebaseoff_render;golden_cornell_csg__software__off_render"
-            LABELS  "golden;golden_software;worldframe")
+            DEPENDS "golden_cornell_csg__vulkan__off__rebaseoff_render;golden_cornell_csg__vulkan__off_render"
+            LABELS  "golden;golden_vulkan;worldframe")
     endif()
     # --- end Planetary P1 -------------------------------------------------
 

@@ -419,12 +419,11 @@ void RunAccelSuite(BackendType backend) {
         // claim is the paced loop above.
         CHECK(stalls <= static_cast<std::uint64_t>(kBurst));
     }
-    // Sanity on the counter itself: it is not stuck at zero on a GPU
-    // backend, or the assertions above would be vacuous. The software
-    // backend has no GPU and legitimately reports 0 forever.
-    if (backend != BackendType::Software) {
-        CHECK(stalls_before >= 2u);   // one CreateBLAS + one CreateTLAS
-    }
+    // Sanity on the counter itself: it is not stuck at zero, or the
+    // assertions above would be vacuous. This used to be conditional --
+    // the software backend had no GPU and legitimately reported 0 forever
+    // -- but every remaining backend is a GPU one, so it is unconditional.
+    CHECK(stalls_before >= 2u);   // one CreateBLAS + one CreateTLAS
 
     // ---------------------------------------------------------------
     // 6. Capacity is a hard edge, not a silent truncation. Growing past
@@ -486,10 +485,6 @@ void RunAccelSuite(BackendType backend) {
 }
 
 }  // namespace
-
-TEST_CASE("rhi accel: multi-instance TLAS + update verb (software)") {
-    RunAccelSuite(BackendType::Software);
-}
 
 TEST_CASE("rhi accel: multi-instance TLAS + update verb (vulkan)") {
     // Opt-in, and off by default even on a Vulkan build.

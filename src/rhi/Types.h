@@ -29,17 +29,20 @@ namespace pt::rhi {
 // of this and has its own guard.
 inline constexpr std::size_t kMaxPushConstantBytes = 4096;
 
+// The software backend was removed when the engine went
+// Windows/Vulkan/NVIDIA-exclusive: a CPU tracer cannot exercise any of the
+// hardware the renderer now targets, so it validated nothing the GPU path
+// actually runs. `None` is kept -- headless / no-device startup still needs
+// a backend value that creates no device.
 enum class BackendType : std::uint8_t {
     None = 0,
-    Software,
     Vulkan,
 };
 
 constexpr const char* BackendName(BackendType b) {
     switch (b) {
-        case BackendType::None:     return "none";
-        case BackendType::Software: return "software";
-        case BackendType::Vulkan:   return "vulkan";
+        case BackendType::None:   return "none";
+        case BackendType::Vulkan: return "vulkan";
     }
     return "?";
 }

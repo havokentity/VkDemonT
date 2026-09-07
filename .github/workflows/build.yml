@@ -100,34 +100,26 @@ jobs:
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure --no-tests=error -L nightly
 
-      # Golden-image regression matrix (#45) -- software backend
-      # only. The Windows runner has no usable Vulkan ICD beyond
-      # validation-layer headers, so the vulkan cell would init-fail
-      # the same way the smoke tests would. Software runs via Embree
-      # on the CPU and works on every host.
-      - name: Golden-image regression matrix (software cell)
-        # Pre-clean stale golden_actual/diff PNGs from a cached build
-        # so a render crash can't leave the always-uploaded artifact
-        # populated with a previous run's images. Matches the macOS
-        # job above.
-        id: goldens
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          # Clear stale PNGs but recreate the parent directories:
-          # imgdiff writes via stb_image_write which doesn't auto-mkdir,
-          # and the configure-time `file(MAKE_DIRECTORY)` only fires on
-          # a fresh cmake configure.
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
-              build/win-debug/golden_actual,
-              build/win-debug/golden_diff
-          New-Item -ItemType Directory -Force -Path `
-              build/win-debug/golden_actual,
-              build/win-debug/golden_diff | Out-Null
-          ctest --test-dir build/win-debug --output-on-failure -L golden_software
-          "rc=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          exit 0
+      # Golden-image regression matrix (#45) -- NOT RUN ON THIS RUNNER.
+      #
+      # The matrix used to run its software-backend cells here, because the
+      # software tracer ran on any CPU via Embree. That backend has been
+      # removed: this engine is Windows/Vulkan/NVIDIA-exclusive, and a CPU
+      # tracer that paints its own sky and shares no code with the shaders
+      # could not validate the renderer it was supposedly guarding. Every
+      # golden cell is now a vulkan cell.
+      #
+      # GitHub-hosted windows-latest has no usable Vulkan ICD, so those cells
+      # cannot run here at all -- the same reason the vulkan smoke tests below
+      # are commented out. Running the matrix therefore requires a GPU runner.
+      #
+      # Until a self-hosted RTX runner is attached, the golden matrix is a
+      # LOCAL gate: `ctest -R golden` on a machine with the GPU. That is a real
+      # reduction in CI coverage and is stated here rather than quietly
+      # dropped. The unit tests above still run on every push.
 
+      # Kept so a future GPU runner has somewhere to publish diffs; it
+      # uploads nothing while the matrix does not run here.
       - name: Upload golden-image diff artefacts
         if: always()
         uses: actions/upload-artifact@v4

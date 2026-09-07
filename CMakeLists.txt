@@ -74,7 +74,6 @@ option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined (clang/gcc)
 # breaking anyone.  Local devs who want a faster build (no need for
 # AVX-512 perf on their own machine) can flip this OFF in their cmake
 # invocation.
-option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatched; +~25% build time)" ON)
 # Unit tests. Default ON for developer builds. The option exists for
 # anyone wanting to trim configure time on a build that genuinely
 # can't run tests (CI release-staging step, embedded systems, etc.) --

@@ -345,7 +345,7 @@ namespace cvar {
             "list. 0 = strict exact-match like before.",
             CVAR_ARCHIVE);
     // Default backend: native Vulkan + RT extensions on Windows/Linux.
-    PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "vulkan",   "One of none|vulkan. The software backend was removed when the engine went Vulkan-exclusive.", CVAR_ARCHIVE);
     // Software backend's present path on Windows. Default 'vulkan' uses
     // a minimal VkInstance/VkSurface/VkSwapchain owned by SoftwareDevice
     // so the window stays in DXGI flip-model presentation throughout
@@ -3021,8 +3021,7 @@ bool Engine::Init() {
             v->value = "vulkan";
         }
         BackendType t = BackendType::None;
-        if      (v->value == "software") t = BackendType::Software;
-        else if (v->value == "vulkan")   t = BackendType::Vulkan;
+        if (v->value == "vulkan") t = BackendType::Vulkan;
         if (t != BackendType::None) RequestBackendSwitch(t);
     }
 
@@ -3857,8 +3856,14 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // path runs as the loop exits).
     bool need_recreate = false;
     bool need_warn     = false;
-    if (to == BackendType::Software &&
-        current_backend_ == BackendType::Vulkan) {
+    // Vulkan -> software was the only switch that needed an HWND
+    // recreate (Microsoft's DXGI flip-model lockout leaves GDI unable to
+    // blit to an HWND that has hosted a swapchain). With the software
+    // backend gone there is no such switch left, so this is dead and the
+    // condition is pinned false rather than deleted, keeping the
+    // surrounding warn/recreate machinery intact for any future backend
+    // that needs it.
+    if (false) {
         if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit");
             v && v->value == "gdi") {
             std::string mode = "auto";
@@ -17823,7 +17828,7 @@ void Engine::RegisterCommands() {
         constexpr auto kAny      = pt::console::CVAR_VALUE_ANY;
         constexpr auto kWinLinux = pt::console::CVAR_VALUE_WIN |
                                    pt::console::CVAR_VALUE_LINUX;
-        v->allowed_values        = {"none", "software", "vulkan"};
+        v->allowed_values        = {"none", "vulkan"};
         v->allowed_value_flags   = {
             kAny,       // none
             kAny,       // software
@@ -17831,8 +17836,7 @@ void Engine::RegisterCommands() {
         };
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
-            if      (cv.value == "software") t = BackendType::Software;
-            else if (cv.value == "vulkan")   t = BackendType::Vulkan;
+            if (cv.value == "vulkan") t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
     }
@@ -25216,9 +25220,8 @@ bool Engine::OceanGpuAvailable() const {
     // The GPU ocean compute pre-pass only ever ran on the now-retired
     // Metal backend; no live backend registers a real pipeline today, so
     // in practice this returns false via the id==0 test above until a
-    // Vulkan ocean pipeline lands. The software guard remains so that if
-    // one does, Software still correctly falls back to the CPU solver.
-    if (current_backend_ == BackendType::Software) return false;
+    // Vulkan ocean pipeline lands. The software fallback guard that used to
+    // sit here went with the software backend itself.
     auto& C = pt::console::Console::Get();
     if (auto* v = C.FindCVar("r_ocean_gpu")) {
         if (v->GetInt() == 0) return false;

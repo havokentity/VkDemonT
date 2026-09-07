@@ -126,38 +126,14 @@ FetchContent_Declare(nlohmann_json
     SYSTEM
 )
 
-# --- embree: CPU BVH + ray-triangle intersection for the Software RHI -----
-# Triangle-only BVH for the software backend's mesh path. We disable
-# every geometry type except triangles, ray packets (single rays are
-# fine here -- the engine fans out across pixels at the dispatcher),
-# ISPC (no need for cross-platform SIMD codegen at this scale), and
-# tutorials. Tasking system goes INTERNAL so we don't drag TBB into
-# this codebase. ARM64 / Apple Silicon support has been first-class
-# since Embree 4.x; the same source tree builds natively on
-# x86_64 Windows + NVIDIA RTX too.
-#
-# Two acquisition paths, in order of preference:
-#   1. Pre-built artefact from .github/workflows/prebuild-embree.yml,
-#      consumed via cmake/EmbreeBinary.cmake.  Sets EMBREE_PREBUILT_FOUND
-#      = TRUE and an `embree` IMPORTED STATIC target; skips the slow
-#      from-source compile entirely (~30s download vs ~10-15min build).
-#   2. Source compile via FetchContent.  Triggered when EmbreeBinary
-#      couldn't find a prebuilt for the host platform / config -- new
-#      Embree version, ISA flag bump, unsupported platform, etc.  The
-#      first such build is slow; prebuild-embree.yml then runs and
-#      uploads the artefact so the NEXT configure hits the fast path.
-#
-# Both paths read their settings from cmake/EmbreeConfig.cmake (single
-# source of truth for version + flags) so they can't drift.
-include(${CMAKE_CURRENT_LIST_DIR}/EmbreeBinary.cmake)
-if(NOT EMBREE_PREBUILT_FOUND)
-    pt_apply_embree_config()
-    FetchContent_Declare(embree
-        URL       ${EMBREE_VENDORED_URL}
-        URL_HASH  ${EMBREE_VENDORED_URL_HASH}
-        SYSTEM
-    )
-endif()
+# --- embree: REMOVED ---------------------------------------------------------
+# Embree existed solely to give the software RHI a CPU BVH + ray-triangle
+# intersector. That backend is gone (the engine is Windows/Vulkan/NVIDIA-only),
+# and nothing else ever linked it -- the remaining references across the tree
+# were all comments. Dropping it removes the slowest dependency in the build:
+# the from-source FetchContent path took ~10-15 minutes, which is why
+# cmake/EmbreeBinary.cmake and .github/workflows/prebuild-embree.yml existed to
+# cache a prebuilt artefact. All three are deleted together.
 
 # --- manifold: mesh CSG (P9 headline) --------------------------------------
 # Robust manifold-mesh boolean ops (union/intersect/subtract). Builds with
@@ -281,37 +257,6 @@ else()
     set(PT_DEP_UNDEF_DEBUG_FLAGS -UDEBUG)
 endif()
 
-# Embree compile + per-target tweaks below are only relevant when we're
-# building Embree from source (EmbreeBinary.cmake didn't find a prebuilt
-# for this host).  The prebuilt path is a single IMPORTED target with no
-# in-tree sources to compile, so there's nothing to wrap in the C++17
-# block and no sub-targets (sys / math / simd / lexers / tasking) to
-# tweak warning flags on.
-if(NOT EMBREE_PREBUILT_FOUND)
-    # Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
-    # includes (<type_traits>, <exception>) that libc++ no longer pulls in
-    # automatically when the consumer compiles with C++20+. Building Embree
-    # itself in C++17 sidesteps the issue without forking; consumers of
-    # Embree (our SoftwareDevice TU) keep building in the project's standard
-    # C++23. Block scope (see Manifold pattern below) confines the override
-    # so it doesn't leak to subsequent fetches.
-    block()
-        set(CMAKE_CXX_STANDARD 17)
-        set(CMAKE_CXX_STANDARD_REQUIRED ON)
-        FetchContent_MakeAvailable(embree)
-    endblock()
-    # Silence Embree's vendored warning-as-noise so the build log stays
-    # readable; the lib has ~hundreds of warnings we can't fix without
-    # forking the upstream project.
-    if(TARGET embree)
-        target_compile_options(embree PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
-    endif()
-    foreach(_t sys math simd lexers tasking)
-        if(TARGET ${_t})
-            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
-        endif()
-    endforeach()
-endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()
