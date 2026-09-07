@@ -266,9 +266,11 @@ public:
     // seam. All four route to ngx_upscaler_, which is lazily created on
     // the first call and latches its own failure.
     bool SupportsUpscaler() const override;
+    bool SupportsRayReconstruction() override;
     bool QueryUpscalerSettings(UpscalerMode mode,
                                std::uint32_t display_width,
                                std::uint32_t display_height,
+                               bool ray_reconstruction,
                                UpscalerSettings& out) override;
     bool Upscale(const UpscaleDesc& d) override;
     void ReleaseUpscalerFeature() override;

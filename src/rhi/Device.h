@@ -575,15 +575,33 @@ public:
     // OptiX / NRD unavailability paths.
     virtual bool SupportsUpscaler() const { return false; }
 
+    // True iff this backend can run DLSS Ray Reconstruction, which is a
+    // STRICTLY narrower question than SupportsUpscaler(): RR is a
+    // separate NGX feature, shipping in a separate DLL, with its own
+    // hardware and driver floor. A machine with working Super
+    // Resolution and no RR is an ordinary configuration, not an error.
+    //
+    // The engine must consult this BEFORE it selects the RR denoiser
+    // kind, because selecting it is what stands the SVGF / NRD / OptiX
+    // chain down -- discovering the truth at Upscale() time would mean a
+    // frame that is neither denoised nor upscaled. Non-const for the
+    // same reason QueryUpscalerSettings is: the answer may require
+    // lazily initialising the runtime.
+    virtual bool SupportsRayReconstruction() { return false; }
+
     // Ask the runtime what render extent `mode` wants for a given
     // display extent, once per mode change and per swapchain resize.
     // Returns false when the mode is unavailable on this
     // hardware/driver/runtime, leaving `out.supported` false and the
     // extents zero. The caller must treat that as "fall back to Off",
     // never as a size to clamp.
+    // `ray_reconstruction` picks which of the two runtimes is asked --
+    // see Upscaler::QueryOptimalSettings for why they are not
+    // interchangeable.
     virtual bool QueryUpscalerSettings(UpscalerMode /*mode*/,
                                        std::uint32_t /*display_width*/,
                                        std::uint32_t /*display_height*/,
+                                       bool /*ray_reconstruction*/,
                                        UpscalerSettings& /*out*/) { return false; }
 
     // Record the upscale into the frame's in-flight command buffer.

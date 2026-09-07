@@ -188,16 +188,39 @@ struct UpscaleDesc {
     // rather than half-honour it: silently running SR when RR was asked
     // for would leave the caller's denoiser turned off and the image
     // noisy, which looks like a quality regression rather than a missing
-    // feature.
+    // feature. A backend that DOES implement it must refuse the frame
+    // (return false) rather than fall back to SR behind the caller's
+    // back, because by then the caller has already stood its denoiser
+    // down -- see RayReconstructionAvailable().
     bool          ray_reconstruction = false;
-    TextureHandle albedo_in;                  // diffuse albedo, .rgb
+    // The four MANDATORY RR guides. All at the render extent.
+    // (DLSS-RR Integration Guide SS3.4.1-3.4.4.)
+    TextureHandle albedo_in;                  // diffuse albedo, .rgb, NOT sRGB
     TextureHandle specular_albedo_in;         // integrated specular reflectance
-    TextureHandle normal_in;                  // world-space shading normal
-    TextureHandle roughness_in;               // R32F linear roughness
-    TextureHandle specular_hit_distance_in;   // optional; 0 = not supplied
-    // Column-major 4x4, 16 floats each. RR wants the two factors
-    // separately; the engine's push carries only the combined
-    // view*proj, so these are passed alongside rather than derived.
+    TextureHandle normal_in;                  // shading normal, world or view space
+    TextureHandle roughness_in;               // R32F LINEAR roughness
+    // Optional. World-space distance from the specular ray origin (which
+    // must lie ON the primary surface) to the reflection's hit point --
+    // verified against the DLSS-RR Integration Guide SS3.4.9, which is
+    // also where the "only needed if specular motion vectors are not
+    // provided" rule comes from. This engine supplies it and not
+    // specular motion vectors. 0 = not supplied.
+    TextureHandle specular_hit_distance_in;
+    // 16 floats each, and REQUIRED whenever specular_hit_distance_in is
+    // supplied: RR builds the specular motion field from the hit
+    // distance by projecting the virtual reflected point, which needs
+    // both factors separately (the engine's push carries only the
+    // combined view*proj).
+    //
+    // LAYOUT, because this is the sort of thing that silently produces a
+    // plausible-but-wrong image: the guide (SS3.4.9) specifies "Row Major
+    // Order and left multiplication". A row-major left-multiplied matrix
+    // and a column-major right-multiplied one describing the SAME
+    // transform have IDENTICAL memory layouts -- each is the transpose
+    // of the other, and transposing a matrix is exactly what swapping
+    // row- and column-major storage does. So glm's column-major
+    // value_ptr() is already the bytes NGX wants and must NOT be
+    // transposed on the way in.
     const float*  world_to_view = nullptr;
     const float*  view_to_clip  = nullptr;
 };
@@ -222,12 +245,31 @@ public:
     // frame has no path to succeed and would only spam the log.
     virtual bool Available() const = 0;
 
+    // True iff the runtime, the driver and the GPU can all do Ray
+    // Reconstruction specifically. SEPARATE from Available() because RR
+    // is a different NGX feature with its own DLL, its own hardware
+    // floor and its own capability probe: a machine can have working
+    // Super Resolution and no RR at all, and the caller has to learn
+    // that BEFORE it stands its denoiser down, not on the frame the
+    // evaluate fails.
+    //
+    // Latched and logged once on the first failing probe, exactly like
+    // Available().
+    virtual bool RayReconstructionAvailable() { return false; }
+
     // Ask the runtime what render extent `mode` wants for this display
     // extent. Returns false (and leaves out.supported false) when the
     // mode is unavailable. MUST NOT be answered from a table.
+    //
+    // `ray_reconstruction` selects WHICH runtime is asked. RR and SR
+    // publish separate optimal-settings entry points, and while they
+    // return the same ladder today, asking the one that is not going to
+    // run the frame is how a create-vs-feed extent mismatch gets
+    // introduced the first time they diverge.
     virtual bool QueryOptimalSettings(UpscalerMode  mode,
                                       std::uint32_t display_width,
                                       std::uint32_t display_height,
+                                      bool          ray_reconstruction,
                                       UpscalerSettings& out) = 0;
 
     // Record the upscale into the caller's in-flight command buffer.

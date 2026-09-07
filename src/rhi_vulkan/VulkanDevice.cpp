@@ -5495,9 +5495,27 @@ bool VulkanDevice::SupportsUpscaler() const {
     return ngx_upscaler_->Available();
 }
 
+// Narrower than SupportsUpscaler(): a machine can have working Super
+// Resolution and no Ray Reconstruction. Non-const because it may have to
+// bring the runtime up to answer -- see the seam's comment for why the
+// engine must ask this before it stands its denoiser down.
+bool VulkanDevice::SupportsRayReconstruction() {
+    if (device_ == VK_NULL_HANDLE) return false;
+    if (ngx_upscaler_failed_)      return false;
+    if (ngx_upscaler_ == nullptr) {
+        ngx_upscaler_ = std::make_unique<VulkanNgxUpscaler>(this);
+    }
+    if (!ngx_upscaler_->Init()) {
+        ngx_upscaler_failed_ = true;
+        return false;
+    }
+    return ngx_upscaler_->RayReconstructionAvailable();
+}
+
 bool VulkanDevice::QueryUpscalerSettings(UpscalerMode  mode,
                                          std::uint32_t display_width,
                                          std::uint32_t display_height,
+                                         bool          ray_reconstruction,
                                          UpscalerSettings& out) {
     out = UpscalerSettings{};
     if (device_ == VK_NULL_HANDLE) return false;
@@ -5512,7 +5530,8 @@ bool VulkanDevice::QueryUpscalerSettings(UpscalerMode  mode,
         return false;
     }
     return ngx_upscaler_->QueryOptimalSettings(mode, display_width,
-                                               display_height, out);
+                                               display_height,
+                                               ray_reconstruction, out);
 }
 
 bool VulkanDevice::Upscale(const UpscaleDesc& d) {

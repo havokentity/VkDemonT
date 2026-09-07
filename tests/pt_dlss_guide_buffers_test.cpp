@@ -385,12 +385,33 @@ TEST_CASE("roughness guide is perceptual roughness, with the ocean fold") {
     CHECK(Count(pt, "roughness_tex.Store(tid, guide_rough);") == 1);
 }
 
-TEST_CASE("the guide trio is gated on RR intent, not on a dead denoiser kind") {
+TEST_CASE("the guide trio is gated on the resolved RR kind, not on a dead denoiser kind") {
     const std::string eng = Slurp(PT_ENGINE_CPP_PATH);
-    // One gate, and it reads the DLSS cvars. The MetalFX enumeration that
-    // made these buffers dead code must not come back.
-    CHECK(Count(eng,
-        "const bool want_specular_guidance_gbuffers = DlssRayReconstructionRequested();") == 1);
+    // One gate, and it reads the RESOLVED denoiser kind.
+    //
+    // This pinned `DlssRayReconstructionRequested()` (raw cvar intent) when it
+    // was written, which was the right shape at the time -- it replaced a
+    // MetalFX enumeration no live backend could satisfy, which is how these
+    // buffers became dead code. Wiring the NGX RR evaluate then showed cvar
+    // intent was still wrong, one step subtler: the SIBLING gates for normal
+    // and albedo enumerate denoiser KINDS, so `r_dlss_rr 1` with
+    // `r_denoiser off` allocated the specular trio while leaving two of RR's
+    // four MANDATORY guides nonexistent. Resolving to the kind puts all four
+    // on the same footing, and additionally means a GPU that cannot do RR
+    // does not allocate ~50 MB of buffers nothing will read.
+    // Pinned as two single-line substrings rather than one multi-line
+    // literal: this file has CRLF line endings, so a literal newline
+    // escape embedded in the needle would never match.
+    CHECK(Count(eng, "const bool want_specular_guidance_gbuffers =") == 1);
+    // TWO sites resolve to the RR kind, and both are meant to. The guide gate
+    // above decides whether the buffers exist; rr_is_denoiser decides whether
+    // the SVGF/NRD/OptiX chain stands down so RR receives raw Monte-Carlo
+    // radiance instead of an already-denoised frame. Pinning the count at 2
+    // rather than 1 is the point: if either disappears, RR is either fed
+    // buffers it does not have or fed a signal something else already
+    // filtered.
+    CHECK(Count(eng, "const bool rr_is_denoiser =") == 1);
+    CHECK(Count(eng, "(denoiser_kind_ == DenoiserKind::DlssRayReconstruction);") == 2);
     // The dead kinds may still be NAMED in a comment that records why the
     // trio was unreachable -- that history is worth keeping. What must not
     // come back is a live comparison against them.

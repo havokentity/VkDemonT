@@ -752,17 +752,27 @@ namespace cvar {
             "REPLACES the denoiser: Ray Reconstruction is a denoiser and an "
             "upscaler in one pass, so stacking it on top of SVGF or NRD would "
             "denoise twice and lose detail the second pass cannot recover. "
-            "When this is on the engine forces the denoiser chain off and "
-            "logs the reason once -- it is not a silent override.\n"
+            "When this is on the engine stands the denoiser chain down and "
+            "logs the reason once -- it is not a silent override. "
+            "r_denoiser keeps its value and takes effect again the moment "
+            "this returns to 0; internally the engine selects a dedicated "
+            "denoiser kind rather than zeroing r_denoiser, because the "
+            "denoiser flag also gates G-buffer allocation, the celestials "
+            "composite, cloud transmittance, the SIGMA shadow buffer and "
+            "the ReSTIR dispatch, none of which RR wants turned off.\n"
             "Requires r_dlss != off -- RR is a mode of the same feature, not "
-            "an independent one. The specular guidance G-buffers it needs "
-            "(specular albedo, roughness, specular hit distance) are "
-            "allocated off THIS cvar: they used to be gated on the MetalFX "
-            "denoiser kinds, which no live backend selected, which is how "
-            "they came to be allocated, written and read by nobody. Setting "
-            "this is what brings them into existence, and it has to happen "
-            "before the NGX feature is created because DLSS-RR is handed its "
-            "guide buffers at creation time.",
+            "an independent one. Falls back to Super Resolution with one log "
+            "line if the GPU, driver or runtime cannot do RR (it ships in "
+            "its own nvngx_dlssd.dll, so a machine can have working DLSS and "
+            "no Ray Reconstruction).\n"
+            "The guide buffers it needs -- diffuse albedo, specular albedo, "
+            "world-space normal and linear roughness are MANDATORY, specular "
+            "hit distance is optional but supplied -- are allocated off the "
+            "RESOLVED state of this cvar: they used to be gated on the "
+            "MetalFX denoiser kinds, which no live backend selected, which "
+            "is how they came to be allocated, written and read by nobody. "
+            "Allocation has to happen before the NGX feature is created "
+            "because DLSS-RR is handed its guide buffers at creation time.",
             CVAR_ARCHIVE);
     // --- end DLSS ----------------------------------------------------------
     PT_CVAR(r_render_scale, "1.0",
@@ -2740,6 +2750,32 @@ bool Engine::DlssRayReconstructionRequested() const {
     if (!DlssRequested()) return false;
     return rr->GetInt() != 0;
 }
+// See the declaration in Engine.h. The backend probe is cached because
+// it brings the NGX runtime up and its answer is fixed for the session
+// (missing nvngx_dlssd.dll, driver too old, GPU without the silicon --
+// none of which change while the process runs).
+bool Engine::DlssRayReconstructionActive() {
+    if (!DlssRayReconstructionRequested()) return false;
+    if (device_ == nullptr)                return false;
+    if (dlss_rr_supported_ < 0) {
+        dlss_rr_supported_ = device_->SupportsRayReconstruction() ? 1 : 0;
+    }
+    if (dlss_rr_supported_ == 0) {
+        // THE degradation line, matching how SR and NRD degrade: say what
+        // was asked for, say what runs instead, and do not repeat the
+        // backend's reason -- it has already logged which check said no.
+        if (!dlss_rr_degraded_logged_) {
+            LOG_WARN("engine: r_dlss_rr is set but DLSS Ray Reconstruction is "
+                     "unavailable on this build / GPU / driver -- falling "
+                     "back to Super Resolution, and r_denoiser keeps doing "
+                     "the denoising. See the preceding `DLSS:` line for which "
+                     "check failed.");
+            dlss_rr_degraded_logged_ = true;
+        }
+        return false;
+    }
+    return true;
+}
 // See the declaration in Engine.h for why this reads cvars rather than a
 // resolved DLSS state.
 bool Engine::DlssRequested() const {
@@ -2756,17 +2792,24 @@ bool Engine::ResolveDlssForDisplay(pt::rhi::UpscalerMode mode,
     if (device_ == nullptr)                 return false;
     if (display_w == 0 || display_h == 0)   return false;
 
+    // RR and SR publish separate optimal-settings entry points, so the
+    // flag is part of the QUESTION and therefore part of the cache key --
+    // otherwise toggling r_dlss_rr at the console would keep serving the
+    // other runtime's cached extent.
+    const bool want_rr = DlssRayReconstructionActive();
     const bool query_stale = (dlss_query_mode_      != mode)      ||
                              (dlss_query_display_w_ != display_w) ||
-                             (dlss_query_display_h_ != display_h);
+                             (dlss_query_display_h_ != display_h) ||
+                             (dlss_query_rr_        != want_rr);
     if (query_stale) {
         pt::rhi::UpscalerSettings s{};
-        const bool ok =
-            device_->QueryUpscalerSettings(mode, display_w, display_h, s);
+        const bool ok = device_->QueryUpscalerSettings(mode, display_w,
+                                                       display_h, want_rr, s);
         dlss_settings_        = ok ? s : pt::rhi::UpscalerSettings{};
         dlss_query_mode_      = mode;
         dlss_query_display_w_ = display_w;
         dlss_query_display_h_ = display_h;
+        dlss_query_rr_        = want_rr;
 
         std::string mode_str = "off";
         if (auto* v = pt::console::Console::Get().FindCVar("r_dlss")) {
@@ -8252,24 +8295,13 @@ void Engine::RenderFrame() {
             dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
             dlss_query_display_w_ = 0;
             dlss_query_display_h_ = 0;
+            dlss_query_rr_        = false;
         }
         dlss_mode_   = resolved_dlss;
         dlss_active_ = (resolved_dlss != pt::rhi::UpscalerMode::Off);
-
-        // Ray Reconstruction: the cvar exists and its G-buffers are
-        // allocated off it, but the NGX RR feature belongs to a separate
-        // workstream. Say so once rather than letting a user conclude
-        // r_dlss_rr 1 is doing something.
-        if (dlss_active_ && DlssRayReconstructionRequested() &&
-            !dlss_rr_pending_logged_) {
-            LOG_INFO("engine: r_dlss_rr is set. The specular guidance "
-                     "G-buffers are being allocated and written, but the NGX "
-                     "Ray Reconstruction feature is not wired yet -- this "
-                     "frame runs Super Resolution and whatever r_denoiser "
-                     "selects still does the denoising.");
-            dlss_rr_pending_logged_ = true;
-        }
-        if (!dlss_active_) dlss_rr_pending_logged_ = false;
+        // Re-arm the degradation line when DLSS goes away entirely, so a
+        // later genuine RR failure is still said out loud.
+        if (!dlss_active_) dlss_rr_degraded_logged_ = false;
     }
     // --- end DLSS ----------------------------------------------------------
 
@@ -8308,6 +8340,49 @@ void Engine::RenderFrame() {
         // lazily on first dispatch). Stay on the noisy path until
         // SupportsDenoise flips true.
         want_kind = DenoiserKind::Off;
+    }
+    // --- DLSS Ray Reconstruction REPLACES the denoiser chain -------------
+    //
+    // docs/DLSS_INTEGRATION_PLAN.md SS5.1. RR is a denoiser and an upscaler
+    // in one NGX feature; running SVGF / NRD / OptiX in front of it would
+    // denoise twice, and the second pass would be fed a spatially filtered
+    // image when it was trained on Monte-Carlo noise -- strictly worse
+    // than feeding it the noisy frame.
+    //
+    // The override happens HERE, on `want_kind`, rather than by forcing
+    // `r_denoiser off`. `denoiser_active_` is load-bearing for far more
+    // than denoising (G-buffer allocation, the celestials composite gate,
+    // cloud transmittance, the SIGMA shadow buffer, the ReSTIR dispatch),
+    // so standing the chain down by zeroing the cvar would take all of
+    // that with it -- including the very guide buffers RR needs. A
+    // dedicated kind keeps the machinery alive and swaps only the
+    // dispatch, which is exactly what plan SS5.1 prescribes.
+    //
+    // Still gated on SupportsDenoise: RR's own output still goes through
+    // Denoise(Kind::FinalizeOnly) for the bloom + tonemap + swapchain
+    // write at the display extent.
+    //
+    // r_denoiser is LATCHED BUT INERT while this is on, and that is said
+    // out loud exactly once -- the same courtesy the engine already
+    // extends to r_svgf_atrous_passes, and what r_dlss_rr's own docstring
+    // promises.
+    if (dlss_active_ && DlssRayReconstructionActive() &&
+        device_->SupportsDenoise()) {
+        if (want_kind != DenoiserKind::Off && !dlss_rr_inert_denoiser_logged_) {
+            std::string denoiser_str = "(unset)";
+            if (auto* v = C.FindCVar("r_denoiser")) denoiser_str = v->value;
+            LOG_INFO("engine: r_dlss_rr 1 overrides r_denoiser={} -- DLSS Ray "
+                     "Reconstruction IS the denoiser, so the {} chain is "
+                     "standing down for as long as RR is on. r_denoiser keeps "
+                     "its value and takes effect again the moment r_dlss_rr "
+                     "returns to 0; this is not a silent override.",
+                     denoiser_str, denoiser_str);
+            dlss_rr_inert_denoiser_logged_ = true;
+        }
+        want_kind = DenoiserKind::DlssRayReconstruction;
+    } else {
+        // Re-arm so a later re-engage says it again.
+        dlss_rr_inert_denoiser_logged_ = false;
     }
     // `denoiser_active_` is the engine's name for "the G-buffer
     // machinery is alive", not for "a denoiser is running" -- it gates
@@ -8393,6 +8468,13 @@ void Engine::RenderFrame() {
             LOG_INFO("engine: r_denoiser=optix_temporal_hdr_aov -- NVIDIA OptiX denoiser "
                      "(TEMPORAL_AOV model: motion + history + albedo + normal guides) "
                      "via CUDA-Vulkan interop active");
+        } else if (want_kind == DenoiserKind::DlssRayReconstruction) {
+            LOG_INFO("engine: r_dlss_rr=1 -- NVIDIA DLSS Ray Reconstruction "
+                     "denoises AND upscales in one NGX pass. The path tracer's "
+                     "raw per-frame radiance goes straight to RR (no SVGF / "
+                     "NRD / OptiX in front of it), guided by diffuse albedo, "
+                     "specular albedo, world-space normal, linear roughness "
+                     "and specular hit distance at the render extent.");
         }
         if (want_denoiser && device_) {
             // Kind SWITCH with the denoiser still on: free the
@@ -8403,7 +8485,12 @@ void Engine::RenderFrame() {
             // the write gates -- keyed on texture-id != 0 -- kept the
             // path tracer writing G-buffers nothing reads) until the
             // denoiser was toggled fully off.
-            const bool new_kind_wants_specular = DlssRayReconstructionRequested();
+            // want_kind, not denoiser_kind_: this runs inside the
+            // transition branch, where denoiser_kind_ has just been
+            // assigned want_kind, but naming the new kind directly says
+            // what is meant.
+            const bool new_kind_wants_specular =
+                (want_kind == DenoiserKind::DlssRayReconstruction);
             if (!new_kind_wants_specular) {
                 if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
                 if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -8879,12 +8966,20 @@ void Engine::RenderFrame() {
     // MetalFX kinds here so the engine allocates + fills the G-buffer
     // for them too. The plain OptiX HDR variants (Hdr + TemporalHdr)
     // don't take normals.
+    // DlssRayReconstruction is in this list because RR takes normals as a
+    // MANDATORY guide (DLSS-RR Integration Guide SS3.4.3) -- and because
+    // this list, being an enumeration of KINDS, is precisely where the
+    // "r_dlss_rr 1 with r_denoiser off allocates nothing" coupling lived:
+    // with the chain off the kind was Off, so the normal and albedo
+    // G-buffers RR cannot run without were never created. Giving RR its
+    // own kind (plan SS5.1) is what lets it appear here at all.
     const bool want_normal_gbuffer =
         (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
-         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
+         denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
+         denoiser_kind_ == DenoiserKind::DlssRayReconstruction);
     // Albedo G-buffer: OptiX AOV variants (HdrAov + TemporalHdrAov),
     // MetalFX (and SVGF->MetalFX chained modes, since MetalFX is the
     // finalizer there too), AND the pure SVGF/NRD kinds (issue #119,
@@ -8905,7 +9000,10 @@ void Engine::RenderFrame() {
          // Nrd are the gbuffer set now that the MetalFX kinds are gone.
          denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
-         denoiser_kind_ == DenoiserKind::Nrd);
+         denoiser_kind_ == DenoiserKind::Nrd                 ||
+         // RR's diffuse albedo guide (SS3.4.1). Mandatory, not a
+         // demodulation convenience as it is for the SVGF kinds above.
+         denoiser_kind_ == DenoiserKind::DlssRayReconstruction);
     // MetalFX specular-guidance G-buffers (issue #118). Apple's
     // MTLFXTemporalDenoisedScaler accepts specularAlbedo + roughness +
     // specularHitDistance as guidance inputs; with PR #114's normal +
@@ -8927,20 +9025,26 @@ void Engine::RenderFrame() {
     // listing what blocks Ray Reconstruction -- which needs exactly these
     // three -- and the MetalFX removal is what frees them.
     //
-    // Gated on RR INTENT rather than on a resolved denoiser kind, because
-    // allocation has to happen before the NGX feature is created: DLSS-RR is
-    // handed its guide buffers at creation time, not per-frame.
+    // Now gated on the RESOLVED kind rather than on RR intent, and that
+    // is the fix for the coupling this comment used to merely record.
     //
-    // KNOWN REMAINING COUPLING, stated rather than hidden: the allocation
-    // site this flag reaches sits inside `if (denoiser_active_)`, so asking
-    // for RR with `r_denoiser off` still allocates nothing. Every other
-    // G-buffer the path tracer produces (depth, motion, normal, albedo) has
-    // the same shape, so untangling it is one change for all of them, not a
-    // special case for these three -- and it belongs to whoever wires the
-    // NGX evaluate, because plan section 5.1 has RR REPLACING the denoiser
-    // chain rather than composing with it. Until then, exercising the guide
-    // writes needs an r_denoiser kind selected alongside r_dlss_rr.
-    const bool want_specular_guidance_gbuffers = DlssRayReconstructionRequested();
+    // THE COUPLING THAT WAS HERE: the flag was `DlssRayReconstructionRequested()`
+    // -- pure cvar intent -- while the allocation site it reaches sits
+    // inside `if (denoiser_active_)`, and the sibling normal/albedo gates
+    // enumerate denoiser KINDS. So `r_dlss_rr 1` with `r_denoiser off`
+    // asked for the specular trio while the kind stayed Off, which meant
+    // normals and diffuse albedo -- two of RR's four MANDATORY guides --
+    // were never allocated. RR would then have been handed a partial guide
+    // set, which is undefined rather than merely degraded.
+    //
+    // Giving RR its own DenoiserKind (plan SS5.1) untangles it without a
+    // special case: the kind is selected from r_dlss_rr, `denoiser_active_`
+    // follows the kind as it does for every other denoiser, and all four
+    // guides plus the trio now come from the same enumeration. The
+    // resolved form also means a GPU that cannot do RR does not allocate
+    // ~50 MB of guide buffers nothing will read.
+    const bool want_specular_guidance_gbuffers =
+        (denoiser_kind_ == DenoiserKind::DlssRayReconstruction);
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -9775,13 +9879,14 @@ void Engine::RenderFrame() {
     // Engine slots 11/12/13 -> vk::bindings 24/25/26: the MetalFX
     // specular-guidance trio (issue #118). Path tracer writes them
     // alongside the existing G-buffers when the write_specular_*_gbuffer
-    // push gates are non-zero; MetalFX (and SVGF->MetalFX chained
-    // kinds) consume them via MTLFXTemporalDenoisedScalerDescriptor's
-    // specularAlbedoTexture / roughnessTexture / specularHitDistanceTexture.
-    // Engine allocates them only when want_specular_guidance_gbuffers
-    // is set (see allocation block above); the bind is gated on
-    // non-zero id so non-MetalFX dispatches leave the slots unbound
-    // and the matching push gates elide the shader writes.
+    // push gates are non-zero. The consumer is DLSS Ray Reconstruction,
+    // which reads them as pInSpecularAlbedo / pInRoughness /
+    // pInSpecularHitDistance (the MetalFX descriptor this was originally
+    // written for went with the macOS backend). Engine allocates them
+    // only when want_specular_guidance_gbuffers is set (see the
+    // allocation block above); the bind is gated on non-zero id so every
+    // other dispatch leaves the slots unbound and the matching push
+    // gates elide the shader writes.
     if (denoiser_active_ && specular_albedo_tex_id_ != 0) {
         cb->BindStorageTexture(11, pt::rhi::TextureHandle{specular_albedo_tex_id_});
     }
@@ -10647,9 +10752,9 @@ void Engine::RenderFrame() {
     // normal/albedo gates: only ever set when the engine actually owns the
     // matching texture for this dispatch. The host's
     // want_specular_guidance_gbuffers flag drives allocation (it is
-    // DlssRayReconstructionRequested(); it used to name the MetalFX denoiser
-    // kinds, which no live backend could select -- that is what made the
-    // trio dead code); the runtime gate here is the descriptor-
+    // denoiser_kind_ == DlssRayReconstruction; it used to name the MetalFX
+    // denoiser kinds, which no live backend could select -- that is what
+    // made the trio dead code); the runtime gate here is the descriptor-
     // is-actually-bound signal. Under partially-bound semantics the
     // shader-side write MUST elide when the slot is unbound; the
     // per-texture gate is what enables that elision.
@@ -14059,13 +14164,18 @@ void Engine::RenderFrame() {
         // registers on Vulkan via this PR (shared 14-slot descriptor
         // layout via kSlotToTexBinding[] reuse + a 112B push + 112B
         // Frame UBO tail at binding(14, 0)), but the dispatch site
-        // currently lives inside the Metal-only use_engine_tonemap
-        // branch. A dedicated Vulkan dispatch path (engine-side
-        // post-Denoise hook, or composite-inside-VulkanNrdDenoiser
-        // between atrous and finalize) is the missing piece. Until
-        // then the metal-only guard on engine_composite_active above
-        // keeps push.composite_celestials = 0 on Vulkan so PathTrace
-        // doesn't peel celestials the composite can't add back.
+        // originally lived inside the Metal-only use_engine_tonemap
+        // branch.
+        //
+        // THAT IS NO LONGER TRUE, and the claim that used to stand here
+        // -- "the metal-only guard on engine_composite_active above
+        // keeps push.composite_celestials = 0 on Vulkan" -- was stale
+        // (docs/DLSS_INTEGRATION_PLAN.md SS5.2 flagged it for correction
+        // "when the file is next touched"; this is that touch). The gate
+        // has no backend term, and Vulkan has two real dispatch paths:
+        // the vulkan_dual_denoise split (SvgfNoFinalize -> StarsComposite
+        // -> FinalizeOnly) and the DLSS sequence's step 2, both below.
+        // Celestials ARE peeled and composited back on Vulkan.
         // Leaving dd.stars_in zero tells the backend the slot is
         // unused; DenoiseFinalize.slang has correspondingly dropped
         // its stars_tex declaration in this PR.
@@ -14721,8 +14831,20 @@ void Engine::RenderFrame() {
             // result in post_denoise_hdr. With r_denoiser off, DLSS
             // consumes the path tracer's raw per-frame radiance
             // directly, which is what denoise_color already holds.
+            //
+            // RAY RECONSTRUCTION SKIPS THIS ENTIRELY, and that is the
+            // whole point of plan SS5.1. RR *is* the denoiser: it was
+            // trained on Monte-Carlo noise, and handing it a spatially
+            // filtered image would have smeared away the very structure
+            // it keys on -- strictly worse than the noisy input, not
+            // merely redundant. Without the kind term here, `r_dlss_rr 1`
+            // alongside any r_denoiser value would have denoised twice,
+            // which is exactly what r_dlss_rr's docstring promises it
+            // does not do.
+            const bool rr_is_denoiser =
+                (denoiser_kind_ == DenoiserKind::DlssRayReconstruction);
             std::uint64_t dlss_src_id = denoise_color_tex_id_;
-            if (denoiser_kind_ != DenoiserKind::Off &&
+            if (!rr_is_denoiser && denoiser_kind_ != DenoiserKind::Off &&
                 post_denoise_hdr_tex_id_ != 0 && !kind_is_optix) {
                 const bool step1_is_nrd =
                     (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_);
@@ -14785,16 +14907,20 @@ void Engine::RenderFrame() {
             // far the scene moved between samples.
             ud.frame_time_delta_ms = 0.0f;
             ud.mode = dlss_mode_;
-            // The RR seam, populated but not acted on by the SR path --
-            // a separate workstream owns the NGX RR feature. Filling
-            // these in costs nothing and means that workstream changes
-            // the backend, not this call site.
-            ud.ray_reconstruction       = DlssRayReconstructionRequested();
+            // Ray Reconstruction. The RESOLVED kind, not the cvar: on a
+            // GPU that cannot do RR the kind stayed whatever r_denoiser
+            // asked for, that chain ran at step 1 above, and asking the
+            // backend for RR here would make it refuse the frame.
+            ud.ray_reconstruction       = rr_is_denoiser;
             ud.albedo_in                = pt::rhi::TextureHandle{albedo_tex_id_};
             ud.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
             ud.normal_in                = pt::rhi::TextureHandle{normal_tex_id_};
             ud.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
             ud.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
+            // Passed straight through, NOT transposed. NGX documents its
+            // matrices as row-major with left multiplication, which is
+            // the same byte layout as glm's column-major right-multiplied
+            // pair -- see UpscaleDesc's comment for the derivation.
             ud.world_to_view = glm::value_ptr(view);
             ud.view_to_clip  = glm::value_ptr(proj);
 
