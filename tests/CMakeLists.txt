@@ -965,8 +965,8 @@ pt_add_test(scene_serialize
 # (PT_HAS_*_BACKEND are PUBLIC defines on that target). The suite body
 # is backend-agnostic and skips itself when a backend is absent, has no
 # acceleration-structure support, or cannot produce the accel_probe
-# pipeline -- so the same file is correct on Windows (software, plus
-# vulkan when a headless VkDevice comes up) and Linux.
+# pipeline -- so the same file is correct on Windows (vulkan, when a
+# headless VkDevice comes up) and on a no-backend Linux configure.
 #
 # Whether a backend can actually host an acceleration structure is a
 # RUNTIME device capability, so the suite queries the device
@@ -979,20 +979,19 @@ pt_add_test(scene_serialize
 # same binary filtered to that backend's doctest case (`-tc=`), so a
 # backend that cannot run says so on its OWN ctest line:
 #
-#     rhi_accel_software .... Passed
 #     rhi_accel_vulkan ...... ***Skipped
 #
-# That visibility is the entire point. A single aggregate cell would
-# print `Passed` because the software backend really did run the full
-# suite, while saying nothing about the hardware-RT backend being
-# skipped, and ctest suppresses a passing test's stdout so the in-binary
-# coverage ledger never reaches the log. One cell per backend puts the
-# skip where a reader cannot miss it.
+# That visibility is the entire point, and it is the only thing left of
+# it now that `vulkan` is the sole backend: on a GPU-less CI runner this
+# cell reports Skipped rather than a green tick over zero coverage. An
+# aggregate cell would say nothing at all, because ctest suppresses a
+# passing test's stdout so the in-binary coverage ledger never reaches
+# the log.
 #
 # Registration follows pt_add_golden_cell's configure-time gating
 # exactly: a cell is only registered where its backend is compiled in
-# (software => WIN32, vulkan => PT_ENABLE_VULKAN_BACKEND), so no host
-# carries a cell that could only ever skip.
+# (vulkan => PT_ENABLE_VULKAN_BACKEND), so no host carries a cell that
+# could only ever skip.
 #
 # SKIP_RETURN_CODE 125: the binary exits 125 when the backend it was
 # filtered to could not run -- no device, no hardware ray tracing, or no
@@ -1030,8 +1029,6 @@ function(pt_add_accel_cell _backend)
         LABELS           "rhi_accel;rhi_accel_${_backend}")
 endfunction()
 
-if(WIN32)
-endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     # Skips by default even here -- VulkanDevice has no headless path.
     # See the Vulkan TEST_CASE in rhi_accel_update_test.cpp.
@@ -1124,13 +1121,9 @@ function(pt_add_golden_cell)
     if(PT_CELL_BACKEND STREQUAL "vulkan" AND NOT PT_ENABLE_VULKAN_BACKEND)
         return()
     endif()
-    # rhi_software is gated to WIN32 in src/rhi/CMakeLists.txt (no
-    # SetDIBitsToDevice analog implemented for Linux). Registering a
-    # software cell on Linux would fail at runtime when the engine
-    # rejects r_backend software; skip it at configure time.
-    if(FALSE)
-        return()
-    endif()
+    # (The software-cell gate that used to sit here is gone with the software
+    # RHI. `vulkan` is the only backend a cell can name; anything else falls
+    # through to the harness, which fails on an unknown r_backend.)
 
     # Defaults. cmake_parse_arguments leaves variables undefined when
     # the caller doesn't pass the corresponding flag, so `NOT VAR`
@@ -1308,18 +1301,24 @@ endfunction()
 # --- MVP cells --------------------------------------------------------------
 # 1 scene (cornell_csg) x compiled backends x 1 denoiser (off).
 #
-# CI mapping today (.github/workflows/build.yml uses `-L golden_software`
-# on both the macOS and Windows lanes): the hosted GitHub runners do
-# not have GPUs that survive Metal / Vulkan init reliably -- the macOS
-# runner ships a paravirtualised Apple-GPU, and the Windows lane runs
-# on a generic VM without an NVIDIA / AMD ICD -- so CI exercises the
-# software backend on both. Metal cells still register on Mac (so a
-# local `ctest` against a real M-series picks them up); Vulkan cells
-# register on Windows/Linux builds where PT_ENABLE_VULKAN_BACKEND is
-# enabled. Each host's CI step filters via the
-# `golden_software` label; other ctest LABELS (`golden`,
-# `golden_metal`, `golden_vulkan`, `golden_missing`) are for local /
-# future use.
+# CI mapping today: NONE OF THIS RUNS IN CI. Every surviving cell is a
+# `vulkan` cell -- the software backend and its Embree CPU tracer are
+# deleted, and the Metal backend went with the Mac strip -- and the hosted
+# GitHub windows-latest runner has no NVIDIA/AMD ICD, so Vulkan device
+# creation returns VK_ERROR_INCOMPATIBLE_DRIVER there. .github/workflows/
+# build.yml therefore has no golden step at all; its unit-test step
+# excludes the whole matrix with `-LE "golden|nightly"`, and the reasoning
+# is written out in that file next to where the step used to be.
+#
+# The matrix is a LOCAL gate until a self-hosted RTX runner is attached:
+# `ctest -R golden` (or `-L golden_vulkan`) on a machine with the GPU.
+# The `golden` / `golden_vulkan` / `golden_missing` LABELS exist for that
+# local run and for the future GPU runner.
+#
+# On Linux (and any PT_ENABLE_VULKAN_BACKEND=OFF configure, e.g. the
+# linux-asan-ubsan-debug preset the sanitizer lane uses) pt_add_golden_cell
+# returns early for every cell, so zero golden tests register and that
+# lane's unfiltered `ctest` stays correct.
 #
 # pt_add_golden_cell expands `$<TARGET_FILE:pt_render_one_frame>` and
 # `$<TARGET_FILE:imgdiff>` at generate time; both targets only exist
