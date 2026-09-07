@@ -1515,16 +1515,61 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         lunar_night
         bsc_night_clouds)
     foreach(_scene IN LISTS _sky_scenes_night)
-        # NIGHT. Deliberately NOT re-pinned by #280 and deliberately not
-        # re-measured: the airglow floor procSky adds is still a painted
-        # stand-in (the real figure is 7.09e-8 W/m^2/sr of O I 557.7 nm
-        # nightglow, five orders of magnitude below where the floor sits),
-        # and the moon and star paths are painted with no physical anchor
-        # at all. Thresholds measured against those would be measured
-        # against a half-migrated state. See the hold note on
-        # bsc_night_clouds below.
-        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off)
+        # NIGHT. The #280 hold is DISCHARGED as of #338: the airglow floor
+        # is no longer a painted stand-in (kPtNightSkyRadiance = 2.5e-7
+        # W/m^2/sr, from V = 22.0 mag/arcsec^2 of dark-site sky) and the
+        # star path has real radiometry with a conserved-energy splat. The
+        # moon disc is still painted, which is why lunar_night carries its
+        # own exposure note.
+        #
+        # EXPOSURE OVERRIDE, and it is load-bearing. These are SOFTWARE
+        # cells, and the software tracer paints its own sky with no
+        # atmospheric physics -- it never runs the shader whose units #338
+        # fixed. The fixtures now state the physically-derived night
+        # exposure (~2000, anchored on the V = 6 naked-eye limit), which is
+        # correct for the GPU backends and meaningless here: applied to a
+        # painted sky it renders 255 EVERYWHERE, a flat white frame that
+        # would pin nothing and pass forever. That is precisely the failure
+        # mode #257 caught with the planet-free sunset cells.
+        #
+        # So each software night cell is pinned at the exposure its own
+        # painted sky was authored against. Their role is unchanged and is
+        # not sky validation -- they are the control that says a change did
+        # not leak into host code -- and this keeps them able to do it.
+        # Detecting a night SKY regression needs a GPU cell; see the
+        # vulkan night cell added below.
+        pt_add_golden_cell(SCENE ${_scene} BACKEND software DENOISER off
+            EXTRA "r_exposure 0.2646")
     endforeach()
+
+    # NIGHT SKY, ON THE GPU (#338). The software cells above cannot see a
+    # sky regression at all -- the software tracer paints its own sky and
+    # runs none of the shader whose radiometry #338 fixed -- so until this
+    # cell there was NOTHING in the matrix that would catch the night sky
+    # breaking. Every committed Windows golden is a software cell.
+    #
+    # DENOISER svgf_atrous is mandatory, not a preference: r_star_split
+    # routes the stars through StarsComposite.slang AFTER the denoiser, and
+    # a `off` override disables the denoiser and takes the composite with
+    # it, so the cell would pin a starless frame and pass forever (the same
+    # trap #257 caught, and the reason the ReSTIR and aurora cells also
+    # force a denoiser).
+    #
+    # TOLERANCES ARE PIXEL-EXACT, and that is the whole point. This frame is
+    # a black sky (background 0.07/255) with about 64 star pixels on it, so
+    # losing EVERY star moves only 0.03% of pixels and a mean delta of
+    # ~0.016. The matrix's usual 32/4/2 would pass a total star wipeout
+    # without blinking. Measured on this host, the render is bit-identical
+    # run to run (two consecutive renders, same md5), which is what
+    # docs/DETERMINISM_BASELINE.md established for this backend -- so
+    # threshold 0 is achievable and is the only setting that actually
+    # guards the thing this cell exists for.
+    #
+    # A driver update legitimately re-pins this cell. If it starts failing
+    # with a diff that is visually identical, that is what happened;
+    # regenerate rather than loosening, so the guard keeps its teeth.
+    pt_add_golden_cell(SCENE bsc_night BACKEND vulkan DENOISER svgf_atrous
+        MAX_DELTA 0 MEAN_DELTA 0 FAIL_PERCENT 0)
 
     # DAY. Software cells keep the defaults (16 / 2 / 1) and keep their
     # ROLE, which is not what it looks like: the software tracer paints its
@@ -3305,10 +3350,14 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         TAG agx     EXTRA "r_tonemap_op agx")
     pt_add_golden_cell(SCENE procedural_noon BACKEND software DENOISER off
         TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
+    # The r_exposure override is the same one the sibling night cells
+    # carry, and for the same reason: these render the software tracer's
+    # painted sky, which the fixture's physically-derived ~2000 night
+    # exposure blows to flat white. See the night-cell block above.
     pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
-        TAG agx     EXTRA "r_tonemap_op agx")
+        TAG agx     EXTRA "r_tonemap_op agx" "r_exposure 0.2646")
     pt_add_golden_cell(SCENE bsc_night       BACKEND software DENOISER off
-        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral")
+        TAG khronos EXTRA "r_tonemap_op khronos_pbr_neutral" "r_exposure 0.2646")
     # --- end Wave 9 tone-mapping operators --------------------------------
 
     # --- Wave 10 bloom + lens dirt ----------------------------------------
