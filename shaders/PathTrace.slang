@@ -4559,13 +4559,18 @@ float3 procSky(float3 rd, float3 sun) {
     // palette goes to zero on its own when the sun is far enough below the
     // horizon -- that is what the integral does -- so the `day` smoothstep
     // that used to blend to night has nothing left to do and is gone.
-    // What remains is a floor standing in for airglow and integrated
-    // starlight, which this engine does not model and which really is
-    // additive: at noon it is 0.028 against a zenith of ~15, and at
-    // midnight it is the whole sky.  Carried across the unit rebase by the
-    // one documented factor, so its brightness relative to the physical
-    // sky is where its author put it.
-    sky += float3(0.005, 0.010, 0.030) * kPtLegacySkyScale;
+    // What remains stands in for airglow, zodiacal light and integrated
+    // faint starlight, none of which this engine integrates and all of
+    // which really are additive.
+    //
+    // #338 phase 2 put a real number on it. The painted value was
+    // float3(0.005, 0.010, 0.030) * kPtLegacySkyScale -- 0.0589 W/m^2/sr
+    // of luma, roughly 2e5 times a genuinely dark sky. Everything correct
+    // that was placed against it drowned: with physically-scaled stars the
+    // bsc_night fixture rendered a perfectly uniform frame, sky and stars
+    // at the same 19.9/255, not one star pixel above background. The stars
+    // were never what was broken.
+    sky += kPtNightSkyTint * kPtNightSkyRadiance;
 
     // Star contribution. Routed through starsOnly() so the same logic
     // is reusable from the primary-miss celestials-composite path

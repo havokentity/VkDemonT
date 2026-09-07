@@ -794,7 +794,7 @@ namespace cvar {
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "1e-6",  "Minimum exposure scalar that auto-exposure can settle on. Used as a floor; the geometric-mean metering in AutoExposure.slang produces values down to ~1e-5 for genuine outdoor daylight (sky luminance of ~1e4 units / 0.18 target = ~1.8e-5). 1e-6 leaves headroom and prevents NaN pathologies; bump up to ~0.05 if you want auto-exposure to refuse to dim below a certain level for stylistic reasons.", CVAR_ARCHIVE);
-    PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_max,    "2000.0", "Maximum exposure scalar that auto-exposure can settle on -- how far the eye is allowed to dark-adapt. NOT a look knob: 2000 is derived from the naked-eye limiting magnitude. A V = 6 star (the faintest a dark-adapted human sees) delivers 3.19e-9 * 10^(-0.4*6) = 1.27e-11 W/m^2, which over a 9.04e-6 sr pixel (60 deg vertical FOV, 384 px) is 1.40e-6 W/m^2/sr; the exposure that lands that on the display's ~2/255 visibility threshold through ACES is ~2000. At that same exposure a 2.5e-7 W/m^2/sr dark sky reads 0.4/255 (black) and Vega reads 219/255 -- i.e. the night sky comes out looking like night, with the right stars in it, without a single tuned term. The previous 4.0 was ~500x too low to let any night scene adapt at all, which is why nights rendered as a flat grey wash. Raising it only changes scenes dark enough to CLAMP (mean below ~1e-4); lit scenes never reach it.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
@@ -18516,19 +18516,31 @@ void Engine::RegisterCommands() {
             // 0.05 floor was capping the dimming and burning out skies.
             // Locked-exposure presets (dslr_iso*, linear) keep min == max
             // since they're not running auto-exposure.
+            // exp_max is the DARK-ADAPTATION CEILING, and since #338 phase 2
+            // it is anchored rather than picked. Human 2000 is the exposure
+            // at which a V = 6 star -- the naked-eye limit -- lands on the
+            // display's ~2/255 visibility threshold (derivation in the
+            // r_exposure_max docstring). The animal presets scale that by
+            // their measured dim-light advantage over humans, so each one
+            // states "this eye sees N magnitudes deeper" rather than
+            // carrying an independently invented number.
             static const Preset presets[] = {
-                // Human eye: comfortable adaptation range, ~1s adapt time.
-                {"human",        1e-6f,  4.0f,  0.18f, 0.20f, true,  1.5f},
-                // Cats: rod-rich retina, ~6x dim-light sensitivity.
-                {"cat",          1e-6f, 12.0f,  0.18f, 0.30f, true,  1.5f},
-                // Owls: nocturnal extreme, ~100x rod density of humans.
-                {"owl",          1e-6f, 30.0f,  0.18f, 0.35f, true,  1.5f},
+                // Human eye: dark-adapts to the naked-eye limit, V = 6.
+                {"human",        1e-6f,  2000.0f,  0.18f, 0.20f, true,  1.5f},
+                // Cats: rod-rich retina, ~6x dim-light sensitivity -- about
+                // two magnitudes deeper than a human, so V ~ 8.
+                {"cat",          1e-6f, 12000.0f,  0.18f, 0.30f, true,  1.5f},
+                // Owls: nocturnal extreme, ~100x rod density of humans --
+                // about five magnitudes deeper, V ~ 11.
+                {"owl",          1e-6f, 200000.0f, 0.18f, 0.35f, true,  1.5f},
                 // DSLR locked at ISO 100: no auto, fixed exposure.
                 {"dslr_iso100",  1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
                 // DSLR locked at ISO 6400: 64x more gain.
                 {"dslr_iso6400", 8.0f,   8.0f,  0.18f, 0.0f,  false, 8.0f},
-                // Smartphone: auto, modest range.
-                {"phone",        1e-6f,  6.0f,  0.18f, 0.25f, true,  1.5f},
+                // Smartphone: auto, modest range. Night mode stacks frames
+                // rather than opening up, so it lands short of a
+                // dark-adapted eye but far past the old 6.0.
+                {"phone",        1e-6f,  3000.0f, 0.18f, 0.25f, true,  1.5f},
                 // Linear: bypass exposure entirely (debug).
                 {"linear",       1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
             };
@@ -18921,7 +18933,11 @@ void Engine::RegisterCommands() {
     };
     set_slider("r_spp",             1.0f,   32.0f,  1.0f);
     set_slider("r_max_bounces",     1.0f,   16.0f,  1.0f);
-    set_slider("r_exposure",        0.1f,    5.0f,  0.05f);
+    // Range reaches a night exposure since #338 phase 2 (a dark-adapted
+    // scene needs ~2000, not ~1.5). A linear slider over 0.1..2000 is
+    // coarse at the daylight end; a log-scale control is the real fix
+    // and is UI work, but an unreachable range is worse than a coarse one.
+    set_slider("r_exposure",        0.1f, 2000.0f,  0.05f);
     set_slider("r_env_intensity",   0.0f,    5.0f,  0.05f);
     set_slider("r_sun_elevation", -90.0f,   90.0f,  0.5f);
     set_slider("r_sun_azimuth",     0.0f,  360.0f,  1.0f);
