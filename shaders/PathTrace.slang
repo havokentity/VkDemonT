@@ -177,34 +177,61 @@ Texture2D<float4> moon_map;
 // every subsequent texture slot.
 [[vk::binding(22, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
 
-// MetalFX specular-guidance G-buffers (issue #118). Apple's
-// MTLFXTemporalDenoisedScaler exposes three optional specular inputs --
-// without them the scaler can't differentiate specular from diffuse
-// response and exhibits 8x8 halos around bright reflections / metals.
-// PR #114 wired normal + diffuse_albedo; this PR fills the remaining
-// trio so MetalFX can close the gap with DLSS Ray Reconstruction on
-// Apple Silicon.
+// Specular-guidance G-buffers. Originally added for MetalFX's
+// MTLFXTemporalDenoisedScaler (issue #118); MetalFX was removed in the
+// Vulkan-only strip and the sole remaining consumer is DLSS Ray
+// Reconstruction, whose `pInSpecularAlbedo` / `pInRoughness` /
+// `pInSpecularHitDistance` these three feed. Without them a neural
+// reconstructor cannot tell specular response from diffuse and halos
+// bright reflections and metals.
+//
+// The RR contract is what these now target, and it differs from the
+// MetalFX one in two places that were silently wrong while the buffers
+// were dead code (the allocation gate named only MetalFX kinds no live
+// backend could select, so nothing ever wrote or read them):
+//   * specular_albedo is the split-sum INTEGRATED specular reflectance,
+//     not F0. See envBrdfSplitSum().
+//   * specular_hit_distance is measured FROM THE PRIMARY HIT along the
+//     reflected ray, not from the camera, and comes from a real second
+//     trace rather than a smoothness-weighted proxy.
 //
 // Binding numbers: 24/25/26. Binding 23 is reserved for #115 SIGMA
 // shadow visibility (parallel-agent coordination). The cluster
-// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 (this PR) lives
+// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 lives
 // just past the SDF-cluster buffer at 21 and keeps the descriptor
 // pool sizing arithmetic simple.
 //
-// All three are declared on BOTH SPIR-V and Metal targets so Slang's
-// declaration-order MSL slot assignment stays stable -- same rule as
-// normal_tex / albedo_tex / cloud_trans_tex (see albedo_tex's comment
-// for the PR #108 history that motivates this). Runtime writes are
-// gated on the matching push.write_specular_*_gbuffer flag the engine
-// sets only for MetalFX-family denoiser kinds.
+// Runtime writes are gated on the matching push.write_specular_*_gbuffer
+// flag, which the engine sets from want_specular_guidance_gbuffers ==
+// DlssRayReconstructionRequested(). With r_dlss off (the default) the
+// textures are not allocated, the flags stay 0 and none of this executes.
 
-// specular_albedo: per-pixel F0 (Fresnel reflectance at normal
-// incidence). RGBA16F so it can carry the full RGB metal tint
-// (metal F0 = surface albedo, NOT a uniform value -- gold is yellow
-// because its specular reflectance is yellow, not because it tints
-// a white diffuse). Dielectrics use the standard float3(0.04) IOR=1.5
-// Schlick approximation; pure Lambert writes float3(0) since it has
-// no specular lobe. Sky / no-hit pixels write float3(0).
+// specular_albedo: the directional-hemispherical specular reflectance
+// R_s(v) = F0 * A(roughness, n.v) + B(roughness, n.v), i.e. the split-sum
+// environment BRDF (Karis 2013 / Lazarov's fit -- see envBrdfSplitSum()
+// for the derivation and the citations). This is the quantity a
+// demodulating consumer divides the specular radiance by, so it must be
+// the INTEGRATED reflectance and not F0: F0 is R_s at normal incidence
+// only, and every dielectric rises to R_s -> 1 at the horizon.
+//
+// RGBA16F so it can carry the full RGB metal tint (metal F0 = surface
+// albedo, NOT a uniform value -- gold is yellow because its specular
+// reflectance is yellow, not because it tints a white diffuse). The .a
+// channel is unused and written 0.
+//
+// Per-material F0 fed into the split-sum, mirroring what the shading
+// branches actually refract with so the guide and the render agree by
+// construction:
+//   MAT_METAL      : F0 = albedo.
+//   MAT_DIELECTRIC : F0 = ((1 - n)/(1 + n))^2 from h.ior, the same
+//                    Schlick base reflectance the MAT_DIELECTRIC branch
+//                    computes (n = 1.5 gives the familiar 0.04).
+//   MAT_WATER      : same expression from the water IOR
+//                    (n = 1.333 gives 0.0204, the "0.02 for water at
+//                    0 deg" the water BRDF names).
+//   MAT_LAMBERT    : 0 -- no specular lobe at all, so R_s is exactly 0
+//                    and the split-sum's B term must NOT be applied.
+// Sky / no-hit pixels write float3(0).
 //
 // Declared as WTexture2D (write-only) rather than RWTexture2D because
 // Apple Silicon GPUs cap compute kernels at 8 read_write textures per
@@ -215,41 +242,78 @@ Texture2D<float4> moon_map;
 // 8-RW cap. Vulkan's GLSL/SPIR-V emit uses a write-only `imageStore`
 // path; the host-side bind path is identical (storage image, same
 // VkDescriptorSet entry, same vk::binding number). Issue #118 / Slang
-// docs WTexture2D guidance: a2-03-wgsl-target-specific.md.
+// docs WTexture2D guidance: a2-03-wgsl-target-specific.md. Metal is gone
+// but the declaration is unchanged: WTexture2D is exactly as correct on
+// SPIR-V, and churning it would gain nothing.
 [[vk::binding(24, 0), vk::image_format("rgba16f")]] WTexture2D<float4> specular_albedo_tex;
 
-// roughness: linear surface roughness in [0, 1]. Single-channel.
-// 0 = perfect mirror, 1 = fully Lambertian. The path tracer's
-// material struct already carries a roughness param on PBR-style
-// hits (used in the GGX BRDF); this G-buffer just exposes it to
-// MetalFX as a guidance input so the scaler can vary its spatial
-// filter aggressiveness by surface response. Sky / no-hit pixels
-// write 1.0 (fully rough -- MetalFX won't try to sharpen a specular
-// highlight in empty space). See specular_albedo_tex's comment for
-// the WTexture2D vs RWTexture2D rationale (Apple's 8-RW cap).
+// roughness: PERCEPTUAL (a.k.a. linear / artist) roughness in [0, 1],
+// the parameter r for which the GGX microfacet width is alpha = r^2.
+// That is the engine's own convention everywhere (anisoAlpha():
+// `alpha = r * r`; terrainRoughnessFold(): `a = base^2`, returns
+// sqrt(...)), and it is the convention DLSS RR and NRD document for
+// `pInRoughness` (NRD spells it linearRoughness = sqrt(alpha)). No
+// remap is applied on the way out -- the two conventions already agree.
+// 0 = perfect mirror, 1 = fully Lambertian.
+//
+// Two per-material corrections the raw h.roughness does not carry:
+//   * MAT_LAMBERT has no microfacet lobe, so its roughness field is
+//     meaningless; write 1.0 so a consumer treats the pixel as having
+//     no specular to preserve.
+//   * MAT_WATER stores 0.0 (a perfect Fresnel interface at the macro
+//     scale) and gets ALL of its roughness from unresolved wave slope
+//     at shading time via oceanBrdfAlpha2(). Writing 0 would tell the
+//     consumer the open ocean seen from orbit is a mirror when it is
+//     in fact Cox & Munk's sigma^2 of mean-square slope. The same fold
+//     the shading pass runs is applied here.
+// Sky / no-hit pixels write 1.0 (fully rough -- there is no specular
+// highlight in empty space to sharpen). See specular_albedo_tex's
+// comment for the WTexture2D vs RWTexture2D rationale.
 [[vk::binding(25, 0), vk::image_format("r32f")]] WTexture2D<float>  roughness_tex;
 
-// specular_hit_distance: distance from the camera (in world units) to
-// the surface a reflection ray from the primary hit would land on.
-// Single-channel. Apple uses this for parallax-correct temporal
-// reprojection of specular highlights -- without it, reflections on
-// moving cameras smear because MetalFX has no way to know the
-// reflected-virtual-image depth differs from the visible-surface
-// depth.
+// specular_hit_distance: the distance, in metres, FROM THE PRIMARY HIT
+// along the mirror-reflected direction to whatever that reflected ray
+// hits. It is what lets a temporal reconstructor reproject a reflection
+// parallax-correctly: the reflected virtual image sits at
+// primary_t + specular_hit_distance from the eye, not at primary_t, so
+// without it reflections smear whenever the camera translates.
 //
-// MVP semantics: we don't run a second trace per pixel (the full
-// design would re-trace in r = reflect(view_dir, normal) from the
-// primary hit). Instead we use `primary_t` (the distance the camera
-// ray itself travelled) as a proxy, biased by the roughness: at
-// roughness=0 (perfect mirror) the reflected hit is at infinity for
-// curved surfaces / at primary_t for flat ones, so this proxy is
-// closer to right for shorter-distance reflections; at roughness=1
-// the field doesn't matter anyway (MetalFX won't try to reproject
-// a fully-rough surface as a sharp specular). A future PR can
-// replace this with a real reflection-ray trace; the visual diff
-// determines whether the perf cost is worth it.
-// Sky / no-hit pixels write 0 (no surface). See specular_albedo_tex's
-// comment for the WTexture2D vs RWTexture2D rationale.
+// This is a REAL second trace, not a proxy. It replaces
+// `h0.t * (1 - roughness)`, which was neither a distance nor
+// dimensionally a distance -- it collapsed to 0 on rough surfaces
+// (telling the consumer the reflection is glued to the surface) and
+// returned the PRIMARY distance on mirrors (telling it the reflection
+// is at the surface's own depth, which is the one case it demonstrably
+// is not). A wrong number in a distance field mis-reprojects actively;
+// it is worse than no input, which is why the plan's fallback was a
+// null binding rather than shipping the proxy.
+//
+// Conventions and their reasons:
+//   * FROM THE PRIMARY HIT, not from the camera. This is NRD's hitDist
+//     convention and the one Streamline documents for RR. (The original
+//     MetalFX-era comment here said "from the camera"; MetalFX is gone
+//     and RR is the only consumer.)
+//   * The MIRROR direction, deterministically, rather than a GGX-sampled
+//     lobe direction. The whole G-buffer pass is deliberately noise-free
+//     (unjittered primary ray, no stochastic sampling) because these are
+//     GUIDES; injecting a stochastic lobe sample would put per-pixel
+//     noise into the very buffer that is supposed to explain the noise
+//     in the colour. The mirror direction is the mode of the GGX lobe
+//     and is exact at roughness 0, where parallax correction matters
+//     most and where a rough surface's reprojection error is invisible
+//     anyway.
+//   * A reflected ray that escapes the scene writes 1.0e10 m -- the same
+//     sky sentinel depth_tex uses, chosen so a consumer comparing the
+//     two sees one consistent scene scale. It is the honest value: the
+//     reflected image of the sky IS at infinity, so there is no parallax
+//     to correct, and a finite small number (least of all 0) would
+//     manufacture some. See depth_view's sky branch for the sentinel's
+//     own derivation and its stated 1 AU ceiling.
+//   * Lambert and sky pixels write 0.0, meaning "no specular lobe here."
+//     This is the one place the 0 == "no specular" fallback is correct,
+//     and it is correct because there genuinely is no reflected ray.
+// See specular_albedo_tex's comment for the WTexture2D vs RWTexture2D
+// rationale.
 [[vk::binding(26, 0), vk::image_format("r32f")]] WTexture2D<float>  specular_hit_distance_tex;
 
 // --- Wave 8 ocean (#25) ----------------------------------------------------
@@ -2807,6 +2871,72 @@ float clearcoatFresnel(float cos_v) {
     float fc = pow(1.0 - clamp(cos_v, 0.0, 1.0), 5.0);
     return kClearcoatF0 + (1.0 - kClearcoatF0) * fc;
 }
+
+// --- Split-sum environment BRDF (the "specular albedo" a denoiser wants) ----
+//
+// The directional-hemispherical specular reflectance of a GGX surface: the
+// fraction of a uniform incident radiance field that leaves along v.
+//
+//     R_s(v) = INTEGRAL over the hemisphere of  f_s(l, v) * (n . l) dl
+//
+// Karis's split-sum factorisation of that integral (Karis, "Real Shading in
+// Unreal Engine 4", SIGGRAPH 2013 *Physically Based Shading in Theory and
+// Practice* course notes, eq. for the "environment BRDF") separates the
+// Schlick Fresnel's F0 into a scale and a bias:
+//
+//     R_s(v) ~= F0 * A(roughness, n.v)  +  B(roughness, n.v)
+//
+// A and B are the two moments of the masked GGX lobe against Schlick's
+// (1-cos)^5 expansion and depend on NOTHING but roughness and n.v -- which
+// is why they can be pre-integrated. The analytic fit to that 2D table used
+// here is Lazarov's, from the same 2013 course ("Getting More Physical in
+// Call of Duty: Black Ops II"), republished as `EnvBRDFApprox` in Karis's
+// mobile notes. `roughness` is the PERCEPTUAL parameter (alpha = r^2),
+// which is what the fit was built against and what this engine stores.
+//
+// HOW ACCURATE, HONESTLY. It is a three-ALU fit, not the integral. Measured
+// against a 65536-sample numerical split-sum (Karis's IntegrateBRDF with the
+// IBL Smith k = alpha/2) in tests/pt_dlss_guide_buffers_test.cpp: for
+// low-F0 dielectrics -- water, glass, the planet limb, i.e. what this engine
+// actually renders -- the reflectance agrees to under 0.05 over most of the
+// domain and 0.16 in the worst corner. For high-F0 metals it is coarser,
+// up to ~0.16 absolute / ~20% relative in the mid-roughness band. That is
+// still an order of magnitude better than the quantity it replaces (raw F0,
+// which is wrong by a factor of up to 1/F0 = ~50 on water at grazing), and
+// matching the form the consumer documents matters more than beating it on
+// accuracy: a demodulate/re-modulate pair only cancels if both sides
+// evaluate the same term. If a future consumer wants the exact table, the
+// upgrade is a rational fit (NRD's EnvironmentTerm_Rtg), not a tweak here.
+//
+// WHY THIS AND NOT F0. F0 is R_s at NORMAL incidence only. Every dielectric
+// goes to R_s -> 1 at grazing incidence -- that is the Fresnel effect, and it
+// is not small: water's F0 is 0.02, so handing a consumer F0 understates the
+// horizon reflectance of the ocean by a factor of ~50. A denoiser that
+// demodulates by the specular albedo (DLSS Ray Reconstruction's
+// `pInSpecularAlbedo` is exactly this quantity) would then re-modulate the
+// grazing band by 0.02 and crush it. The two places this engine cares about
+// most -- the ocean and the planet limb -- are both entirely grazing.
+//
+// Returns (A, B); the caller forms F0 * A + B per channel.
+float2 envBrdfSplitSumAB(float roughness, float n_dot_v) {
+    const float4 c0 = float4(-1.0, -0.0275, -0.572,  0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.040, -0.040);
+    float4 r    = clamp(roughness, 0.0, 1.0) * c0 + c1;
+    float  a004 = min(r.x * r.x, exp2(-9.28 * clamp(n_dot_v, 0.0, 1.0)))
+                * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// F0 * A + B, clamped to [0,1]. The clamp is energy conservation, not a
+// fudge: a reflectance above 1 would return more light than arrived. The fit
+// overshoots by ~4% in the one corner (roughness 0, n.v 0) where the true
+// value is exactly 1, and a consumer that DIVIDES by this term would amplify
+// rather than demodulate there.
+float3 envBrdfSplitSum(float3 f0, float roughness, float n_dot_v) {
+    float2 ab = envBrdfSplitSumAB(roughness, n_dot_v);
+    return clamp(f0 * ab.x + ab.y, float3(0.0), float3(1.0));
+}
+// --- end split-sum environment BRDF -----------------------------------------
 
 // Sample the clearcoat reflection lobe. Returns the world-space reflected
 // direction + the BRDF weight (G2/G1 masking ratio; Fresnel + the 1/p
@@ -8248,77 +8378,168 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
             albedo_tex[tid] = float4(hit_albedo, guide_trans);
         }
-        // MetalFX specular-guidance G-buffers (issue #118). Three
-        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
-        // specular from diffuse response -- without them the scaler
-        // produces 8x8 halos around bright reflections / metals.
+        // Specular-guidance G-buffers: DLSS Ray Reconstruction's
+        // pInSpecularAlbedo / pInRoughness / pInSpecularHitDistance. See
+        // the three texture declarations at the top of this file for the
+        // full contract, the citations and the reasons each convention is
+        // what it is. All three are gated on their own push flag, which is
+        // 0 unless the engine allocated the textures for RR, so with
+        // r_dlss off none of this block executes.
         //
-        // F0 (specular_albedo) per material kind:
-        //   MAT_METAL      : F0 = albedo (the material colour reflects
-        //                    directly; gold's yellow specular IS its
-        //                    yellow albedo, not a tinted white highlight).
-        //   MAT_DIELECTRIC : F0 = float3(0.04) — the standard Schlick
-        //                    approximation for IOR~1.5 (glass, plastic,
-        //                    coated dielectrics). Engine's dielectric
-        //                    primitives are nominally IOR=1.5 unless
-        //                    overridden in the prim material struct.
-        //   MAT_LAMBERT    : F0 = float3(0) — no specular lobe at all.
-        // Pulled from h0 (not hit_albedo / hit_normal which collapse
-        // to sentinels on sky pixels) so we can preserve the material-
-        // kind discriminator.
-        //
-        // roughness: from h0.roughness directly. The material struct
-        // packs roughness in primitive .v1.a / SDF cluster header /
-        // mesh material — already plumbed through traceScene as h.roughness.
-        //
-        // specular_hit_distance: MVP proxy using `primary_t * (1 - rough)`,
-        // i.e. attenuated by smoothness so a perfect mirror keeps the
-        // full distance and a rough surface trends toward 0 where
-        // MetalFX has no specular reproject to do. A future PR (real
-        // reflection-ray trace from the primary hit) can replace this
-        // with the actual reflected-virtual-image depth; see the
-        // texture's declaration comment for the design trade-off.
-        //
-        // All three are sky-aware: hit_normal == float3(0) means h0.hit
-        // == false, so we write the "no surface" sentinel for that
-        // pixel. roughness sentinel is 1.0 (fully rough -> MetalFX
-        // skips specular handling); F0 + hit_distance sentinel is 0.
-        if (write_specular_albedo_gbuffer != 0u) {
+        // The three writes share three quantities, computed once here.
+        // Everything is pulled from h0 (not hit_albedo / hit_normal, which
+        // collapse to sentinels on sky pixels) so the material-kind
+        // discriminator survives.
+        const bool want_any_specular_guide =
+            (write_specular_albedo_gbuffer != 0u) ||
+            (write_roughness_gbuffer != 0u) ||
+            (write_specular_hit_distance_gbuffer != 0u);
+        if (want_any_specular_guide) {
+            // (0) The shading normal FACED AGAINST the incoming ray, the same
+            //     `nf` every shading branch builds from the sign of
+            //     dot(n, rd). Thin geometry, a submerged body and a displaced
+            //     ocean crest seen from below all deliver a normal pointing
+            //     away from the eye; reflecting about the raw one would send
+            //     the specular ray into the surface it started on, and would
+            //     report n.v = 0 (full grazing rise) on a face seen head-on.
+            //     Fresnel is symmetric about the interface, so facing it is
+            //     the physically correct read, not a clamp.
+            float3 gn = (dot(h0.normal, rd0) < 0.0) ? h0.normal : -h0.normal;
+
+            // (1) Guide roughness, in the perceptual convention alpha = r^2
+            //     that both this engine and RR use -- see roughness_tex's
+            //     declaration comment for the audit.
+            float guide_rough = h0.hit ? saturate(h0.roughness) : 1.0;
+            if (h0.hit && h0.mat == MAT_LAMBERT) {
+                // Lambert has no microfacet lobe, so whatever the prim
+                // seeding left in h.roughness is meaningless here.
+                guide_rough = 1.0;
+            }
+#if PT_WATER_ENABLED
+            if (h0.hit && h0.mat == MAT_WATER && planet_ocean.x > 0.0) {
+                // Water carries h.roughness == 0 by construction: at the
+                // macro scale it is a perfect Fresnel interface, and every
+                // bit of roughness it has is wave slope the shading pass
+                // folds in through oceanBrdfAlpha2(). Run the SAME fold
+                // here or the guide would call the open ocean a mirror at
+                // every distance -- which is exactly the surface RR would
+                // then fail to reconstruct. The gate matches the shading
+                // pass's: alpha^2 is Cox & Munk's mean-square slope minus
+                // whatever the cascades still resolve geometrically, and
+                // with r_ocean off the cascades resolve nothing so the
+                // whole of sigma^2 lands in the BRDF (the conservation law
+                // documented at oceanBrdfAlpha2).
+                float3 res_g = float3(0.0);
+                if (ocean_params0.x != 0.0) {
+                    res_g = oceanCascadeResolvedAll(
+                        uint(max(planet_ocean.y, 1.0)),
+                        uint(max(ocean_params1.y, 1.0)),
+                        ptConeWidthAt(cone0, h0.t));
+                }
+                // oceanBrdfAlpha2 returns alpha^2 (the shading pass takes
+                // a_ggx = sqrt of it), and the guide wants r = sqrt(alpha),
+                // so r = (alpha^2)^(1/4).
+                float alpha2_g = oceanBrdfAlpha2(res_g);
+                guide_rough = saturate(sqrt(sqrt(max(alpha2_g, 0.0))));
+            }
+#endif
+
+            // (2) Fresnel reflectance at normal incidence, per material
+            //     kind, mirroring what each shading branch actually
+            //     refracts with so the guide and the render cannot drift.
             float3 f0 = float3(0.0);
+            bool   has_specular_lobe = false;
             if (h0.hit) {
-                if      (h0.mat == MAT_METAL)      f0 = h0.albedo;
-                else if (h0.mat == MAT_DIELECTRIC) f0 = float3(0.04);
-                // Lambert keeps f0 = 0.
+                if (h0.mat == MAT_METAL) {
+                    // The material colour reflects directly; gold's yellow
+                    // specular IS its yellow albedo, not a tinted white
+                    // highlight.
+                    f0 = h0.albedo;
+                    has_specular_lobe = true;
+                } else if (h0.mat == MAT_DIELECTRIC) {
+                    // Schlick base reflectance of an air -> medium
+                    // interface, ((n1 - n2)/(n1 + n2))^2 with n1 = 1, from
+                    // the SAME h0.ior the MAT_DIELECTRIC branch refracts
+                    // with. n = 1.5 reproduces the familiar 0.04. A prim
+                    // that left ior at the 1.0 sentinel genuinely has no
+                    // index step and correctly yields F0 = 0; max() only
+                    // keeps a 0 sentinel from inverting the expression.
+                    float n  = max(h0.ior, 1.0);
+                    float r0 = (1.0 - n) / (1.0 + n);
+                    f0 = float3(r0 * r0);
+                    has_specular_lobe = true;
+                }
+#if PT_WATER_ENABLED
+                else if (h0.mat == MAT_WATER) {
+                    // Same expression, water's index: h.ior when the prim
+                    // overrides it, otherwise the global r_water_ior in
+                    // water_params0.w -- the exact fallback chain the
+                    // MAT_WATER shading branch uses. n = 1.333 gives
+                    // 0.0204, i.e. the "accurate F0 for water at 0 deg"
+                    // the water BRDF names as 0.02.
+                    float nw = clamp(h0.ior > 0.0 ? h0.ior : water_params0.w,
+                                     1.0, 2.4);
+                    float rw = (1.0 - nw) / (1.0 + nw);
+                    f0 = float3(rw * rw);
+                    has_specular_lobe = true;
+                }
+#endif
+                // MAT_LAMBERT keeps f0 = 0 and has_specular_lobe = false.
             }
-            // WTexture2D.Store(coord, value) instead of subscript
-            // assignment -- WTexture2D is write-only (lowers to Metal
-            // access::write to stay under the 8-RW-texture cap) and
-            // doesn't support the [] = ... HLSL convenience syntax.
-            specular_albedo_tex.Store(tid, float4(f0, 0.0));
-        }
-        if (write_roughness_gbuffer != 0u) {
-            float r = h0.hit ? saturate(h0.roughness) : 1.0;
-            // Lambert lobe is fully rough; the engine's prim seeding
-            // sets h.roughness based on the material's GGX param, but
-            // for MAT_LAMBERT the value is meaningless (Lambert doesn't
-            // have a roughness). Force = 1.0 so MetalFX sees Lambert
-            // pixels as "no specular surface to preserve."
-            if (h0.hit && h0.mat == MAT_LAMBERT) r = 1.0;
-            roughness_tex.Store(tid, r);
-        }
-        if (write_specular_hit_distance_gbuffer != 0u) {
-            float dist = 0.0;
-            if (h0.hit) {
-                // MVP proxy: primary hit distance weighted by smoothness
-                // (1 - roughness). At roughness=0 the reflection comes
-                // from somewhere far past the primary hit, but we don't
-                // trace it -- the value is "as far as we know, primary_t."
-                // At roughness=1 we'd write 0 anyway since MetalFX won't
-                // try to reproject a fully-rough specular.
-                float smoothness = 1.0 - saturate(h0.roughness);
-                dist = h0.t * smoothness;
+
+            if (write_specular_albedo_gbuffer != 0u) {
+                // The split-sum integrated specular reflectance, NOT F0.
+                // Lambert and sky are excluded rather than passed through
+                // the fit: with F0 = 0 the fit still returns its B term,
+                // which rises toward 1 at grazing incidence, and telling a
+                // reconstructor that a matte surface mirrors the horizon is
+                // the same class of error as telling it water does not.
+                float3 spec_albedo = float3(0.0);
+                if (has_specular_lobe) {
+                    // n.v from the primary ray: rd0 points away from the
+                    // eye, so -rd0 is the view vector, and `gn` is already
+                    // faced against it so this is non-negative by
+                    // construction.
+                    float n_dot_v = saturate(dot(gn, -rd0));
+                    spec_albedo = envBrdfSplitSum(f0, guide_rough, n_dot_v);
+                }
+                // WTexture2D.Store(coord, value) instead of subscript
+                // assignment -- WTexture2D is write-only (lowers to Metal
+                // access::write to stay under the 8-RW-texture cap) and
+                // doesn't support the [] = ... HLSL convenience syntax.
+                specular_albedo_tex.Store(tid, float4(spec_albedo, 0.0));
             }
-            specular_hit_distance_tex.Store(tid, dist);
+            if (write_roughness_gbuffer != 0u) {
+                roughness_tex.Store(tid, guide_rough);
+            }
+            if (write_specular_hit_distance_gbuffer != 0u) {
+                // A real reflection ray. Sky and Lambert pixels have no
+                // specular lobe, so they write 0 -- the one case where the
+                // "0 means no specular" fallback is the truth rather than a
+                // stand-in for a number we did not compute.
+                float dist = 0.0;
+                if (has_specular_lobe) {
+                    float3 hit_p  = ro0 + rd0 * h0.t;
+                    float3 refl_d = reflect(rd0, gn);
+                    // The cone carried to the hit, so the secondary ray's
+                    // self-intersection offset and t_min scale with the
+                    // footprint exactly as every other secondary ray in
+                    // this renderer does (ptRayOrigin / ptRayTMin).
+                    PtRayCone cone_r = ptConeAdvance(cone0, h0.t);
+                    float3 refl_o = ptRayOrigin(hit_p, gn, cone_r, refl_d);
+                    // shutter_t01 = 1.0, matching the G-buffer's primary
+                    // ray: guides must not be jittered along the shutter or
+                    // the reprojection sees a different scene than the
+                    // depth it was handed.
+                    HitInfo hr = traceScene(refl_o, refl_d, 1.0, cone_r);
+                    // 1.0e10 m == depth_tex's sky sentinel. The reflected
+                    // image of the sky is at infinity: there is no parallax
+                    // to correct, and any small finite number would invent
+                    // some.
+                    dist = hr.hit ? hr.t : 1.0e10;
+                }
+                specular_hit_distance_tex.Store(tid, dist);
+            }
         }
     }
 

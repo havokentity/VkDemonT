@@ -592,6 +592,29 @@ target_compile_definitions(pt_denoise_demod_guide PRIVATE
     PT_SHADER_DENOISE_REMOD_PATH="${CMAKE_SOURCE_DIR}/shaders/DenoiseRemod.slang"
     PT_SHADER_RESTIR_FINAL_PATH="${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang")
 
+# --- pt_dlss_guide_buffers -------------------------------------------------
+# The DLSS Ray Reconstruction guide-buffer contract: specular albedo is the
+# split-sum INTEGRATED specular reflectance (Karis 2013 / Lazarov's fit) and
+# not raw F0, specular hit distance is a real reflection-ray trace and not
+# the `primary_t * (1 - roughness)` proxy, the roughness guide is perceptual
+# roughness with the ocean's Cox & Munk slope fold applied, and the exposure
+# scalar is published as a 1x1 R32F image as well as a storage buffer.
+#
+# WHY IT IS NOT A GOLDEN. The default config is r_dlss off, so none of these
+# buffers is allocated on the golden path -- which is the requirement (the
+# change must be inert for existing users) and also the reason a golden
+# could not observe any of it. The physics half runs on the host against a
+# numerically integrated split-sum reference; the plumbing half is pinned as
+# source-text counts, like pt_denoise_demod_guide.
+pt_add_test(pt_dlss_guide_buffers
+    pt_dlss_guide_buffers_test.cpp)
+target_compile_definitions(pt_dlss_guide_buffers PRIVATE
+    PT_SHADER_PATHTRACE_PATH="${CMAKE_SOURCE_DIR}/shaders/PathTrace.slang"
+    PT_SHADER_AUTOEXPOSURE_PATH="${CMAKE_SOURCE_DIR}/shaders/AutoExposure.slang"
+    PT_SHADER_TONEMAP_PATH="${CMAKE_SOURCE_DIR}/shaders/Tonemap.slang"
+    PT_VULKAN_DEVICE_PATH="${CMAKE_SOURCE_DIR}/src/rhi_vulkan/VulkanDevice.cpp"
+    PT_ENGINE_CPP_PATH="${CMAKE_SOURCE_DIR}/src/engine/Engine.cpp")
+
 # --- pt_planet_albedo (issue #300, land cover) -----------------------------
 # The surface albedo raster, the two physical models that modulate it, and
 # the wire formats between the CPU sampler and the shader's.

@@ -193,7 +193,17 @@ constexpr bool kEnableValidation = false;
 // shared descriptor-set layout stays a superset of every kernel's
 // declared bindings. A sibling fog agent owns binding 36; leave it
 // alone.
-static constexpr std::uint32_t kNumTexSlots = 19;
+// DLSS exposure texture: engine texture slot 19 -> vk::binding 48 is
+// exposure_tex, a 1x1 R32F storage image holding the PRE-TONEMAP exposure
+// multiplier -- the same scalar AutoExposure.slang writes into
+// exposure_state[0] and Tonemap.slang multiplies the linear radiance by
+// before the curve. NGX's DLSS eval takes that value as a 1x1 R32F
+// TEXTURE (pInExposureTexture), which a storage buffer cannot satisfy, so
+// AutoExposure mirrors the scalar into this image in the same pass that
+// computes it (single source of truth: one kernel, one value, two views of
+// it). Allocated only when DLSS is requested; PARTIALLY_BOUND covers the
+// default r_dlss off case where the slot stays unbound.
+static constexpr std::uint32_t kNumTexSlots = 20;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -221,6 +231,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
         //                   scratch binding so the table value references a
         //                   declared binding)
     37, // engine slot 18 -> shader binding 37 (godrays_mask scratch, Wave 9)
+    48, // engine slot 19 -> shader binding 48 (exposure_tex, DLSS)
 };
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
@@ -1955,8 +1966,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // Wave 8 ocean (#25) bumps storage_image per set from 14 to 16 for
     // ocean_displacement + ocean_normal (bindings 32/33); Wave 8 PBR (#26)
     // adds pbr_atlas (binding 34) for a total of 17. Wave 9 god rays adds
-    // godrays_mask (binding 37) for a total of 18.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 18 + 4 });
+    // godrays_mask (binding 37) for a total of 18. The DLSS exposure image
+    // (binding 48) makes 19 -- this count is the number of STORAGE_IMAGE
+    // bindings the shared layout declares, so it MUST be bumped in lockstep
+    // with add_binding(..., STORAGE_IMAGE) below or a fully-populated set
+    // fails allocation with VK_ERROR_OUT_OF_POOL_MEMORY. The declared
+    // bindings today are 0, 1, 6, 7, 8, 9, 12, 13, 16, 17, 22, 24, 25, 26,
+    // 32, 33, 34, 37, 48.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 19 + 4 });
     // Binding 2 is the one polymorphic slot on the shared layout (scene TLAS
     // for PathTrace, storage image for the cloud kernels). When the mutable-
     // descriptor extension is available it is declared MUTABLE_EXT (below);
@@ -2251,6 +2268,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // the same superset reason as 36/38/39 above.
         add_binding(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Planetary P4 --------------------------------------
+        // DLSS exposure texture: binding 48, a 1x1 R32F storage image
+        // carrying the pre-tonemap exposure multiplier. Declared by
+        // AutoExposure.slang only, but the descriptor-set layout is shared
+        // across every kernel, so it has to live here or that kernel's
+        // module is rejected at vkCreateComputePipelines. See
+        // kSlotToTexBinding[]'s entry for why the scalar needed an image.
+        add_binding(48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
