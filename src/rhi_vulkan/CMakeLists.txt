@@ -20,13 +20,20 @@ target_link_libraries(pt_rhi_vulkan
 # Vulkan backend on). When inactive the wrapper file isn't compiled, the
 # NRD lib isn't linked, and PT_ENABLE_NRD is undefined in the source so
 # the #if PT_ENABLE_NRD blocks inside VulkanNrdLibDenoiser.{h,cpp} compile
-# out -- VulkanDenoiser.cpp is unrelated (it's the SVGF placeholder backing
-# the existing r_denoiser nrd cvar value and has no PT_ENABLE_NRD gates).
-# Today the wrapper is a scaffold -- it stubs the NRD instance/dispatch
-# translation; the r_denoiser nrd cvar value still routes through the
-# in-house SVGF chain. A follow-up PR will switch routing to
-# VulkanNrdLibDenoiser::Encode once the per-frame Dispatch->VkDispatch
-# translation lands.
+# out -- VulkanDenoiser.cpp is built either way (it is the in-house SVGF
+# chain behind svgf_basic / svgf_atrous, it is the fallback `r_denoiser
+# nrd` degrades to, and even on the NRD path its DenoiseFinalize stage
+# does the bloom + tonemap + swapchain write; it has no PT_ENABLE_NRD
+# gates).
+# With PT_NRD_ACTIVE the `r_denoiser nrd` cvar value routes to
+# VulkanNrdLibDenoiser (a real nrd::Instance running RELAX_DIFFUSE);
+# without it the engine's Device::SupportsNrdLibrary() reports false and
+# the cvar degrades to the in-house SVGF a-trous chain with a log line.
+#
+# The two Slang kernels that bridge the engine's G-buffer set to NRD's
+# IN_*/OUT_* textures (NrdPack / NrdUnpack) are compiled further down,
+# in a second PT_NRD_ACTIVE block -- pt_compile_slang isn't defined
+# until cmake/Slang.cmake is included, which happens below.
 if(PT_NRD_ACTIVE)
     target_sources(pt_rhi_vulkan PRIVATE VulkanNrdLibDenoiser.cpp)
     target_link_libraries(pt_rhi_vulkan PRIVATE NRD)
@@ -216,6 +223,18 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/DenoiseFinalize.slang
     STAGE compute ENTRY main TARGETS spirv)
+# NRD front-end / back-end bridge kernels (issue #50). Compiled ONLY
+# under PT_NRD_ACTIVE: nothing but VulkanNrdLibDenoiser.cpp references
+# their embedded SPIR-V, so building them into the default (NRD-off)
+# configuration would be dead weight in every binary.
+if(PT_NRD_ACTIVE)
+    pt_compile_slang(
+        TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/NrdPack.slang
+        STAGE compute ENTRY main TARGETS spirv)
+    pt_compile_slang(
+        TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/NrdUnpack.slang
+        STAGE compute ENTRY main TARGETS spirv)
+endif()
 # --- Acceleration-structure probe (issue #254 P0 / issue #251) -------------
 # Test-only ray-query kernel used by tests/rhi_accel_update_test.cpp to
 # read CommittedInstanceID() back out of a multi-instance TLAS. Declares

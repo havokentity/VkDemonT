@@ -10,6 +10,9 @@
 #if defined(PT_ENABLE_OPTIX)
 #include "VulkanOptixDenoiser.h"
 #endif
+#if defined(PT_ENABLE_NRD)
+#include "VulkanNrdLibDenoiser.h"
+#endif
 
 #include "../core/Diag.h"
 #include "../core/Log.h"
@@ -2563,6 +2566,14 @@ void VulkanDevice::DestroyDevice() {
         // raw VK objects via its own dtor; destroying it here does
         // both in the right order while device_ is still live.
         denoiser_.reset();
+#if defined(PT_ENABLE_NRD)
+        // Same rationale for the NRD library denoiser: it owns raw
+        // VkImage / VkDeviceMemory / VkImageView / VkPipeline /
+        // VkDescriptorPool handles (NRD's pools can't go through
+        // CreateTexture -- they need VK_IMAGE_USAGE_SAMPLED_BIT), and
+        // its dtor calls vkDestroy* against device_->RawDevice().
+        nrd_lib_denoiser_.reset();
+#endif
 #if defined(PT_ENABLE_OPTIX)
         // Same rationale for the OptiX denoiser: it holds external
         // VkImage / VkDeviceMemory / VkSemaphore handles whose dtor
@@ -5231,6 +5242,21 @@ bool VulkanDevice::SupportsDenoise() const {
     return pipelines_ready_.load(std::memory_order_acquire);
 }
 
+bool VulkanDevice::SupportsNrdLibrary() const {
+#if defined(PT_ENABLE_NRD)
+    // Compiled in. The only remaining question is whether a previous
+    // Init() already failed -- CreateInstance / vkCreateComputePipelines
+    // failures are deterministic, so once one happens the answer is
+    // permanently no and the engine downgrades `r_denoiser nrd` to the
+    // in-house SVGF chain with a log line.
+    return !nrd_lib_failed_;
+#else
+    // -DPT_ENABLE_NRD=OFF (the default). The NRD library was never
+    // fetched or linked, so there is nothing to route to.
+    return false;
+#endif
+}
+
 void VulkanDevice::Denoise(const DenoiseDesc& d) {
     PT_ZONE_SCOPED_N("VulkanDevice::Denoise");
     if (device_ == VK_NULL_HANDLE) return;
@@ -5268,7 +5294,7 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
                      "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
                      "3=OptixTemporalHdr, 4=OptixTemporalHdrAov, "
                      "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly, "
-                     "8=SvgfNoFinalize), "
+                     "8=SvgfNoFinalize, 9=Nrd), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_logged_kinds_mask |= bit;
@@ -5367,6 +5393,129 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 #endif
+
+    // ---- NRD library path (Kind::Nrd) ----------------------------------
+    // NVIDIA RayTracingDenoiser, RELAX_DIFFUSE (issue #50). Structured
+    // to FALL THROUGH into the SVGF branch below on any failure rather
+    // than returning: a frame where NRD can't run still gets denoised,
+    // just by the in-house chain, and SupportsNrdLibrary() flips false
+    // so the engine's next frame logs the downgrade and stops asking.
+    if (d.kind == DenoiseDesc::Kind::Nrd) {
+#if defined(PT_ENABLE_NRD)
+        bool nrd_ran = false;
+        if (d.color_in.id == 0 || d.depth_in.id == 0 || d.motion_in.id == 0 ||
+            d.normal_in.id == 0 || d.output.id == 0) {
+            LOG_WARN("VulkanDevice::Denoise(Nrd): missing G-buffer inputs "
+                     "(color={} depth={} motion={} normal={} out={}) -- "
+                     "falling through to SVGF for this frame",
+                     d.color_in.id, d.depth_in.id, d.motion_in.id,
+                     d.normal_in.id, d.output.id);
+        } else if (!nrd_lib_failed_) {
+            auto image_it = images_.find(d.color_in.id);
+            if (image_it == images_.end()) {
+                LOG_WARN("VulkanDevice::Denoise(Nrd): color_in image lookup miss (id={})",
+                         d.color_in.id);
+            } else {
+                const std::uint32_t w = image_it->second.extent.width;
+                const std::uint32_t h = image_it->second.extent.height;
+                if (w != 0 && h != 0) {
+                    if (nrd_lib_denoiser_ == nullptr) {
+                        nrd_lib_denoiser_ = std::make_unique<VulkanNrdLibDenoiser>(this);
+                    }
+                    if (!nrd_lib_denoiser_->Init(w, h)) {
+                        // Init() logs the specific reason. Latch so the
+                        // engine downgrades on the next frame instead of
+                        // re-attempting a deterministic failure forever.
+                        nrd_lib_failed_ = true;
+                        LOG_ERROR("VulkanDevice::Denoise(Nrd): NRD init failed at {}x{}; "
+                                  "`r_denoiser nrd` degrades to the in-house SVGF "
+                                  "a-trous chain for the rest of this session", w, h);
+                    } else {
+                        VulkanNrdLibDenoiser::EncodeInputs ei{};
+                        ei.color_in      = d.color_in;
+                        ei.depth_in      = d.depth_in;
+                        ei.motion_in     = d.motion_in;
+                        ei.normal_in     = d.normal_in;
+                        ei.albedo_in     = d.albedo_in;
+                        ei.output        = d.output;
+                        ei.world_to_view = d.world_to_view;
+                        ei.view_to_clip  = d.view_to_clip;
+                        ei.jitter_x      = d.jitter_x;
+                        ei.jitter_y      = d.jitter_y;
+                        ei.reset_history = d.reset_history;
+                        // NRD wants demodulated radiance for the same
+                        // reason SVGF does, and the engine's guide is
+                        // reusable as-is -- see NrdPack.slang.
+                        ei.demod_enabled = d.albedo_demod_enabled && (d.albedo_in.id != 0);
+                        nrd_lib_denoiser_->Encode(wrapped_cb_->Raw(), ei);
+                        nrd_ran = true;
+                    }
+                }
+            }
+        }
+
+        if (nrd_ran) {
+            // Bloom composite + tonemap + swapchain write. Reuse the
+            // SVGF denoiser's proven DenoiseFinalize stage rather than
+            // duplicating it -- exactly what Kind::FinalizeOnly does.
+            // final_output == 0 means the caller wants the denoised
+            // linear-HDR left in d.output (the Kind::SvgfNoFinalize
+            // contract), so we stop here.
+            if (d.final_output.id != 0) {
+                if (denoiser_ == nullptr) {
+                    denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+                }
+                if (!denoiser_->Ready() && !denoiser_->Init()) {
+                    LOG_ERROR("VulkanDevice::Denoise(Nrd): SVGF finalize stage init "
+                              "failed; the denoised image is in the HDR intermediate "
+                              "but the swapchain write is skipped this frame");
+                    denoiser_.reset();
+                    return;
+                }
+                // RAW: NrdUnpack just wrote d.output and the finalize
+                // dispatch is about to read it.
+                {
+                    VkMemoryBarrier mb{};
+                    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    vkCmdPipelineBarrier(wrapped_cb_->Raw(),
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 1, &mb, 0, nullptr, 0, nullptr);
+                }
+                auto out_it = images_.find(d.output.id);
+                const std::uint32_t fw = (out_it != images_.end()) ? out_it->second.extent.width  : 0u;
+                const std::uint32_t fh = (out_it != images_.end()) ? out_it->second.extent.height : 0u;
+                denoiser_->SetTonemapOp(d.tonemap_op);
+                denoiser_->EncodeFinalizeOnly(
+                    wrapped_cb_->Raw(),
+                    LookupImageView(d.output),
+                    LookupImageView(d.final_output),
+                    LookupBuffer(d.exposure_state),
+                    (d.bloom_in.id != 0) ? LookupImageView(d.bloom_in) : VK_NULL_HANDLE,
+                    d.bloom_intensity,
+                    fw, fh, d.hdr_pipeline,
+                    (d.stars_in.id != 0) ? LookupImageView(d.stars_in) : VK_NULL_HANDLE);
+            }
+            return;
+        }
+        // else: fall through to the SVGF chain below.
+#else
+        // Built without -DPT_ENABLE_NRD=ON. The engine gates on
+        // SupportsNrdLibrary() and should never issue this kind here,
+        // so a one-shot warning flags the plumbing bug; the frame still
+        // renders through SVGF rather than dropping the denoise.
+        static bool s_logged_no_nrd = false;
+        if (!s_logged_no_nrd) {
+            LOG_WARN("VulkanDevice::Denoise: Kind::Nrd requested on a build without "
+                     "PT_ENABLE_NRD. Configure with -DPT_ENABLE_NRD=ON to get the "
+                     "NVIDIA RayTracingDenoiser; running the in-house SVGF a-trous "
+                     "chain instead.");
+            s_logged_no_nrd = true;
+        }
+#endif
+    }
 
     // ---- FinalizeOnly path (Kind::FinalizeOnly) ------------------------
     // Run JUST the swapchain finalize stage (linear HDR -> exposure ->

@@ -279,9 +279,23 @@ if(PT_NRD_ACTIVE)
     if(TARGET NRD)
         target_compile_options(NRD PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
     endif()
+    # NRD's transitive targets are a mixed bag of library kinds: MathLib is
+    # an INTERFACE library (header-only) and ShaderMake ships both a real
+    # executable and a UTILITY/custom target depending on the version.
+    # target_compile_options() is a hard CMake ERROR on both of those
+    # ("may only set INTERFACE properties on INTERFACE targets" /
+    # "called with non-compilable target type"), so filter by TYPE before
+    # touching them rather than by name.
     foreach(_t MathLib ShaderMake ShaderMakeBlob)
         if(TARGET ${_t})
-            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+            get_target_property(_t_type ${_t} TYPE)
+            if(_t_type STREQUAL "STATIC_LIBRARY"  OR
+               _t_type STREQUAL "SHARED_LIBRARY"  OR
+               _t_type STREQUAL "MODULE_LIBRARY"  OR
+               _t_type STREQUAL "OBJECT_LIBRARY"  OR
+               _t_type STREQUAL "EXECUTABLE")
+                target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+            endif()
         endif()
     endforeach()
 endif()
