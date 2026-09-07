@@ -93,7 +93,12 @@ private:
     // avoid reading past the end (pbr_atlas at slot 16 already sat right
     // at the old [16] boundary). Keep in sync with kSlotToTexBinding[] /
     // kNumTexSlots in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[20] {};
+    //
+    // Slot 19 (exposure_tex -> vk::binding 48) bumps it to [21]. NGX
+    // wants the pre-tonemap exposure multiplier as a 1x1 R32F IMAGE and
+    // the engine only had it as a storage-buffer scalar; AutoExposure.slang
+    // now mirrors the scalar into that image. kNumTexSlots is 20.
+    TextureHandle  bound_tex_[21] {};
     // 14 buffer slots:
     //   0..7   original engine layout (mesh_positions / mesh_indices,
     //          primitives, marginal / conditional CDFs, exposure_state,

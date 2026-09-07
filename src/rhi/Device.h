@@ -273,29 +273,39 @@ public:
         // Engine allocates + writes this only when r_denoiser is
         // optix_hdr_aov.
         TextureHandle albedo_in;
-        // MetalFX specular-guidance G-buffers (issue #118). Three
-        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
-        // specular from diffuse response and eliminate the 8x8 halos
-        // it otherwise produces around bright reflections / metals.
-        //   specular_albedo_in       -- RGBA16F per-pixel F0 (Fresnel
-        //                               reflectance at normal incidence;
-        //                               metals: F0 = albedo; dielectrics:
-        //                               float3(0.04); Lambert: 0).
-        //   roughness_in             -- R32F single-channel surface
-        //                               roughness in [0, 1].
-        //   specular_hit_distance_in -- R32F distance from camera to
-        //                               specularly-reflected hit (MVP:
-        //                               primary_t * smoothness proxy;
-        //                               see PathTrace.slang's matching
-        //                               texture declaration for the
-        //                               trade-off vs a real second-trace).
-        // Engine allocates them only for DenoiserKind::MetalFX /
-        // SvgfBasicMetalFx / SvgfAtrousMetalFx; nil for all other kinds.
-        // Apple's MTLFXTemporalDenoisedScaler tolerates a nil binding
-        // as "no guidance," so backends consuming the trio can pass
-        // them straight through. SVGF / NRD / OptiX paths ignore them
-        // (their respective issues will wire matching inputs later;
-        // #50 covers NRD).
+        // Specular-guidance G-buffers. Added for MetalFX (issue #118),
+        // which is gone; the sole consumer is now DLSS Ray Reconstruction,
+        // and these three map one-for-one onto its guide inputs.
+        //   specular_albedo_in       -- RGBA16F. The SPLIT-SUM INTEGRATED
+        //                               specular reflectance
+        //                               F0*A(rough, n.v) + B(rough, n.v)
+        //                               (Karis 2013 / Lazarov's fit), i.e.
+        //                               RR's pInSpecularAlbedo. NOT raw F0:
+        //                               F0 is normal-incidence only, and
+        //                               every dielectric rises toward 1 at
+        //                               grazing incidence, so F0 understates
+        //                               the ocean horizon by ~1/0.02.
+        //   roughness_in             -- R32F PERCEPTUAL roughness in [0, 1],
+        //                               the r for which GGX alpha = r^2.
+        //                               Matches RR / NRD's "linear
+        //                               roughness" = sqrt(alpha); no remap
+        //                               is applied on either side.
+        //   specular_hit_distance_in -- R32F distance FROM THE PRIMARY HIT
+        //                               along the mirror-reflected ray to
+        //                               what that ray hits (NRD's hitDist
+        //                               convention), from a real second
+        //                               trace. 0 means "no specular lobe"
+        //                               (Lambert / sky); a reflected ray
+        //                               that escapes writes depth_in's own
+        //                               1e10 m sky sentinel, because the
+        //                               reflected image of the sky is at
+        //                               infinity and has no parallax to
+        //                               correct.
+        // Engine allocates all three only while DLSS Ray Reconstruction is
+        // requested (r_dlss != off && r_dlss_rr); 0 for every other config,
+        // including the default. They travel together -- a consumer handed a
+        // partial set is worse off than one handed none. SVGF / NRD / OptiX
+        // ignore them (#50 covers NRD's own hit-distance input).
         TextureHandle specular_albedo_in;
         TextureHandle roughness_in;
         TextureHandle specular_hit_distance_in;
@@ -317,6 +327,20 @@ public:
         // exposure the path tracer's inline tonemap would have used.
         // MetalFX ignores it.
         BufferHandle  exposure_state;
+        // The SAME scalar as `exposure_state`, as a 1x1 R32F texture:
+        // NGX's DLSS / DLSS-RR eval takes the exposure as
+        // `pInExposureTexture` and cannot read a storage buffer.
+        //
+        // It is the PRE-tonemap multiplier -- every tonemap site in this
+        // engine is `tonemapDispatch(c * exposure, op)` -- so it is a
+        // dimensionless gain on physical radiance (the renderer is
+        // radiometric: W/m^2/sr), not a photometric stop value.
+        //
+        // Kept in step with the buffer by whichever path owns the scalar:
+        // AutoExposure.slang writes both in one invocation when
+        // r_auto_exposure is 1, the host writes both when it is 0.
+        // 0 unless r_dlss != off. Every non-DLSS consumer ignores it.
+        TextureHandle exposure_texture;
         // Vulkan SVGF/NRD only: bloom-pyramid mip 0 (half-res linear
         // HDR). The DenoiseFinalize pass bilinear-samples this and
         // adds it pre-tonemap so highlights get the same ACES squash.

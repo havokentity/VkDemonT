@@ -1706,6 +1706,26 @@ private:
     // its final tonemap, replacing the per-frame readback path that
     // stalled the GPU on dGPU.
     std::uint64_t                               exposure_state_id_     = 0;
+    // The SAME scalar as exposure_state_id_, published as a 1x1 R32F
+    // storage image (engine texture slot 19 -> vk::binding 48).
+    //
+    // NGX's DLSS eval takes the exposure as `pInExposureTexture`, a 1x1
+    // R32F texture; it cannot read a storage buffer, and the engine had the
+    // value only in buffer form. docs/DLSS_INTEGRATION_PLAN.md section 2.3
+    // item 4 records this as a missing input for both SR and RR.
+    //
+    // It is the PRE-tonemap multiplier, which is what NGX wants: every
+    // tonemap site here is `tonemapDispatch(c * exposure, op)`, so the
+    // scalar scales linear radiance and the curve follows. Radiometric
+    // engine, so it is a dimensionless gain on W/m^2/sr -- not a photometric
+    // stop.
+    //
+    // Written by whichever path owns the scalar, so the two views cannot
+    // drift: AutoExposure.slang stores it in the same invocation that
+    // computes it (r_auto_exposure 1), and the host WriteTexture's it
+    // alongside every WriteBuffer of exposure_state (manual mode + seeding).
+    // Allocated only while DlssRequested(); 0 otherwise.
+    std::uint64_t                               exposure_texture_id_   = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
@@ -1969,32 +1989,44 @@ private:
     std::uint32_t                               restir_alloc_w_ = 0;
     std::uint32_t                               restir_alloc_h_ = 0;
     // --- end ReSTIR DI Phase A ---------------------------------------------
-    // MetalFX specular-guidance G-buffers (issue #118). Three textures
-    // fed to MTLFXTemporalDenoisedScaler so it can tell specular from
-    // diffuse response; without them MetalFX produces 8x8 halos on
-    // bright reflections. Allocated only for MetalFX-family denoiser
-    // kinds (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx);
-    // SVGF / NRD / OptiX paths leave them at 0 since they don't accept
-    // these guidance inputs. Same allocation lifecycle as
-    // normal_tex_id_ / albedo_tex_id_.
+    // Specular-guidance G-buffers. Added for MetalFX (issue #118) and gated
+    // on the MetalFX denoiser kinds, which no live backend could ever
+    // select -- so they were allocated, written and read by nobody until the
+    // MetalFX removal repointed the gate at DlssRayReconstructionRequested().
+    // The only consumer now is DLSS Ray Reconstruction, which is handed all
+    // three at feature-creation time. Allocated only while RR is requested;
+    // 0 for every other configuration, including the default. Same
+    // allocation lifecycle as normal_tex_id_ / albedo_tex_id_.
     //
-    //   specular_albedo_tex_id_       -- RGBA16F per-pixel F0 (Fresnel
-    //                                    reflectance at normal incidence).
-    //                                    Metals: F0 = albedo; dielectrics:
-    //                                    F0 = float3(0.04); Lambert: 0.
-    //   roughness_tex_id_             -- R32F single-channel surface
-    //                                    roughness in [0, 1]. 0 = mirror,
-    //                                    1 = fully rough. (R16F would be
-    //                                    plenty for the precision but the
-    //                                    RHI doesn't expose it today; see
-    //                                    Engine.cpp allocation for the
-    //                                    R16F-vs-R32F trade.)
-    //   specular_hit_distance_tex_id_ -- R32F distance from camera to the
-    //                                    specularly-reflected hit (MVP:
-    //                                    primary_t * smoothness; a future
-    //                                    PR can swap in a real reflection-
-    //                                    ray trace). Same R32F-as-fallback
-    //                                    rationale as roughness_tex_id_.
+    //   specular_albedo_tex_id_       -- RGBA16F. The SPLIT-SUM INTEGRATED
+    //                                    specular reflectance
+    //                                    F0*A(rough, n.v) + B(rough, n.v)
+    //                                    (Karis 2013 / Lazarov's analytic
+    //                                    fit), which is RR's
+    //                                    pInSpecularAlbedo. NOT raw F0 --
+    //                                    F0 is the normal-incidence value
+    //                                    only, and it understates grazing
+    //                                    reflectance by up to 1/F0 (a factor
+    //                                    of ~50 on water), exactly on the
+    //                                    ocean and the planet limb.
+    //   roughness_tex_id_             -- R32F PERCEPTUAL roughness in [0, 1]
+    //                                    (GGX alpha = roughness^2), the
+    //                                    engine's own convention and the one
+    //                                    RR/NRD document; no remap either
+    //                                    way. 0 = mirror, 1 = fully rough.
+    //                                    (R16F would be plenty for the
+    //                                    precision but the RHI doesn't
+    //                                    expose it today; see Engine.cpp
+    //                                    allocation for the R16F-vs-R32F
+    //                                    trade.)
+    //   specular_hit_distance_tex_id_ -- R32F distance FROM THE PRIMARY HIT
+    //                                    along the mirror-reflected ray to
+    //                                    what it hits -- a real second
+    //                                    trace, in NRD's hitDist convention.
+    //                                    Replaces `primary_t * (1-rough)`,
+    //                                    which was not a distance at all.
+    //                                    Same R32F-as-fallback rationale as
+    //                                    roughness_tex_id_.
     std::uint64_t                               specular_albedo_tex_id_       = 0;
     std::uint64_t                               roughness_tex_id_             = 0;
     std::uint64_t                               specular_hit_distance_tex_id_ = 0;
@@ -2375,6 +2407,13 @@ private:
     // at creation time, not per frame. Returns false while the NGX calls are
     // unwired, which is correct: nothing consumes the buffers yet.
     bool DlssRayReconstructionRequested() const;
+    // True when the user has asked for ANY DLSS mode (r_dlss != off),
+    // Ray Reconstruction or not. Gates exposure_texture_id_: NGX takes the
+    // exposure as a 1x1 R32F texture for plain Super Resolution / DLAA as
+    // well as for RR, so the texture is wider than the RR-only guide trio.
+    // Same "reads the cvars, not a resolved state" reasoning as
+    // DlssRayReconstructionRequested().
+    bool DlssRequested() const;
     // Issue #50 -- does the active backend have a working NVIDIA
     // RayTracingDenoiser? Refreshed from Device::SupportsNrdLibrary()
     // once per frame, because the runtime half of that answer can flip

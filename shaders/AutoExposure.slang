@@ -34,6 +34,10 @@
 // Bindings:
 //   binding 1  : accum_hdr (RWTexture2D<float4>) -- shared with PathTrace
 //   binding 15 : exposure_state (RWStructuredBuffer<float>, 1 element)
+//   binding 48 : exposure_tex (RWTexture2D<float>, 1x1 R32F) -- the SAME
+//                scalar as a texture, because NGX's DLSS eval takes the
+//                exposure as pInExposureTexture and cannot read a buffer.
+//                Written under the write_exposure_tex push gate.
 //
 // Push constants (32B, fits within the 112B unified push range):
 //   width, height: accum_hdr dimensions
@@ -91,12 +95,43 @@
 [[vk::binding(11, 0)]] StructuredBuffer<float>  _slot_conditional_cdf;
 [[vk::binding(15, 0)]] RWStructuredBuffer<float> exposure_state;
 
+// --- DLSS exposure texture (binding 48) ------------------------------------
+//
+// The same scalar exposure_state[0] carries, mirrored into a 1x1 R32F
+// image. NGX's DLSS / DLSS-RR eval takes the exposure as a TEXTURE
+// (pInExposureTexture, 1x1 R32F) and cannot read a storage buffer, so the
+// engine has to publish it in both shapes.
+//
+// It is the PRE-tonemap multiplier, which is what NGX asks for: every
+// tonemap site in this engine evaluates `tonemapDispatch(c * exposure, op)`
+// -- the scalar scales linear radiance and the curve is applied after. The
+// engine is radiometric (W/m^2/sr, kPtSolarIrradiance = 1360.8 W/m^2), so
+// this is a dimensionless gain on physical radiance, not a photometric
+// stop value.
+//
+// Written HERE rather than in a pass of its own so the two views cannot
+// drift: one kernel computes `current`, one kernel publishes it twice, in
+// the same invocation, under the same `total_count > 0` guard. The manual
+// (r_auto_exposure 0) path never runs this kernel and the host seeds both
+// resources side by side instead.
+//
+// Declared LAST so it cannot disturb the MSL slot alignment the block
+// above depends on (Metal is gone, but the invariant is cheap to keep).
+// Bound by the engine only when DLSS is on; the descriptor is
+// PARTIALLY_BOUND, and the write is gated on write_exposure_tex so the
+// default r_dlss off path never touches an unbound image.
+[[vk::binding(48, 0), vk::image_format("r32f")]] RWTexture2D<float> exposure_tex;
+
 [[vk::push_constant]]
 cbuffer Push {
     uint  width;
     uint  height;
     uint  stride;
-    uint  pad0;
+    // Was `pad0`. Now the write gate for exposure_tex (binding 48): 1 only
+    // when the engine allocated + bound the 1x1 R32F DLSS exposure image.
+    // Reusing the existing pad rather than growing the struct keeps AePush
+    // at 32 B and the two static_asserts in Engine.cpp intact.
+    uint  write_exposure_tex;
     float key;
     float exp_min;
     float exp_max;
@@ -243,5 +278,11 @@ void main(uint3 tid : SV_DispatchThreadID, uint gid : SV_GroupIndex) {
                           log(target)  * adapt_speed);
         }
         exposure_state[0] = current;
+        // Mirror into the 1x1 R32F image NGX reads. Same invocation, same
+        // value, same guard -- see exposure_tex's declaration for why the
+        // engine needs the scalar in two shapes.
+        if (write_exposure_tex != 0u) {
+            exposure_tex[uint2(0, 0)] = current;
+        }
     }
 }

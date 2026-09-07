@@ -2734,11 +2734,18 @@ Engine::Engine() {
 // resolved denoiser state.
 bool Engine::DlssRayReconstructionRequested() const {
     auto& C = pt::console::Console::Get();
-    const auto* mode = C.FindCVar("r_dlss");
-    const auto* rr   = C.FindCVar("r_dlss_rr");
-    if (!mode || !rr) return false;
-    if (mode->value == "off") return false;   // RR is a mode of DLSS, not independent
+    const auto* rr = C.FindCVar("r_dlss_rr");
+    if (!rr) return false;
+    // RR is a mode of DLSS, not independent.
+    if (!DlssRequested()) return false;
     return rr->GetInt() != 0;
+}
+// See the declaration in Engine.h for why this reads cvars rather than a
+// resolved DLSS state.
+bool Engine::DlssRequested() const {
+    const auto* mode = pt::console::Console::Get().FindCVar("r_dlss");
+    if (!mode) return false;
+    return mode->value != "off";
 }
 
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }
@@ -3874,6 +3881,8 @@ void Engine::TearDownDevice() {
         // autoexpose_pipeline_id_) are owned by the device handle and
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
+        // The 1x1 R32F image view of the same scalar (DLSS pInExposureTexture).
+        if (exposure_texture_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{exposure_texture_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
         if (editor_overlay_segs_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{editor_overlay_segs_buf_id_});
         if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
@@ -4035,6 +4044,7 @@ void Engine::TearDownDevice() {
     moon_map_tex_id_      = 0;
     autoexpose_pipeline_id_ = 0;
     exposure_state_id_      = 0;
+    exposure_texture_id_    = 0;
     placeholder_storage_id_ = 0;
     denoiser_active_      = false;
     prev_frame_valid_ = false;
@@ -8538,6 +8548,16 @@ void Engine::RenderFrame() {
     // Gated on RR INTENT rather than on a resolved denoiser kind, because
     // allocation has to happen before the NGX feature is created: DLSS-RR is
     // handed its guide buffers at creation time, not per-frame.
+    //
+    // KNOWN REMAINING COUPLING, stated rather than hidden: the allocation
+    // site this flag reaches sits inside `if (denoiser_active_)`, so asking
+    // for RR with `r_denoiser off` still allocates nothing. Every other
+    // G-buffer the path tracer produces (depth, motion, normal, albedo) has
+    // the same shape, so untangling it is one change for all of them, not a
+    // special case for these three -- and it belongs to whoever wires the
+    // NGX evaluate, because plan section 5.1 has RR REPLACING the denoiser
+    // chain rather than composing with it. Until then, exercising the guide
+    // writes needs an r_denoiser kind selected alongside r_dlss_rr.
     const bool want_specular_guidance_gbuffers = DlssRayReconstructionRequested();
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
@@ -8950,6 +8970,54 @@ void Engine::RenderFrame() {
             bloom_dummy_tex_id_ = dh.id;
             std::uint16_t zero[4] {0,0,0,0};
             if (dh.id != 0) device_->WriteTexture(dh, zero, sizeof(zero));
+        }
+    }
+
+    // DLSS exposure texture (docs/DLSS_INTEGRATION_PLAN.md 2.3 item 4).
+    // 1x1 R32F holding the same pre-tonemap multiplier exposure_state[0]
+    // carries, because NGX takes the exposure as a texture and cannot read
+    // a storage buffer. Resolution-independent, so it deliberately does NOT
+    // ride the size_changed G-buffer block above -- its only lifetime input
+    // is whether the user has asked for DLSS at all, which is a cvar they
+    // can flip at runtime. Created / destroyed here, BEFORE the frame's
+    // command buffer is acquired, because DestroyTexture wait-idles the
+    // device and must not land in the middle of recording.
+    {
+        const bool want_exposure_tex = DlssRequested();
+        if (want_exposure_tex && exposure_texture_id_ == 0) {
+            auto eh = device_->CreateTexture({
+                .width = 1, .height = 1,
+                .format = pt::rhi::TextureFormat::R32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "dlss_exposure",
+            });
+            exposure_texture_id_ = eh.id;
+            if (exposure_texture_id_ == 0) {
+                LOG_ERROR("dlss_exposure 1x1 R32F creation failed -- DLSS will "
+                          "have to fall back to NGX auto-exposure");
+            } else {
+                // Seed with the live scalar so the very first DLSS frame does
+                // not read an undefined image. AutoExposure overwrites it one
+                // frame later in auto mode; in manual mode this IS the value
+                // and the r_exposure / r_auto_exposure handlers keep it fresh.
+                float seed = 1.0f;
+                auto& Cs = pt::console::Console::Get();
+                bool auto_exp_seed = true;
+                if (auto* av = Cs.FindCVar("r_auto_exposure")) auto_exp_seed = av->GetBool();
+                if (!auto_exp_seed) {
+                    if (auto* ev = Cs.FindCVar("r_exposure")) seed = ev->GetFloat();
+                } else if (exposure_state_id_ != 0) {
+                    float live = 1.0f;
+                    if (device_->ReadbackBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                                &live, sizeof(float))) {
+                        seed = live;
+                    }
+                }
+                device_->WriteTexture(eh, &seed, sizeof(float));
+            }
+        } else if (!want_exposure_tex && exposure_texture_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{exposure_texture_id_});
+            exposure_texture_id_ = 0;
         }
     }
 
@@ -10193,12 +10261,13 @@ void Engine::RenderFrame() {
     // denoiser_kind_ that flips want_albedo_gbuffer above.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
-    // MetalFX specular-guidance G-buffer write gates (issue #118). Same
-    // gating logic as the normal/albedo gates: only ever set when the
-    // engine actually owns the matching texture for this dispatch.
-    // The host's want_specular_guidance_gbuffers flag drives allocation
-    // (set only for DenoiserKind::MetalFX / SvgfBasicMetalFx /
-    // SvgfAtrousMetalFx); the runtime gate here is the descriptor-
+    // Specular-guidance G-buffer write gates. Same gating logic as the
+    // normal/albedo gates: only ever set when the engine actually owns the
+    // matching texture for this dispatch. The host's
+    // want_specular_guidance_gbuffers flag drives allocation (it is
+    // DlssRayReconstructionRequested(); it used to name the MetalFX denoiser
+    // kinds, which no live backend could select -- that is what made the
+    // trio dead code); the runtime gate here is the descriptor-
     // is-actually-bound signal. Under partially-bound semantics the
     // shader-side write MUST elide when the slot is unbound; the
     // per-texture gate is what enables that elision.
@@ -13290,7 +13359,10 @@ void Engine::RenderFrame() {
             std::uint32_t width;
             std::uint32_t height;
             std::uint32_t stride;
-            std::uint32_t pad0;
+            // Was `pad0`; now AutoExposure.slang's write gate for the 1x1
+            // R32F DLSS exposure image at binding 48. Reusing the pad keeps
+            // the struct at 32 B, so both static_asserts below still hold.
+            std::uint32_t write_exposure_tex;
             float key;
             float exp_min;
             float exp_max;
@@ -13342,6 +13414,16 @@ void Engine::RenderFrame() {
         // declared buffer(7)) -- exposure converges to garbage.
         cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
         cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+        // DLSS exposure image. Bound and written only while it exists, i.e.
+        // only while the user has asked for DLSS -- the kernel's gate is the
+        // push flag, so with r_dlss off the image store is never reached and
+        // slot 19 is never bound (PARTIALLY_BOUND covers the empty slot).
+        // The write rides this kernel so the buffer and the image can never
+        // disagree: same invocation, same `current`.
+        if (exposure_texture_id_ != 0) {
+            cb->BindStorageTexture(19, pt::rhi::TextureHandle{exposure_texture_id_});
+            ae.write_exposure_tex = 1u;
+        }
         cb->PushConstants(&ae, sizeof(ae));
         cb->Dispatch(1, 1, 1);  // single workgroup of 64 threads
     }
@@ -13429,11 +13511,14 @@ void Engine::RenderFrame() {
         // tolerates it. MetalFX uses the diffuse albedo as a spatial-
         // filter guidance signal.
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
-        // MetalFX specular-guidance G-buffers (issue #118). Engine
-        // allocates these only for MetalFX-family kinds; for all
-        // other denoiser modes the IDs are 0 and the backend treats
-        // them as "no guidance for this frame" (matching the existing
-        // nil-handle convention used for albedo_in on SVGF/NRD).
+        // Specular-guidance G-buffers. Engine allocates these only when
+        // DLSS Ray Reconstruction is requested (they were gated on the
+        // MetalFX kinds, which no live backend could select -- that is what
+        // made them dead code); for every other mode the IDs are 0 and the
+        // backend treats them as "no guidance for this frame" (matching the
+        // existing nil-handle convention used for albedo_in on SVGF/NRD).
+        // See rhi/Device.h for what each one now actually contains -- the
+        // quantities changed with the consumer.
         dd.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
         dd.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
         dd.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
@@ -13471,6 +13556,9 @@ void Engine::RenderFrame() {
                                  ? pt::rhi::TextureHandle{0}
                                  : present_target;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
+        // Same scalar, 1x1 R32F image, for NGX's pInExposureTexture. 0
+        // unless r_dlss != off; every other consumer ignores it.
+        dd.exposure_texture = pt::rhi::TextureHandle{exposure_texture_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_frame_valid_;
@@ -19392,6 +19480,13 @@ void Engine::RegisterCommands() {
                 float val = cv.GetFloat();
                 device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
                                      &val, sizeof(float), 0);
+                // Keep the DLSS 1x1 R32F view of the same scalar in step.
+                // AutoExposure.slang is what mirrors it in auto mode, and it
+                // does not run in manual mode, so the host owns it here.
+                if (exposure_texture_id_ != 0) {
+                    device_->WriteTexture(pt::rhi::TextureHandle{exposure_texture_id_},
+                                          &val, sizeof(float));
+                }
             }
         };
     }
@@ -19407,6 +19502,12 @@ void Engine::RegisterCommands() {
                 val = ev->GetFloat();
             device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
                                  &val, sizeof(float), 0);
+            // Same reason as the r_exposure handler: from here on nothing
+            // else will update the DLSS exposure image.
+            if (exposure_texture_id_ != 0) {
+                device_->WriteTexture(pt::rhi::TextureHandle{exposure_texture_id_},
+                                      &val, sizeof(float));
+            }
         };
     }
     if (auto* v = C.FindCVar("r_sky_use_astronomical")) {
