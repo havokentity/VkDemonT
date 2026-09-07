@@ -274,7 +274,21 @@ if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND WIN32)
     # with clang-cl against the dynamic runtime, so nvsdk_ngx_s.lib (static
     # CRT) would be the wrong one and would produce CRT-mismatch link errors
     # rather than anything self-explanatory.
-    set(PT_DLSS_IMPORT_LIB   "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    # CONFIG-DEPENDENT, and this is not cosmetic: the Debug CRT
+    # (MDd_DynamicDebug, _ITERATOR_DEBUG_LEVEL=2) cannot link a Release import
+    # library. Getting it wrong produces ten LNK2038 mismatches and LNK1319 at
+    # the final link -- which is exactly how CI failed the first time this was
+    # built in Debug, since local development here is Release-only.
+    #
+    # docs/DLSS_INTEGRATION_PLAN.md section 7.2 flagged this as "[unverified]
+    # whether the _dbg variants are needed for the Debug preset; check at
+    # bringup". They are. This is that check.
+    #
+    # The SDK also ships _iterator0 / _iterator1 variants for projects that
+    # override _ITERATOR_DEBUG_LEVEL. We do not, so the plain _dbg build (IDL
+    # 2, the MSVC Debug default) is the right one.
+    set(PT_DLSS_IMPORT_LIB     "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    set(PT_DLSS_IMPORT_LIB_DBG "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib")
     # The runtime DLLs that must sit next to demont.exe. nvngx_dlssg.dll
     # (Frame Generation) is deliberately NOT shipped: it is out of scope, and
     # shipping an unused 7.5 MB licensed binary invites questions.
@@ -291,6 +305,21 @@ if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND WIN32)
         set_target_properties(dlss_ngx PROPERTIES
             IMPORTED_LOCATION             "${PT_DLSS_IMPORT_LIB}"
             INTERFACE_INCLUDE_DIRECTORIES "${PT_DLSS_INCLUDE_DIR}")
+        # IMPORTED_LOCATION_DEBUG wins for a Debug build and falls back to the
+        # plain IMPORTED_LOCATION otherwise. MAP_IMPORTED_CONFIG_* points the
+        # optimised-with-symbols configs at the Release library, since they use
+        # the release CRT.
+        if(EXISTS "${PT_DLSS_IMPORT_LIB_DBG}")
+            set_target_properties(dlss_ngx PROPERTIES
+                IMPORTED_LOCATION_DEBUG              "${PT_DLSS_IMPORT_LIB_DBG}"
+                MAP_IMPORTED_CONFIG_RELWITHDEBINFO   "Release"
+                MAP_IMPORTED_CONFIG_MINSIZEREL       "Release")
+        else()
+            message(WARNING
+                "PT_ENABLE_DLSS: debug import library not found at "
+                "${PT_DLSS_IMPORT_LIB_DBG} -- a Debug build will fail to link "
+                "with LNK2038 CRT mismatches.")
+        endif()
         set(PT_DLSS_ACTIVE ON)
         message(STATUS "DLSS: enabled (v310.7.0, NVIDIA RTX SDK licence) -- ${dlss_SOURCE_DIR}")
     endif()

@@ -257,6 +257,13 @@ jobs:
   #
   # DLSS is OFF here for the same reason it is off on the hosted PR lane: no
   # object file depends on it yet. Revisit when the NGX calls land.
+  # NOTE ON `shell: powershell`: every other job here uses `pwsh`
+  # (PowerShell 7), which GitHub-hosted runners ship. This one runs on a
+  # developer workstation that has Windows PowerShell 5.1 and no pwsh, and
+  # `shell: pwsh` failed with a bare "pwsh: command not found" before the step
+  # produced any other output. Requiring a PowerShell 7 install on the runner
+  # host would be the alternative; not requiring it is cheaper, and every
+  # command in this job is 5.1-compatible.
   gpu-goldens:
     name: GPU golden matrix (self-hosted RTX 5090)
     if: github.event_name == 'pull_request'
@@ -272,7 +279,7 @@ jobs:
       # deliberately NOT provisioned by this workflow: reprovisioning a
       # workstation from CI is how workstations get broken.
       - name: Configure
-        shell: pwsh
+        shell: powershell
         run: |
           $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
           $inst = & $vsw -latest -prerelease -property installationPath
@@ -281,7 +288,7 @@ jobs:
           cmake --preset win-clang-release -DPT_ENABLE_DLSS=OFF
 
       - name: Build
-        shell: pwsh
+        shell: powershell
         run: |
           $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
           $inst = & $vsw -latest -prerelease -property installationPath
@@ -294,7 +301,7 @@ jobs:
       # via stb_image_write, which does not mkdir.
       - name: Golden matrix
         id: goldens
-        shell: pwsh
+        shell: powershell
         run: |
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
               build/win-clang-release/golden_actual, build/win-clang-release/golden_diff
