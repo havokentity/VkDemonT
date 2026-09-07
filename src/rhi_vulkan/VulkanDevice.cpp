@@ -7,8 +7,12 @@
 
 #include "VulkanDevice.h"
 #include "VulkanDenoiser.h"
+#include "VulkanNgxUpscaler.h"
 #if defined(PT_ENABLE_OPTIX)
 #include "VulkanOptixDenoiser.h"
+#endif
+#if defined(PT_ENABLE_NRD)
+#include "VulkanNrdLibDenoiser.h"
 #endif
 
 #include "../core/Diag.h"
@@ -66,6 +70,14 @@ extern const unsigned char shader_BloomDown_spirv_data[];
 extern const unsigned long shader_BloomDown_spirv_size;
 extern const unsigned char shader_BloomUp_spirv_data[];
 extern const unsigned long shader_BloomUp_spirv_size;
+// Render-scale resolve (r_render_scale). Bilinear magnify from the
+// engine's internal-extent LDR target (engine texture slot 1 ->
+// binding 1) to the swapchain (slot 0 -> binding 0). Two storage-image
+// bindings, both already in the shared layout, so it rides the same
+// VkPipelineLayout as everything else. Only dispatched when the
+// internal extent differs from the swapchain extent; DLSS replaces it.
+extern const unsigned char shader_Upscale_spirv_data[];
+extern const unsigned long shader_Upscale_spirv_size;
 // Tonemap (composite bloom + apply exposure*ACES*sRGB, plus lens
 // flare). Compiled to SPIR-V; the host-side TonePush has 48 bytes of
 // padding inserted so the ghost array lands at the kPushSplitOffset
@@ -181,7 +193,17 @@ constexpr bool kEnableValidation = false;
 // shared descriptor-set layout stays a superset of every kernel's
 // declared bindings. A sibling fog agent owns binding 36; leave it
 // alone.
-static constexpr std::uint32_t kNumTexSlots = 19;
+// DLSS exposure texture: engine texture slot 19 -> vk::binding 48 is
+// exposure_tex, a 1x1 R32F storage image holding the PRE-TONEMAP exposure
+// multiplier -- the same scalar AutoExposure.slang writes into
+// exposure_state[0] and Tonemap.slang multiplies the linear radiance by
+// before the curve. NGX's DLSS eval takes that value as a 1x1 R32F
+// TEXTURE (pInExposureTexture), which a storage buffer cannot satisfy, so
+// AutoExposure mirrors the scalar into this image in the same pass that
+// computes it (single source of truth: one kernel, one value, two views of
+// it). Allocated only when DLSS is requested; PARTIALLY_BOUND covers the
+// default r_dlss off case where the slot stays unbound.
+static constexpr std::uint32_t kNumTexSlots = 20;
 constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     0,  // engine slot 0  -> shader binding 0  (output / swapchain)
     1,  // engine slot 1  -> shader binding 1  (accum_hdr)
@@ -209,6 +231,7 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
         //                   scratch binding so the table value references a
         //                   declared binding)
     37, // engine slot 18 -> shader binding 37 (godrays_mask scratch, Wave 9)
+    48, // engine slot 19 -> shader binding 48 (exposure_tex, DLSS)
 };
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
@@ -865,6 +888,32 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::vector<const char*> exts(glfw_exts, glfw_exts + glfw_ext_n);
     if (kEnableValidation) {
         exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    // --- NGX / DLSS instance extensions ---------------------------------
+    // NGX needs these enabled at vkCreateInstance time, which is why this
+    // is here and not anywhere near VulkanNgxUpscaler's construction.
+    // The list is ASKED FOR, not hardcoded: NVIDIA has changed it across
+    // SDK versions and a hardcoded copy would rot silently (DLSS would
+    // initialise and then fail at feature-create with an opaque code).
+    //
+    // Best-effort by construction: an empty list on a machine with no
+    // NVIDIA driver is the expected answer, and DLSS then reports itself
+    // unavailable later. Instance creation must never fail because an
+    // optional upscaler could not enumerate itself.
+    //
+    // The strings are owned by ngx_instance_exts and must outlive the
+    // vkCreateInstance call below -- hence the vector at this scope
+    // rather than inside a helper.
+    const std::vector<std::string> ngx_instance_exts =
+        VulkanNgxUpscaler::RequiredInstanceExtensions();
+    for (const auto& e : ngx_instance_exts) {
+        const bool already = std::any_of(exts.begin(), exts.end(),
+            [&](const char* c) { return e == c; });
+        if (!already) exts.push_back(e.c_str());
+    }
+    if (!ngx_instance_exts.empty()) {
+        LOG_INFO("DLSS: requesting {} NGX instance extension(s) at "
+                 "vkCreateInstance", ngx_instance_exts.size());
     }
 
     std::vector<const char*> layers;
@@ -1764,6 +1813,47 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
              enable_rt_pipeline, enable_pipeline_library, enable_rt_maint1, enable_ser_ext,
              enable_pos_fetch, enable_sucf, use_mutable_binding2);
 
+    // --- NGX / DLSS device extensions ------------------------------------
+    // Same story as the instance side, one step later: NGX names the
+    // device extensions it needs (VK_NVX_binary_import,
+    // VK_NVX_image_view_handle, push descriptors and friends, depending
+    // on SDK version) and they must be enabled here, at vkCreateDevice.
+    // Asked for rather than hardcoded, for the same reason.
+    //
+    // Filtered against what the physical device actually exposes:
+    // vkCreateDevice FAILS OUTRIGHT on an unsupported extension name, so
+    // an unfiltered list would turn "DLSS is unavailable on this GPU"
+    // into "the engine does not start". Anything filtered out is logged
+    // -- DLSS will fail its own capability check afterwards and fall
+    // back to off, but the reason should be visible here rather than
+    // inferred from a later opaque NGX result.
+    //
+    // Strings live in ngx_device_exts for the duration of the call.
+    const std::vector<std::string> ngx_device_exts =
+        VulkanNgxUpscaler::RequiredDeviceExtensions(instance_, phys_device_);
+    std::uint32_t ngx_dext_added   = 0;
+    std::uint32_t ngx_dext_dropped = 0;
+    for (const auto& e : ngx_device_exts) {
+        if (!phys_exts.Has(e.c_str())) {
+            LOG_WARN("DLSS: NGX asked for device extension `{}` which this "
+                     "physical device does not expose -- skipping it; DLSS "
+                     "will report itself unavailable", e);
+            ++ngx_dext_dropped;
+            continue;
+        }
+        const bool already = std::any_of(dexts.begin(), dexts.end(),
+            [&](const char* c) { return e == c; });
+        if (!already) { dexts.push_back(e.c_str()); ++ngx_dext_added; }
+    }
+    if (!ngx_device_exts.empty()) {
+        LOG_INFO("DLSS: requesting {} NGX device extension(s) at "
+                 "vkCreateDevice ({} already enabled, {} unsupported)",
+                 ngx_dext_added,
+                 static_cast<std::uint32_t>(ngx_device_exts.size())
+                     - ngx_dext_added - ngx_dext_dropped,
+                 ngx_dext_dropped);
+    }
+
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext                   = &f2;
@@ -1876,8 +1966,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // Wave 8 ocean (#25) bumps storage_image per set from 14 to 16 for
     // ocean_displacement + ocean_normal (bindings 32/33); Wave 8 PBR (#26)
     // adds pbr_atlas (binding 34) for a total of 17. Wave 9 god rays adds
-    // godrays_mask (binding 37) for a total of 18.
-    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 18 + 4 });
+    // godrays_mask (binding 37) for a total of 18. The DLSS exposure image
+    // (binding 48) makes 19 -- this count is the number of STORAGE_IMAGE
+    // bindings the shared layout declares, so it MUST be bumped in lockstep
+    // with add_binding(..., STORAGE_IMAGE) below or a fully-populated set
+    // fails allocation with VK_ERROR_OUT_OF_POOL_MEMORY. The declared
+    // bindings today are 0, 1, 6, 7, 8, 9, 12, 13, 16, 17, 22, 24, 25, 26,
+    // 32, 33, 34, 37, 48.
+    psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,           kTotalSets * 19 + 4 });
     // Binding 2 is the one polymorphic slot on the shared layout (scene TLAS
     // for PathTrace, storage image for the cloud kernels). When the mutable-
     // descriptor extension is available it is declared MUTABLE_EXT (below);
@@ -2172,6 +2268,13 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // the same superset reason as 36/38/39 above.
         add_binding(47, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
         // --- end Planetary P4 --------------------------------------
+        // DLSS exposure texture: binding 48, a 1x1 R32F storage image
+        // carrying the pre-tonemap exposure multiplier. Declared by
+        // AutoExposure.slang only, but the descriptor-set layout is shared
+        // across every kernel, so it has to live here or that kernel's
+        // module is rejected at vkCreateComputePipelines. See
+        // kSlotToTexBinding[]'s entry for why the scalar needed an image.
+        add_binding(48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
@@ -2395,6 +2498,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // identically to the Metal path.
         build_pipeline("bloom_down",  shader_BloomDown_spirv_data,    shader_BloomDown_spirv_size);
         build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
+        // Render-scale resolve (r_render_scale). Same shared-layout
+        // story as the bloom pair: two storage images at bindings 0
+        // and 1 and a 16-byte push. The engine only dispatches it on
+        // frames where the internal render extent differs from the
+        // swapchain extent, so at the default scale of 1.0 this
+        // pipeline is built and never used -- registration is a
+        // one-time cost that lets Engine::EnsurePipelineHandles treat
+        // "upscale unavailable" as "render scaling unavailable"
+        // rather than as a black screen.
+        build_pipeline("upscale",     shader_Upscale_spirv_data,      shader_Upscale_spirv_size);
         // Tonemap pipeline. Engine.cpp's post-denoise tonemap chain
         // dispatches this when tonemap_pipeline_id_ != 0 AND
         // use_engine_tonemap is true. On Vulkan that's currently NEVER:
@@ -2545,6 +2658,21 @@ void VulkanDevice::DestroyDevice() {
         // raw VK objects via its own dtor; destroying it here does
         // both in the right order while device_ is still live.
         denoiser_.reset();
+        // The NGX upscaler holds a feature handle whose GPU resources
+        // are owned by the driver's DLSS snippet, plus NGX's own
+        // parameter blocks. Its dtor releases the feature and calls
+        // NVSDK_NGX_VULKAN_Shutdown1(device_), so it MUST run while the
+        // VkDevice is still live -- shutting NGX down after
+        // vkDestroyDevice would hand the runtime a dead handle.
+        ngx_upscaler_.reset();
+#if defined(PT_ENABLE_NRD)
+        // Same rationale for the NRD library denoiser: it owns raw
+        // VkImage / VkDeviceMemory / VkImageView / VkPipeline /
+        // VkDescriptorPool handles (NRD's pools can't go through
+        // CreateTexture -- they need VK_IMAGE_USAGE_SAMPLED_BIT), and
+        // its dtor calls vkDestroy* against device_->RawDevice().
+        nrd_lib_denoiser_.reset();
+#endif
 #if defined(PT_ENABLE_OPTIX)
         // Same rationale for the OptiX denoiser: it holds external
         // VkImage / VkDeviceMemory / VkSemaphore handles whose dtor
@@ -2942,6 +3070,18 @@ VkExtent2D VulkanDevice::LookupImageExtent(TextureHandle h) {
     return (it == images_.end()) ? VkExtent2D{0, 0} : it->second.extent;
 }
 
+VkCommandBuffer VulkanDevice::CurrentRawCommandBuffer() const {
+    return (wrapped_cb_ != nullptr) ? wrapped_cb_->Raw() : VK_NULL_HANDLE;
+}
+
+VkFormat VulkanDevice::LookupImageFormat(TextureHandle h) {
+    if (h.id == kSwapchainTextureId) return swap_format_;
+    if (h.id == 0) return VK_FORMAT_UNDEFINED;
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VK_FORMAT_UNDEFINED : it->second.format;
+}
+
 VkBuffer VulkanDevice::LookupBuffer(BufferHandle h) {
     if (h.id == 0) return VK_NULL_HANDLE;
     std::lock_guard lock(resource_mutex_);
@@ -3261,7 +3401,19 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
     // TRANSFER_SRC : the SVGF basic-mode vkCmdCopyImage out of the
     //                history texture into post_denoise_hdr; also
     //                lets ReadbackTexture work on any storage image.
+    // SAMPLED_BIT  : required by NGX/DLSS, which builds its own
+    //                descriptors over the views the engine hands it and
+    //                SAMPLES the input images (colour / depth / motion)
+    //                rather than reading them as storage. A DLSS input
+    //                image without this bit is a validation error at
+    //                feature-evaluate time, not at creation, so it
+    //                surfaces as a mid-frame failure rather than a
+    //                startup one. Costs nothing here: every format this
+    //                switch can produce supports SAMPLED as a
+    //                core-required optimal-tiling feature, and no other
+    //                path is affected by an extra usage bit.
     ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT
+                     | VK_IMAGE_USAGE_SAMPLED_BIT
                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
@@ -5213,6 +5365,84 @@ bool VulkanDevice::SupportsDenoise() const {
     return pipelines_ready_.load(std::memory_order_acquire);
 }
 
+bool VulkanDevice::SupportsNrdLibrary() const {
+#if defined(PT_ENABLE_NRD)
+    // Compiled in. The only remaining question is whether a previous
+    // Init() already failed -- CreateInstance / vkCreateComputePipelines
+    // failures are deterministic, so once one happens the answer is
+    // permanently no and the engine downgrades `r_denoiser nrd` to the
+    // in-house SVGF chain with a log line.
+    return !nrd_lib_failed_;
+#else
+    // -DPT_ENABLE_NRD=OFF (the default). The NRD library was never
+    // fetched or linked, so there is nothing to route to.
+    return false;
+#endif
+}
+
+// ---- Temporal upscaler (DLSS SR / DLAA via NGX) -------------------------
+//
+// All four route through ngx_upscaler_, created lazily on the first
+// call. The creation is NOT done in the constructor on purpose: NGX
+// initialisation loads a ~59 MB DLL and talks to the driver, and paying
+// that on every launch of a build where the user never sets r_dlss would
+// be a startup-time regression for a feature they are not using.
+
+bool VulkanDevice::SupportsUpscaler() const {
+    // Const-correct lazy init is not worth a mutable member here: the
+    // engine calls Upscale() (non-const) on the same frame it first
+    // consults this, and reporting "not yet" for one frame simply keeps
+    // r_dlss off for that frame. What this must never do is report true
+    // before the capability check has actually run.
+    if (device_ == VK_NULL_HANDLE)  return false;
+    if (ngx_upscaler_failed_)       return false;
+    if (ngx_upscaler_ == nullptr)   return false;
+    return ngx_upscaler_->Available();
+}
+
+bool VulkanDevice::QueryUpscalerSettings(UpscalerMode  mode,
+                                         std::uint32_t display_width,
+                                         std::uint32_t display_height,
+                                         UpscalerSettings& out) {
+    out = UpscalerSettings{};
+    if (device_ == VK_NULL_HANDLE) return false;
+    if (ngx_upscaler_failed_)      return false;
+    if (ngx_upscaler_ == nullptr) {
+        ngx_upscaler_ = std::make_unique<VulkanNgxUpscaler>(this);
+    }
+    // Init() latches its own failure and logs the reason once, so a
+    // second call after a failure is free and silent.
+    if (!ngx_upscaler_->Init()) {
+        ngx_upscaler_failed_ = true;
+        return false;
+    }
+    return ngx_upscaler_->QueryOptimalSettings(mode, display_width,
+                                               display_height, out);
+}
+
+bool VulkanDevice::Upscale(const UpscaleDesc& d) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Upscale");
+    if (device_ == VK_NULL_HANDLE) return false;
+    if (ngx_upscaler_failed_)      return false;
+    if (wrapped_cb_ == nullptr || wrapped_cb_->Raw() == VK_NULL_HANDLE) {
+        // No command buffer this frame (loading frame, or the path
+        // tracer was skipped) -- same silent no-op Denoise() takes.
+        return false;
+    }
+    if (ngx_upscaler_ == nullptr) {
+        ngx_upscaler_ = std::make_unique<VulkanNgxUpscaler>(this);
+    }
+    if (!ngx_upscaler_->Init()) {
+        ngx_upscaler_failed_ = true;
+        return false;
+    }
+    return ngx_upscaler_->Evaluate(d);
+}
+
+void VulkanDevice::ReleaseUpscalerFeature() {
+    if (ngx_upscaler_ != nullptr) ngx_upscaler_->ReleaseFeature();
+}
+
 void VulkanDevice::Denoise(const DenoiseDesc& d) {
     PT_ZONE_SCOPED_N("VulkanDevice::Denoise");
     if (device_ == VK_NULL_HANDLE) return;
@@ -5246,11 +5476,17 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         const int k = static_cast<int>(d.kind);
         const std::uint32_t bit = (k >= 0 && k < 32) ? (1u << k) : 0u;
         if (bit != 0u && (s_logged_kinds_mask & bit) == 0u) {
+            // The legend must match DenoiseDesc::Kind's DECLARATION
+            // ORDER, and it had drifted: it still listed MetalFX at 5
+            // and SvgfMetalFx at 6, which were removed with the Metal
+            // backend, so every number after 4 was off by two. That
+            // turned this diagnostic into a source of wrong conclusions
+            // -- a FinalizeOnly dispatch read as "MetalFX", on a build
+            // that has no Metal. Re-derived from the enum.
             LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
                      "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
                      "3=OptixTemporalHdr, 4=OptixTemporalHdrAov, "
-                     "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly, "
-                     "8=SvgfNoFinalize), "
+                     "5=FinalizeOnly, 6=SvgfNoFinalize, 7=Nrd), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_logged_kinds_mask |= bit;
@@ -5349,6 +5585,129 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         return;
     }
 #endif
+
+    // ---- NRD library path (Kind::Nrd) ----------------------------------
+    // NVIDIA RayTracingDenoiser, RELAX_DIFFUSE (issue #50). Structured
+    // to FALL THROUGH into the SVGF branch below on any failure rather
+    // than returning: a frame where NRD can't run still gets denoised,
+    // just by the in-house chain, and SupportsNrdLibrary() flips false
+    // so the engine's next frame logs the downgrade and stops asking.
+    if (d.kind == DenoiseDesc::Kind::Nrd) {
+#if defined(PT_ENABLE_NRD)
+        bool nrd_ran = false;
+        if (d.color_in.id == 0 || d.depth_in.id == 0 || d.motion_in.id == 0 ||
+            d.normal_in.id == 0 || d.output.id == 0) {
+            LOG_WARN("VulkanDevice::Denoise(Nrd): missing G-buffer inputs "
+                     "(color={} depth={} motion={} normal={} out={}) -- "
+                     "falling through to SVGF for this frame",
+                     d.color_in.id, d.depth_in.id, d.motion_in.id,
+                     d.normal_in.id, d.output.id);
+        } else if (!nrd_lib_failed_) {
+            auto image_it = images_.find(d.color_in.id);
+            if (image_it == images_.end()) {
+                LOG_WARN("VulkanDevice::Denoise(Nrd): color_in image lookup miss (id={})",
+                         d.color_in.id);
+            } else {
+                const std::uint32_t w = image_it->second.extent.width;
+                const std::uint32_t h = image_it->second.extent.height;
+                if (w != 0 && h != 0) {
+                    if (nrd_lib_denoiser_ == nullptr) {
+                        nrd_lib_denoiser_ = std::make_unique<VulkanNrdLibDenoiser>(this);
+                    }
+                    if (!nrd_lib_denoiser_->Init(w, h)) {
+                        // Init() logs the specific reason. Latch so the
+                        // engine downgrades on the next frame instead of
+                        // re-attempting a deterministic failure forever.
+                        nrd_lib_failed_ = true;
+                        LOG_ERROR("VulkanDevice::Denoise(Nrd): NRD init failed at {}x{}; "
+                                  "`r_denoiser nrd` degrades to the in-house SVGF "
+                                  "a-trous chain for the rest of this session", w, h);
+                    } else {
+                        VulkanNrdLibDenoiser::EncodeInputs ei{};
+                        ei.color_in      = d.color_in;
+                        ei.depth_in      = d.depth_in;
+                        ei.motion_in     = d.motion_in;
+                        ei.normal_in     = d.normal_in;
+                        ei.albedo_in     = d.albedo_in;
+                        ei.output        = d.output;
+                        ei.world_to_view = d.world_to_view;
+                        ei.view_to_clip  = d.view_to_clip;
+                        ei.jitter_x      = d.jitter_x;
+                        ei.jitter_y      = d.jitter_y;
+                        ei.reset_history = d.reset_history;
+                        // NRD wants demodulated radiance for the same
+                        // reason SVGF does, and the engine's guide is
+                        // reusable as-is -- see NrdPack.slang.
+                        ei.demod_enabled = d.albedo_demod_enabled && (d.albedo_in.id != 0);
+                        nrd_lib_denoiser_->Encode(wrapped_cb_->Raw(), ei);
+                        nrd_ran = true;
+                    }
+                }
+            }
+        }
+
+        if (nrd_ran) {
+            // Bloom composite + tonemap + swapchain write. Reuse the
+            // SVGF denoiser's proven DenoiseFinalize stage rather than
+            // duplicating it -- exactly what Kind::FinalizeOnly does.
+            // final_output == 0 means the caller wants the denoised
+            // linear-HDR left in d.output (the Kind::SvgfNoFinalize
+            // contract), so we stop here.
+            if (d.final_output.id != 0) {
+                if (denoiser_ == nullptr) {
+                    denoiser_ = std::make_unique<VulkanNrdDenoiser>(this);
+                }
+                if (!denoiser_->Ready() && !denoiser_->Init()) {
+                    LOG_ERROR("VulkanDevice::Denoise(Nrd): SVGF finalize stage init "
+                              "failed; the denoised image is in the HDR intermediate "
+                              "but the swapchain write is skipped this frame");
+                    denoiser_.reset();
+                    return;
+                }
+                // RAW: NrdUnpack just wrote d.output and the finalize
+                // dispatch is about to read it.
+                {
+                    VkMemoryBarrier mb{};
+                    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                    vkCmdPipelineBarrier(wrapped_cb_->Raw(),
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                         0, 1, &mb, 0, nullptr, 0, nullptr);
+                }
+                auto out_it = images_.find(d.output.id);
+                const std::uint32_t fw = (out_it != images_.end()) ? out_it->second.extent.width  : 0u;
+                const std::uint32_t fh = (out_it != images_.end()) ? out_it->second.extent.height : 0u;
+                denoiser_->SetTonemapOp(d.tonemap_op);
+                denoiser_->EncodeFinalizeOnly(
+                    wrapped_cb_->Raw(),
+                    LookupImageView(d.output),
+                    LookupImageView(d.final_output),
+                    LookupBuffer(d.exposure_state),
+                    (d.bloom_in.id != 0) ? LookupImageView(d.bloom_in) : VK_NULL_HANDLE,
+                    d.bloom_intensity,
+                    fw, fh, d.hdr_pipeline,
+                    (d.stars_in.id != 0) ? LookupImageView(d.stars_in) : VK_NULL_HANDLE);
+            }
+            return;
+        }
+        // else: fall through to the SVGF chain below.
+#else
+        // Built without -DPT_ENABLE_NRD=ON. The engine gates on
+        // SupportsNrdLibrary() and should never issue this kind here,
+        // so a one-shot warning flags the plumbing bug; the frame still
+        // renders through SVGF rather than dropping the denoise.
+        static bool s_logged_no_nrd = false;
+        if (!s_logged_no_nrd) {
+            LOG_WARN("VulkanDevice::Denoise: Kind::Nrd requested on a build without "
+                     "PT_ENABLE_NRD. Configure with -DPT_ENABLE_NRD=ON to get the "
+                     "NVIDIA RayTracingDenoiser; running the in-house SVGF a-trous "
+                     "chain instead.");
+            s_logged_no_nrd = true;
+        }
+#endif
+    }
 
     // ---- FinalizeOnly path (Kind::FinalizeOnly) ------------------------
     // Run JUST the swapchain finalize stage (linear HDR -> exposure ->

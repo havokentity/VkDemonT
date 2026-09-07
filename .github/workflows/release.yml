@@ -34,13 +34,15 @@ jobs:
     # Vulkan SDK pinned to a known-good LunarG release.
     #
     # Release builds use the win-clang-release preset (clang-cl on top
-    # of the MSVC toolchain) rather than plain MSVC. Embree compiles 4
-    # ISA variants (SSE2 / SSE4.2 / AVX / AVX2) of every kernel for
-    # runtime CPU dispatch -- ~250k LOC of templated C++ that MSVC
-    # ground through in ~20min on the first cold build of v0.3.15.
-    # clang-cl typically halves that on template-heavy code, and it
-    # uses the same MSVC ABI / SDK headers so the resulting demont.exe
-    # is binary-compatible with what users expect on Windows.
+    # of the MSVC toolchain) rather than plain MSVC. The original reason
+    # was Embree: 4 ISA variants of every kernel, ~250k LOC of templated
+    # C++ that MSVC ground through in ~20 min on the first cold build of
+    # v0.3.15. Embree is gone with the software RHI, but clang-cl stays:
+    # it is still faster on the template-heavy dependency set (manifold,
+    # NRD, glm), it uses the same MSVC ABI / SDK headers so the resulting
+    # demont.exe is binary-compatible with what users expect on Windows,
+    # and switching the release compiler is not a change to make casually
+    # in the same PR that removed a dependency.
     runs-on: windows-latest
     permissions:
       contents: write
@@ -85,11 +87,19 @@ jobs:
           cache: true
           stripdown: true
 
-      - name: Verify clang-cl is on PATH
+      - name: Verify toolchain (clang-cl + dxc)
         # windows-latest ships LLVM at C:\Program Files\LLVM\bin so
         # clang-cl.exe should already resolve.  Failing the job early
         # with a clear error beats a confusing CMake "compiler not
         # found" later in Configure if Microsoft ever changes that.
+        #
+        # dxc.exe is checked for the same reason: PT_ENABLE_NRD is ON by
+        # default now, and NRD's build spawns ShaderMake to compile its HLSL
+        # to SPIR-V, which needs DXC from the Vulkan SDK's Bin/. Nothing in
+        # this repo required an SDK *binary* before (find_package(Vulkan)
+        # wants headers + vulkan-1.lib), so `stripdown: true` above has never
+        # been tested against that requirement. This job is tag-driven and
+        # runs independently of build.yml, so it needs its own check.
         shell: pwsh
         run: |
           $clangCl = Get-Command clang-cl -ErrorAction SilentlyContinue
@@ -98,23 +108,67 @@ jobs:
             exit 1
           }
           clang-cl --version
+          echo "VULKAN_SDK = $env:VULKAN_SDK"
+          if (-not $env:VULKAN_SDK) {
+            Write-Host "::error::VULKAN_SDK is not set. The Install Vulkan SDK step is supposed to export it."
+            exit 1
+          }
+          $dxc = Join-Path $env:VULKAN_SDK "Bin\dxc.exe"
+          if (-not (Test-Path $dxc)) {
+            Write-Host "::error::dxc.exe not found at $dxc. NRD's ShaderMake needs it to emit SPIR-V. Remedy: set 'stripdown: false' on the Install Vulkan SDK step, or pin an SDK build that ships Bin/dxc.exe."
+            Get-ChildItem (Join-Path $env:VULKAN_SDK "Bin") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            exit 1
+          }
+          & $dxc --version
+
+      - name: Cache Slang toolchain
+        # cmake/SetupBinaries.cmake downloads slangc into third_party/slang/
+        # -- the SOURCE tree, gitignored -- so the build-directory cache
+        # below can never cover it. Without this the release lane
+        # re-downloads the Slang release archive on every tag push.
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
 
       - name: Cache CMake build directory
         # Restores the entire build/win-clang-release tree (CMakeCache.txt,
         # _deps fetched source, compiled object files) when the cache key
         # matches.  The per-OS prefix in the key keeps this cache
-        # namespaced.  Embree alone is ~250k LOC of templated
-        # kernels that take ~10 min to compile cold under clang-cl;
-        # cache hits should bring that down to "rebuild only the
-        # changed app code + relink" -- a few minutes at most.
+        # namespaced.  Embree used to be the reason this existed (~250k LOC
+        # of templated kernels, ~10 min cold under clang-cl); it is gone, but
+        # NRD replaced it as the slow dependency -- a from-source build of
+        # MathLib + ShaderMake plus an HLSL -> SPIR-V pass over NRD's shader
+        # set. Cache hits should still bring a run down to "rebuild the
+        # changed app code + relink".
         uses: actions/cache@v4
         with:
           path: build/win-clang-release
           key: ${{ env.RELEASE_CACHE_VERSION }}-windows-clang-release-${{ hashFiles('CMakeLists.txt', 'cmake/**', '**/CMakeLists.txt', '.github/workflows/release.yml') }}
 
       - name: Configure (release)
+        # PT_ENABLE_NRD is left at its ON default: NRD is a static library,
+        # needs no runtime redistributable, and is a real feature of the
+        # binary this job ships.
+        #
+        # PT_ENABLE_DLSS is forced OFF, overriding its ON default, and that
+        # is a decision rather than an oversight. Two things must land before
+        # a public release may be built with it ON:
+        #   1. This job must stage PT_DLSS_RUNTIME_DLLS (nvngx_dlss.dll,
+        #      nvngx_dlssd.dll) next to demont.exe -- the "Stage artefact
+        #      tree" step below copies only the exe and assets/, so a
+        #      DLSS-enabled build would ship a feature that cannot
+        #      initialise on a user's machine.
+        #   2. The NVIDIA attribution the RTX SDK licence requires of anyone
+        #      publicly redistributing those binaries must be in the app's
+        #      about/credits surface. cmake/Dependencies.cmake states this
+        #      requirement explicitly; this job is exactly the public
+        #      redistribution it is talking about.
+        # As of this commit nothing links dlss_ngx anyway, so ON would buy a
+        # several-hundred-MB unpinned `git clone` (no URL_HASH -- see the
+        # "KNOWN GAP" note in cmake/Dependencies.cmake) and zero object files.
         shell: pwsh
-        run: cmake --preset win-clang-release
+        run: cmake --preset win-clang-release -DPT_ENABLE_DLSS=OFF
 
       - name: Build
         shell: pwsh

@@ -20,7 +20,6 @@ add_subdirectory(audio)
 # r_software_blit cvar will add a Vulkan-blit alternative on Windows
 # that shares the engine's VkDevice; until then Windows uses GDI.
 if(WIN32)
-    add_subdirectory(rhi_software)
 endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     add_subdirectory(rhi_vulkan)

@@ -7,6 +7,7 @@
 #include "Resources.h"
 #include "Swapchain.h"
 #include "Types.h"
+#include "Upscaler.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -257,7 +258,16 @@ public:
     // command buffer flow.
     struct DenoiseDesc {
         TextureHandle color_in;       // RGBA16F linear (per-frame, not accumulated)
-        TextureHandle depth_in;       // R32F clip-space depth (z/w in [0,1])
+        // R32F LINEAR CAMERA-SPACE depth -- `h0.t * dot(rd0, fwd)`, i.e.
+        // metres along the view axis, with a large sky sentinel (1.0e10).
+        // This comment used to say "clip-space depth (z/w in [0,1])",
+        // which contradicted the shader and was simply wrong: see
+        // PathTrace.slang's depth_tex declaration ("R32F linear
+        // camera-space depth") and its write site, which have always
+        // written linear view depth. Found while auditing DLSS's depth
+        // input (docs/DLSS_INTEGRATION_PLAN.md SS2.1 caveat B); the
+        // shader is authoritative and this is now corrected to match it.
+        TextureHandle depth_in;
         TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
         // World-space surface normals at primary hit (RGBA16F, .xyz =
         // unit normal, .w unused). Required by the Vulkan SVGF/NRD
@@ -273,29 +283,39 @@ public:
         // Engine allocates + writes this only when r_denoiser is
         // optix_hdr_aov.
         TextureHandle albedo_in;
-        // MetalFX specular-guidance G-buffers (issue #118). Three
-        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
-        // specular from diffuse response and eliminate the 8x8 halos
-        // it otherwise produces around bright reflections / metals.
-        //   specular_albedo_in       -- RGBA16F per-pixel F0 (Fresnel
-        //                               reflectance at normal incidence;
-        //                               metals: F0 = albedo; dielectrics:
-        //                               float3(0.04); Lambert: 0).
-        //   roughness_in             -- R32F single-channel surface
-        //                               roughness in [0, 1].
-        //   specular_hit_distance_in -- R32F distance from camera to
-        //                               specularly-reflected hit (MVP:
-        //                               primary_t * smoothness proxy;
-        //                               see PathTrace.slang's matching
-        //                               texture declaration for the
-        //                               trade-off vs a real second-trace).
-        // Engine allocates them only for DenoiserKind::MetalFX /
-        // SvgfBasicMetalFx / SvgfAtrousMetalFx; nil for all other kinds.
-        // Apple's MTLFXTemporalDenoisedScaler tolerates a nil binding
-        // as "no guidance," so backends consuming the trio can pass
-        // them straight through. SVGF / NRD / OptiX paths ignore them
-        // (their respective issues will wire matching inputs later;
-        // #50 covers NRD).
+        // Specular-guidance G-buffers. Added for MetalFX (issue #118),
+        // which is gone; the sole consumer is now DLSS Ray Reconstruction,
+        // and these three map one-for-one onto its guide inputs.
+        //   specular_albedo_in       -- RGBA16F. The SPLIT-SUM INTEGRATED
+        //                               specular reflectance
+        //                               F0*A(rough, n.v) + B(rough, n.v)
+        //                               (Karis 2013 / Lazarov's fit), i.e.
+        //                               RR's pInSpecularAlbedo. NOT raw F0:
+        //                               F0 is normal-incidence only, and
+        //                               every dielectric rises toward 1 at
+        //                               grazing incidence, so F0 understates
+        //                               the ocean horizon by ~1/0.02.
+        //   roughness_in             -- R32F PERCEPTUAL roughness in [0, 1],
+        //                               the r for which GGX alpha = r^2.
+        //                               Matches RR / NRD's "linear
+        //                               roughness" = sqrt(alpha); no remap
+        //                               is applied on either side.
+        //   specular_hit_distance_in -- R32F distance FROM THE PRIMARY HIT
+        //                               along the mirror-reflected ray to
+        //                               what that ray hits (NRD's hitDist
+        //                               convention), from a real second
+        //                               trace. 0 means "no specular lobe"
+        //                               (Lambert / sky); a reflected ray
+        //                               that escapes writes depth_in's own
+        //                               1e10 m sky sentinel, because the
+        //                               reflected image of the sky is at
+        //                               infinity and has no parallax to
+        //                               correct.
+        // Engine allocates all three only while DLSS Ray Reconstruction is
+        // requested (r_dlss != off && r_dlss_rr); 0 for every other config,
+        // including the default. They travel together -- a consumer handed a
+        // partial set is worse off than one handed none. SVGF / NRD / OptiX
+        // ignore them (#50 covers NRD's own hit-distance input).
         TextureHandle specular_albedo_in;
         TextureHandle roughness_in;
         TextureHandle specular_hit_distance_in;
@@ -317,6 +337,20 @@ public:
         // exposure the path tracer's inline tonemap would have used.
         // MetalFX ignores it.
         BufferHandle  exposure_state;
+        // The SAME scalar as `exposure_state`, as a 1x1 R32F texture:
+        // NGX's DLSS / DLSS-RR eval takes the exposure as
+        // `pInExposureTexture` and cannot read a storage buffer.
+        //
+        // It is the PRE-tonemap multiplier -- every tonemap site in this
+        // engine is `tonemapDispatch(c * exposure, op)` -- so it is a
+        // dimensionless gain on physical radiance (the renderer is
+        // radiometric: W/m^2/sr), not a photometric stop value.
+        //
+        // Kept in step with the buffer by whichever path owns the scalar:
+        // AutoExposure.slang writes both in one invocation when
+        // r_auto_exposure is 1, the host writes both when it is 0.
+        // 0 unless r_dlss != off. Every non-DLSS consumer ignores it.
+        TextureHandle exposure_texture;
         // Vulkan SVGF/NRD only: bloom-pyramid mip 0 (half-res linear
         // HDR). The DenoiseFinalize pass bilinear-samples this and
         // adds it pre-tonemap so highlights get the same ACES squash.
@@ -425,16 +459,6 @@ public:
             OptixHdrAov,
             OptixTemporalHdr,
             OptixTemporalHdrAov,
-            MetalFX,
-            // SVGF followed by MetalFX TemporalDenoisedScaler as a
-            // finalizer. Metal only. SVGF kills path-tracing noise;
-            // MetalFX then ML-TAAs the result (cleaner edges than the
-            // in-shader edge-aware blend). The backend lazily allocates
-            // an intermediate scratch texture sized to the swapchain
-            // and routes the SVGF output through it before invoking
-            // MetalFX. On Vulkan this falls back to Kind::Svgf (the
-            // base denoiser still runs; the MetalFX chain is dropped).
-            SvgfMetalFx,
             // Skip every temporal / spatial denoising pass and run JUST
             // the swapchain finalize stage (linear HDR -> exposure ->
             // ACES -> sRGB OETF + bloom composite, written into
@@ -474,6 +498,30 @@ public:
             // engine's post_denoise_hdr_tex) -- the swap is written by
             // the follow-up FinalizeOnly call.
             SvgfNoFinalize,
+            // NVIDIA RayTracingDenoiser (NRD) library, RELAX_DIFFUSE
+            // (issue #50). Vulkan-only, and only on a build configured
+            // with -DPT_ENABLE_NRD=ON -- SupportsNrdLibrary() reports
+            // whether the backend can actually service this kind, and
+            // the engine downgrades to Kind::Svgf with a log line when
+            // it can't (mirroring the OptiX unavailability path).
+            //
+            // Inputs are the Kind::Svgf set (color / depth / motion /
+            // normal / albedo / output / final_output / exposure_state /
+            // bloom_in / bloom_intensity / hdr_pipeline / tonemap_op /
+            // world_to_view / view_to_clip / jitter / reset_history).
+            // The backend packs them into NRD's IN_MV / IN_VIEWZ /
+            // IN_NORMAL_ROUGHNESS / IN_DIFF_RADIANCE_HITDIST, runs the
+            // RELAX dispatch chain, unpacks OUT_DIFF_RADIANCE_HITDIST
+            // into `output`, and then reuses the SVGF denoiser's
+            // DenoiseFinalize stage for bloom + tonemap + swap exactly
+            // as Kind::Svgf does. Passing final_output = 0 stops before
+            // the finalize, matching Kind::SvgfNoFinalize's contract.
+            //
+            // `albedo_demod_enabled` applies here too: NRD wants
+            // demodulated radiance for the same reason SVGF does, and
+            // the backend reuses the engine's existing demodulation
+            // guide rather than deriving a second one.
+            Nrd,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
@@ -484,7 +532,72 @@ public:
         const float* view_to_clip  = nullptr;
     };
     virtual bool SupportsDenoise() const { return false; }
+
+    // True iff this backend can service DenoiseDesc::Kind::Nrd with a
+    // real NVIDIA RayTracingDenoiser instance (issue #50).
+    //
+    // Two things have to hold, and BOTH are folded into this one
+    // answer so callers never have to reason about build flags:
+    //   1. The build was configured with -DPT_ENABLE_NRD=ON (and the
+    //      Vulkan backend is on -- see cmake/Dependencies.cmake's
+    //      PT_NRD_ACTIVE). Off by default, so the default build always
+    //      returns false here.
+    //   2. NRD's instance creation has not already failed at runtime.
+    //      A failure latches, so this flips to false permanently for
+    //      the session and the engine's next frame downgrades cleanly.
+    //
+    // Contract for callers: when this returns false, do NOT issue
+    // Kind::Nrd -- fall back to Kind::Svgf and say so once in the log.
+    // This mirrors how the engine handles an unavailable OptiX.
+    virtual bool SupportsNrdLibrary() const { return false; }
+
     virtual void Denoise(const DenoiseDesc& /*d*/) {}
+
+    // ---- Temporal upscaler (src/rhi/Upscaler.h, plan SS1.5) -------------
+    //
+    // Three virtuals rather than one, because the engine needs the
+    // ANSWER to "what render extent does this mode want?" strictly
+    // before it allocates anything for the frame, and it needs that
+    // answer without having recorded a command buffer yet.
+    //
+    // The default implementations report "no upscaler" so a backend that
+    // has none (and a build without PT_ENABLE_DLSS) needs no #if at the
+    // call site -- exactly how SupportsNrdLibrary() lets the engine stop
+    // reasoning about build flags.
+
+    // True iff this backend has a live upscaler runtime AND the
+    // hardware/driver reports the feature usable. Folds the build flag,
+    // the runtime init and any latched failure into one answer.
+    //
+    // Contract for callers: when this returns false, do NOT issue
+    // Upscale() -- fall back to the engine's own resolve (or to no
+    // scaling at all) and say so once in the log. Same shape as the
+    // OptiX / NRD unavailability paths.
+    virtual bool SupportsUpscaler() const { return false; }
+
+    // Ask the runtime what render extent `mode` wants for a given
+    // display extent, once per mode change and per swapchain resize.
+    // Returns false when the mode is unavailable on this
+    // hardware/driver/runtime, leaving `out.supported` false and the
+    // extents zero. The caller must treat that as "fall back to Off",
+    // never as a size to clamp.
+    virtual bool QueryUpscalerSettings(UpscalerMode /*mode*/,
+                                       std::uint32_t /*display_width*/,
+                                       std::uint32_t /*display_height*/,
+                                       UpscalerSettings& /*out*/) { return false; }
+
+    // Record the upscale into the frame's in-flight command buffer.
+    // Must be called AFTER whatever produced d.color_in and BEFORE
+    // EndFrame, exactly like Denoise(). Returns false when nothing was
+    // recorded -- the caller must then not present d.output, because
+    // nothing wrote it.
+    virtual bool Upscale(const UpscaleDesc& /*d*/) { return false; }
+
+    // Drop the upscaler's feature instance (freeing its VRAM) while
+    // leaving the runtime initialised. Called when the mode returns to
+    // Off, and on teardown paths that must not leave a feature bound to
+    // a destroyed swapchain.
+    virtual void ReleaseUpscalerFeature() {}
 
     // Predictive pipeline JIT prewarming. Engine signals "I will need
     // pipeline `kernel_name` soon" so the backend can start (or finish)

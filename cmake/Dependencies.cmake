@@ -126,38 +126,14 @@ FetchContent_Declare(nlohmann_json
     SYSTEM
 )
 
-# --- embree: CPU BVH + ray-triangle intersection for the Software RHI -----
-# Triangle-only BVH for the software backend's mesh path. We disable
-# every geometry type except triangles, ray packets (single rays are
-# fine here -- the engine fans out across pixels at the dispatcher),
-# ISPC (no need for cross-platform SIMD codegen at this scale), and
-# tutorials. Tasking system goes INTERNAL so we don't drag TBB into
-# this codebase. ARM64 / Apple Silicon support has been first-class
-# since Embree 4.x; the same source tree builds natively on
-# x86_64 Windows + NVIDIA RTX too.
-#
-# Two acquisition paths, in order of preference:
-#   1. Pre-built artefact from .github/workflows/prebuild-embree.yml,
-#      consumed via cmake/EmbreeBinary.cmake.  Sets EMBREE_PREBUILT_FOUND
-#      = TRUE and an `embree` IMPORTED STATIC target; skips the slow
-#      from-source compile entirely (~30s download vs ~10-15min build).
-#   2. Source compile via FetchContent.  Triggered when EmbreeBinary
-#      couldn't find a prebuilt for the host platform / config -- new
-#      Embree version, ISA flag bump, unsupported platform, etc.  The
-#      first such build is slow; prebuild-embree.yml then runs and
-#      uploads the artefact so the NEXT configure hits the fast path.
-#
-# Both paths read their settings from cmake/EmbreeConfig.cmake (single
-# source of truth for version + flags) so they can't drift.
-include(${CMAKE_CURRENT_LIST_DIR}/EmbreeBinary.cmake)
-if(NOT EMBREE_PREBUILT_FOUND)
-    pt_apply_embree_config()
-    FetchContent_Declare(embree
-        URL       ${EMBREE_VENDORED_URL}
-        URL_HASH  ${EMBREE_VENDORED_URL_HASH}
-        SYSTEM
-    )
-endif()
+# --- embree: REMOVED ---------------------------------------------------------
+# Embree existed solely to give the software RHI a CPU BVH + ray-triangle
+# intersector. That backend is gone (the engine is Windows/Vulkan/NVIDIA-only),
+# and nothing else ever linked it -- the remaining references across the tree
+# were all comments. Dropping it removes the slowest dependency in the build:
+# the from-source FetchContent path took ~10-15 minutes, which is why
+# cmake/EmbreeBinary.cmake and .github/workflows/prebuild-embree.yml existed to
+# cache a prebuilt artefact. All three are deleted together.
 
 # --- manifold: mesh CSG (P9 headline) --------------------------------------
 # Robust manifold-mesh boolean ops (union/intersect/subtract). Builds with
@@ -229,6 +205,126 @@ if(PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND)
     message(STATUS "NRD denoiser: enabled (v4.17.3 via FetchContent)")
 endif()
 
+# --- DLSS: Super Resolution / DLAA / Ray Reconstruction (Vulkan-only) ------
+# Activated only when:
+#   - PT_ENABLE_DLSS = ON              (default ON; owner decision, see the
+#                                       option() comment in CMakeLists.txt)
+#   - PT_ENABLE_VULKAN_BACKEND = ON    (DLSS is a Vulkan/NGX path here)
+# Consumers check PT_DLSS_ACTIVE, never PT_ENABLE_DLSS directly, so a stale
+# =ON in the cache on a no-Vulkan host is harmless -- the same pattern
+# PT_NRD_ACTIVE uses above.
+#
+# STRUCTURALLY DIFFERENT FROM EVERY OTHER DEPENDENCY IN THIS FILE, and the
+# difference is why this is not a FetchContent_MakeAvailable:
+#
+#   * DLSS ships PREBUILT BINARIES, not source. There is nothing to compile.
+#     Consumption is: add include/ to the include path, link one import
+#     library, and copy the runtime DLLs next to demont.exe. That is an
+#     IMPORTED target, so we Populate and wire it by hand rather than
+#     add_subdirectory() a project that has no CMakeLists.
+#   * The binaries are real files in git, not LFS pointers -- the repo has no
+#     .gitattributes, verified, which is the thing that would otherwise make a
+#     tag-tarball fetch silently deliver stubs instead of DLLs.
+#   * The tarball is LARGE (several hundred MB for the ~100 MB we use):
+#     lib/Windows_x86_64/rel/ alone is nvngx_dlss.dll 59.0 MB +
+#     nvngx_dlssd.dll 40.9 MB + nvngx_dlssg.dll 7.5 MB, and the dev/
+#     debug-overlay variants add ~125 MB more. Accepted deliberately -- the
+#     owner's call is that build size does not matter here -- but it is the
+#     reason a first configure with this ON is slow.
+#
+# LICENSING, stated rather than implied. These are NVIDIA-RTX-SDK-licensed
+# binaries. Redistribution is permitted as part of an application with
+# material additional functionality beyond the SDK (a path tracer qualifies),
+# and attribution -- crediting NVIDIA and showing the NVIDIA Marks in an
+# about box / credits -- is required before a public release ships with this
+# enabled. There is no fee and no approval gate. Note that "Streamline is
+# MIT" does not change any of this: Streamline's MIT source loads these same
+# licensed binaries.
+set(PT_DLSS_ACTIVE OFF)
+if(PT_ENABLE_DLSS AND NOT PT_ENABLE_VULKAN_BACKEND)
+    message(STATUS "PT_ENABLE_DLSS requires PT_ENABLE_VULKAN_BACKEND; DLSS inactive.")
+endif()
+if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND NOT WIN32)
+    message(STATUS "PT_ENABLE_DLSS: only the Windows_x86_64 SDK layout is wired; DLSS inactive.")
+endif()
+if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND WIN32)
+    # URL_HASH is deliberately absent until the tag is pinned at bringup, and
+    # this is a KNOWN GAP rather than an oversight: every other fetch in this
+    # file pins a SHA256, and this one must too before it is trusted. The
+    # first successful configure prints the computed hash (see below) so it
+    # can be pasted in. Until then the fetch is reproducible by tag but not
+    # verified against tampering.
+    # SOURCE_SUBDIR names a directory that deliberately does not exist. The
+    # DLSS repo has no CMakeLists.txt -- it is a binary drop, not a project --
+    # so MakeAvailable must populate it WITHOUT trying to add_subdirectory().
+    # Pointing SOURCE_SUBDIR at a non-existent path is the documented way to
+    # get that, and it is why this is not the bare FetchContent_Populate()
+    # that CMP0169 deprecates.
+    FetchContent_Declare(dlss
+        GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
+        GIT_TAG        v310.7.0
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  cmake-does-not-build-this
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(dlss)
+
+    set(PT_DLSS_INCLUDE_DIR "${dlss_SOURCE_DIR}/include")
+    # nvsdk_ngx_d.lib is the DYNAMIC-CRT import library. The project builds
+    # with clang-cl against the dynamic runtime, so nvsdk_ngx_s.lib (static
+    # CRT) would be the wrong one and would produce CRT-mismatch link errors
+    # rather than anything self-explanatory.
+    # CONFIG-DEPENDENT, and this is not cosmetic: the Debug CRT
+    # (MDd_DynamicDebug, _ITERATOR_DEBUG_LEVEL=2) cannot link a Release import
+    # library. Getting it wrong produces ten LNK2038 mismatches and LNK1319 at
+    # the final link -- which is exactly how CI failed the first time this was
+    # built in Debug, since local development here is Release-only.
+    #
+    # docs/DLSS_INTEGRATION_PLAN.md section 7.2 flagged this as "[unverified]
+    # whether the _dbg variants are needed for the Debug preset; check at
+    # bringup". They are. This is that check.
+    #
+    # The SDK also ships _iterator0 / _iterator1 variants for projects that
+    # override _ITERATOR_DEBUG_LEVEL. We do not, so the plain _dbg build (IDL
+    # 2, the MSVC Debug default) is the right one.
+    set(PT_DLSS_IMPORT_LIB     "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    set(PT_DLSS_IMPORT_LIB_DBG "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib")
+    # The runtime DLLs that must sit next to demont.exe. nvngx_dlssg.dll
+    # (Frame Generation) is deliberately NOT shipped: it is out of scope, and
+    # shipping an unused 7.5 MB licensed binary invites questions.
+    set(PT_DLSS_RUNTIME_DLLS
+        "${dlss_SOURCE_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+        "${dlss_SOURCE_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+
+    if(NOT EXISTS "${PT_DLSS_IMPORT_LIB}")
+        message(WARNING
+            "PT_ENABLE_DLSS: expected import library not found at "
+            "${PT_DLSS_IMPORT_LIB} -- the SDK layout has moved. DLSS inactive.")
+    else()
+        add_library(dlss_ngx STATIC IMPORTED GLOBAL)
+        set_target_properties(dlss_ngx PROPERTIES
+            IMPORTED_LOCATION             "${PT_DLSS_IMPORT_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${PT_DLSS_INCLUDE_DIR}")
+        # IMPORTED_LOCATION_DEBUG wins for a Debug build and falls back to the
+        # plain IMPORTED_LOCATION otherwise. MAP_IMPORTED_CONFIG_* points the
+        # optimised-with-symbols configs at the Release library, since they use
+        # the release CRT.
+        if(EXISTS "${PT_DLSS_IMPORT_LIB_DBG}")
+            set_target_properties(dlss_ngx PROPERTIES
+                IMPORTED_LOCATION_DEBUG              "${PT_DLSS_IMPORT_LIB_DBG}"
+                MAP_IMPORTED_CONFIG_RELWITHDEBINFO   "Release"
+                MAP_IMPORTED_CONFIG_MINSIZEREL       "Release")
+        else()
+            message(WARNING
+                "PT_ENABLE_DLSS: debug import library not found at "
+                "${PT_DLSS_IMPORT_LIB_DBG} -- a Debug build will fail to link "
+                "with LNK2038 CRT mismatches.")
+        endif()
+        set(PT_DLSS_ACTIVE ON)
+        message(STATUS "DLSS: enabled (v310.7.0, NVIDIA RTX SDK licence) -- ${dlss_SOURCE_DIR}")
+    endif()
+endif()
+
 # --- doctest: unit test framework (header-only) ----------------------------
 # Single-header testing framework. Fast compile (the framework header
 # itself is ~7000 lines but only the TU declaring DOCTEST_CONFIG_IMPLEMENT
@@ -281,37 +377,6 @@ else()
     set(PT_DEP_UNDEF_DEBUG_FLAGS -UDEBUG)
 endif()
 
-# Embree compile + per-target tweaks below are only relevant when we're
-# building Embree from source (EmbreeBinary.cmake didn't find a prebuilt
-# for this host).  The prebuilt path is a single IMPORTED target with no
-# in-tree sources to compile, so there's nothing to wrap in the C++17
-# block and no sub-targets (sys / math / simd / lexers / tasking) to
-# tweak warning flags on.
-if(NOT EMBREE_PREBUILT_FOUND)
-    # Embree's headers (common/sys/vector.h etc.) rely on pre-C++17 transitive
-    # includes (<type_traits>, <exception>) that libc++ no longer pulls in
-    # automatically when the consumer compiles with C++20+. Building Embree
-    # itself in C++17 sidesteps the issue without forking; consumers of
-    # Embree (our SoftwareDevice TU) keep building in the project's standard
-    # C++23. Block scope (see Manifold pattern below) confines the override
-    # so it doesn't leak to subsequent fetches.
-    block()
-        set(CMAKE_CXX_STANDARD 17)
-        set(CMAKE_CXX_STANDARD_REQUIRED ON)
-        FetchContent_MakeAvailable(embree)
-    endblock()
-    # Silence Embree's vendored warning-as-noise so the build log stays
-    # readable; the lib has ~hundreds of warnings we can't fix without
-    # forking the upstream project.
-    if(TARGET embree)
-        target_compile_options(embree PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
-    endif()
-    foreach(_t sys math simd lexers tasking)
-        if(TARGET ${_t})
-            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
-        endif()
-    endforeach()
-endif()
 if(PT_ENABLE_VULKAN_BACKEND)
     FetchContent_MakeAvailable(vma)
 endif()
@@ -334,9 +399,23 @@ if(PT_NRD_ACTIVE)
     if(TARGET NRD)
         target_compile_options(NRD PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
     endif()
+    # NRD's transitive targets are a mixed bag of library kinds: MathLib is
+    # an INTERFACE library (header-only) and ShaderMake ships both a real
+    # executable and a UTILITY/custom target depending on the version.
+    # target_compile_options() is a hard CMake ERROR on both of those
+    # ("may only set INTERFACE properties on INTERFACE targets" /
+    # "called with non-compilable target type"), so filter by TYPE before
+    # touching them rather than by name.
     foreach(_t MathLib ShaderMake ShaderMakeBlob)
         if(TARGET ${_t})
-            target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+            get_target_property(_t_type ${_t} TYPE)
+            if(_t_type STREQUAL "STATIC_LIBRARY"  OR
+               _t_type STREQUAL "SHARED_LIBRARY"  OR
+               _t_type STREQUAL "MODULE_LIBRARY"  OR
+               _t_type STREQUAL "OBJECT_LIBRARY"  OR
+               _t_type STREQUAL "EXECUTABLE")
+                target_compile_options(${_t} PRIVATE ${PT_DEP_WARN_SILENCE_FLAG})
+            endif()
         endif()
     endforeach()
 endif()

@@ -404,6 +404,57 @@ public:
     }
     // --- end Editor backend accessors ------------------------------------
 
+    // --- Render-scale + jitter reporting (DLSS prerequisites) -------------
+    // Bounds r_render_scale is clamped to. See the cvar's own help text
+    // for why each end sits where it does; in short, 1.0 is the top
+    // because supersampling is a different feature, and 0.25 is the
+    // floor because it is already below DLSS Ultra Performance (1/3)
+    // and because the path tracer's ray-cone footprint -- and with it
+    // texture LOD and the star point-spread function -- widens as
+    // 1/scale.
+    static constexpr float kMinRenderScale = 0.25f;
+    static constexpr float kMaxRenderScale = 1.0f;
+
+    // Everything a temporal upscaler needs to know about the frame the
+    // engine just produced, published here so the DLSS integration can
+    // read it without reaching into RenderFrame's locals.
+    //
+    // The four extents describe the decoupling r_render_scale
+    // introduced: the path tracer and every buffer feeding a
+    // reconstruction (colour, depth, motion, normal, albedo) live at
+    // Render*(), and the image the user sees lives at Output*(). They
+    // are equal whenever r_render_scale resolves to 1.0. Valid from the
+    // first completed RenderFrame; all zero before that.
+    std::uint32_t RenderWidth()  const noexcept { return render_w_; }
+    std::uint32_t RenderHeight() const noexcept { return render_h_; }
+    std::uint32_t OutputWidth()  const noexcept { return output_w_; }
+    std::uint32_t OutputHeight() const noexcept { return output_h_; }
+
+    // The sub-pixel camera offset applied to the frame just rendered,
+    // in pixels of the INTERNAL render extent, each component in
+    // [-0.5, 0.5]. This is the quantity that feeds
+    // NVSDK_NGX_Parameter_Jitter_Offset_{X,Y}. Units already match
+    // (NGX also wants centre-relative pixels of the render extent);
+    // the SIGN convention on Y is the one thing the integration must
+    // verify against the SDK rather than assume, because +Y here is
+    // "down the screen" -- the engine's ray builder flips it
+    // (`uv.y = -uv.y`) on the way to NDC.
+    //
+    // Returns (0, 0) and JitterActive() == false when r_camera_jitter
+    // is off. That is not "no jitter happened" -- with the cvar off the
+    // path tracer still draws an independent RANDOM sub-pixel offset
+    // per ray, which is what gives the accumulator its antialiasing.
+    // It means "there is no single deterministic offset that describes
+    // this frame", which is precisely the state in which a temporal
+    // upscaler must NOT be handed a jitter value. A DLSS integration
+    // should therefore treat JitterActive() == false as a
+    // precondition failure and turn r_camera_jitter on, not as
+    // "jitter is zero".
+    float FrameJitterX() const noexcept { return frame_jitter_x_; }
+    float FrameJitterY() const noexcept { return frame_jitter_y_; }
+    bool  JitterActive() const noexcept { return camera_jitter_active_; }
+    // --- end render-scale + jitter reporting -------------------------------
+
 private:
     // Test-only access (PR #181 follow-up, see forward-declaration above).
     friend struct ::pt::engine::PhysDropArgsTestAccess;
@@ -1499,6 +1550,15 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    // Render-scale resolve (r_render_scale). Magnifies the internal-
+    // extent LDR image onto the swapchain. Dispatched ONLY on frames
+    // where the internal extent differs from the swapchain extent, so
+    // at the default scale of 1.0 the id is resolved and never used.
+    // Zero means the backend has no such kernel, which the render-scale
+    // gate reads as "render scaling unavailable" and pins the scale
+    // back to 1.0 -- the alternative would be presenting a swapchain
+    // nothing wrote this frame.
+    std::uint64_t                               upscale_pipeline_id_    = 0;
     // Stateless stars+sun+moon composite (issue #46). Dispatched on
     // Metal between Denoise() and the bloom pyramid so post-denoise
     // HDR receives sub-pixel celestials and bloom downsamples those
@@ -1646,6 +1706,26 @@ private:
     // its final tonemap, replacing the per-frame readback path that
     // stalled the GPU on dGPU.
     std::uint64_t                               exposure_state_id_     = 0;
+    // The SAME scalar as exposure_state_id_, published as a 1x1 R32F
+    // storage image (engine texture slot 19 -> vk::binding 48).
+    //
+    // NGX's DLSS eval takes the exposure as `pInExposureTexture`, a 1x1
+    // R32F texture; it cannot read a storage buffer, and the engine had the
+    // value only in buffer form. docs/DLSS_INTEGRATION_PLAN.md section 2.3
+    // item 4 records this as a missing input for both SR and RR.
+    //
+    // It is the PRE-tonemap multiplier, which is what NGX wants: every
+    // tonemap site here is `tonemapDispatch(c * exposure, op)`, so the
+    // scalar scales linear radiance and the curve follows. Radiometric
+    // engine, so it is a dimensionless gain on W/m^2/sr -- not a photometric
+    // stop.
+    //
+    // Written by whichever path owns the scalar, so the two views cannot
+    // drift: AutoExposure.slang stores it in the same invocation that
+    // computes it (r_auto_exposure 1), and the host WriteTexture's it
+    // alongside every WriteBuffer of exposure_state (manual mode + seeding).
+    // Allocated only while DlssRequested(); 0 otherwise.
+    std::uint64_t                               exposure_texture_id_   = 0;
     std::uint64_t                               box_blas_id_           = 0;
     std::uint64_t                               scene_tlas_id_         = 0;
     std::uint64_t                               box_vbuf_id_           = 0;
@@ -1909,32 +1989,44 @@ private:
     std::uint32_t                               restir_alloc_w_ = 0;
     std::uint32_t                               restir_alloc_h_ = 0;
     // --- end ReSTIR DI Phase A ---------------------------------------------
-    // MetalFX specular-guidance G-buffers (issue #118). Three textures
-    // fed to MTLFXTemporalDenoisedScaler so it can tell specular from
-    // diffuse response; without them MetalFX produces 8x8 halos on
-    // bright reflections. Allocated only for MetalFX-family denoiser
-    // kinds (DenoiserKind::MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx);
-    // SVGF / NRD / OptiX paths leave them at 0 since they don't accept
-    // these guidance inputs. Same allocation lifecycle as
-    // normal_tex_id_ / albedo_tex_id_.
+    // Specular-guidance G-buffers. Added for MetalFX (issue #118) and gated
+    // on the MetalFX denoiser kinds, which no live backend could ever
+    // select -- so they were allocated, written and read by nobody until the
+    // MetalFX removal repointed the gate at DlssRayReconstructionRequested().
+    // The only consumer now is DLSS Ray Reconstruction, which is handed all
+    // three at feature-creation time. Allocated only while RR is requested;
+    // 0 for every other configuration, including the default. Same
+    // allocation lifecycle as normal_tex_id_ / albedo_tex_id_.
     //
-    //   specular_albedo_tex_id_       -- RGBA16F per-pixel F0 (Fresnel
-    //                                    reflectance at normal incidence).
-    //                                    Metals: F0 = albedo; dielectrics:
-    //                                    F0 = float3(0.04); Lambert: 0.
-    //   roughness_tex_id_             -- R32F single-channel surface
-    //                                    roughness in [0, 1]. 0 = mirror,
-    //                                    1 = fully rough. (R16F would be
-    //                                    plenty for the precision but the
-    //                                    RHI doesn't expose it today; see
-    //                                    Engine.cpp allocation for the
-    //                                    R16F-vs-R32F trade.)
-    //   specular_hit_distance_tex_id_ -- R32F distance from camera to the
-    //                                    specularly-reflected hit (MVP:
-    //                                    primary_t * smoothness; a future
-    //                                    PR can swap in a real reflection-
-    //                                    ray trace). Same R32F-as-fallback
-    //                                    rationale as roughness_tex_id_.
+    //   specular_albedo_tex_id_       -- RGBA16F. The SPLIT-SUM INTEGRATED
+    //                                    specular reflectance
+    //                                    F0*A(rough, n.v) + B(rough, n.v)
+    //                                    (Karis 2013 / Lazarov's analytic
+    //                                    fit), which is RR's
+    //                                    pInSpecularAlbedo. NOT raw F0 --
+    //                                    F0 is the normal-incidence value
+    //                                    only, and it understates grazing
+    //                                    reflectance by up to 1/F0 (a factor
+    //                                    of ~50 on water), exactly on the
+    //                                    ocean and the planet limb.
+    //   roughness_tex_id_             -- R32F PERCEPTUAL roughness in [0, 1]
+    //                                    (GGX alpha = roughness^2), the
+    //                                    engine's own convention and the one
+    //                                    RR/NRD document; no remap either
+    //                                    way. 0 = mirror, 1 = fully rough.
+    //                                    (R16F would be plenty for the
+    //                                    precision but the RHI doesn't
+    //                                    expose it today; see Engine.cpp
+    //                                    allocation for the R16F-vs-R32F
+    //                                    trade.)
+    //   specular_hit_distance_tex_id_ -- R32F distance FROM THE PRIMARY HIT
+    //                                    along the mirror-reflected ray to
+    //                                    what it hits -- a real second
+    //                                    trace, in NRD's hitDist convention.
+    //                                    Replaces `primary_t * (1-rough)`,
+    //                                    which was not a distance at all.
+    //                                    Same R32F-as-fallback rationale as
+    //                                    roughness_tex_id_.
     std::uint64_t                               specular_albedo_tex_id_       = 0;
     std::uint64_t                               roughness_tex_id_             = 0;
     std::uint64_t                               specular_hit_distance_tex_id_ = 0;
@@ -1948,6 +2040,104 @@ private:
     std::uint32_t                               bloom_mip_w_[kBloomMips] {};
     std::uint32_t                               bloom_mip_h_[kBloomMips] {};
     std::uint64_t                               bloom_dummy_tex_id_ = 0;   // 1x1 RGBA16F when bloom off
+
+    // --- Render scale (r_render_scale) -----------------------------------
+    // The internal-extent LDR target the path tracer (or the denoiser's
+    // finalize, or Tonemap.slang) writes INSTEAD of the swapchain when
+    // the internal extent differs from the presentation extent. Same
+    // 8-bit UNORM storage class as the swapchain because it holds the
+    // same thing: already-tonemapped, already-sRGB-encoded display
+    // colour. Allocated lazily on the first scaled frame and freed as
+    // soon as the scale returns to 1.0, so the default configuration
+    // pays no VRAM for a feature it never uses. `_w_` / `_h_` are the
+    // extent it was allocated at, which is what drives reallocation --
+    // both a window resize and an r_render_scale change land here.
+    std::uint64_t                               present_ldr_tex_id_ = 0;
+    std::uint32_t                               present_ldr_w_      = 0;
+    std::uint32_t                               present_ldr_h_      = 0;
+    // This frame's internal render extent and the presentation extent.
+    // Equal whenever r_render_scale resolves to 1.0. Everything
+    // upstream of the resolve pass -- accumulator, G-buffers, SVGF
+    // history, ReSTIR reservoirs, every composite -- is sized and
+    // dispatched at render_*; only the resolve pass, the editor gizmo
+    // overlay and the perf HUD run at output_*.
+    std::uint32_t                               render_w_           = 0;
+    std::uint32_t                               render_h_           = 0;
+    std::uint32_t                               output_w_           = 0;
+    std::uint32_t                               output_h_           = 0;
+    // Engaged/disengaged edge latch for the one-line state log, same
+    // shape as vulkan_dual_denoise_engaged_ and friends: a silent
+    // resolution change is exactly the kind of thing that gets blamed
+    // on the renderer months later.
+    bool                                        render_scale_engaged_ = false;
+    // "The backend has no `upscale` kernel, so render scaling was
+    // pinned to 1.0" -- warned once, after a grace period. The grace is
+    // not politeness: Vulkan builds its pipelines on an async worker
+    // and the loading-frame gate only waits on `pathtrace`, so the
+    // first few real frames can legitimately see a not-yet-registered
+    // resolve kernel. Warning on frame one would cry wolf on every
+    // start-up where r_render_scale was archived below 1.
+    int                                         upscale_absent_frames_  = 0;
+    bool                                        upscale_missing_logged_ = false;
+    static constexpr int kUpscaleProbeGraceFrames = 60;
+    // --- end render scale --------------------------------------------------
+
+    // --- DLSS Super Resolution / DLAA (docs/DLSS_INTEGRATION_PLAN.md) ------
+    //
+    // The mode that ACTUALLY resolved this frame, after the cvar, the
+    // build flag, the hardware capability check, the HDR-pipeline
+    // requirement and the optimal-settings query have all had their say.
+    // Distinct from the r_dlss cvar string, which is what the user
+    // ASKED for -- the cvar is never rewritten on a fallback, because
+    // silently editing the user's setting hides the fact that it did
+    // not take.
+    pt::rhi::UpscalerMode dlss_mode_   = pt::rhi::UpscalerMode::Off;
+    bool                  dlss_active_ = false;
+    // Cache for the optimal-settings query. NGX is asked once per
+    // (mode, display extent) pair -- on a mode change or a swapchain
+    // resize -- and never per frame: the query is a driver round trip,
+    // and asking every frame would also make it impossible to tell from
+    // a log whether the extent had actually changed.
+    pt::rhi::UpscalerMode     dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+    std::uint32_t             dlss_query_display_w_ = 0;
+    std::uint32_t             dlss_query_display_h_ = 0;
+    pt::rhi::UpscalerSettings dlss_settings_{};
+    // Display-extent linear-HDR target DLSS writes. Allocated only while
+    // DLSS is engaged and freed the moment it is not, same lifecycle as
+    // present_ldr above. RGBA16F because it holds the same quantity
+    // post_denoise_hdr holds -- unbounded linear radiance -- and handing
+    // the tonemap an 8-bit version of it would throw away the range
+    // before the operator that needs it ever ran.
+    std::uint64_t dlss_output_tex_id_ = 0;
+    std::uint32_t dlss_output_w_      = 0;
+    std::uint32_t dlss_output_h_      = 0;
+    // Engaged/disengaged edge latch for the one-line state log, and a
+    // one-shot latch for the "DLSS owns r_render_scale" explanation so
+    // a user who keeps typing r_render_scale is told why it is inert --
+    // the same courtesy r_svgf_atrous_passes already extends when
+    // r_denoiser makes it inert.
+    bool dlss_engaged_logged_       = false;
+    bool dlss_owns_scale_logged_    = false;
+    // One log line per distinct fallback reason, so a build without the
+    // SDK, an unsupported GPU and a failed query are distinguishable in
+    // the log but none of them repeats per frame.
+    bool dlss_fallback_logged_      = false;
+    // What the "optimal settings" line last reported. The query is
+    // resolved TWICE per frame (window extent before BeginFrame, real
+    // swapchain extent after), and on a host where those two disagree
+    // permanently -- DPI scaling, or a surface whose caps clamp the
+    // swapchain -- the cache would miss on both calls and print the line
+    // every frame. Logging on a change of ANSWER rather than on a cache
+    // refill makes the line immune to that: it is a state-transition
+    // log, like every other one in this file.
+    pt::rhi::UpscalerMode dlss_logged_mode_      = pt::rhi::UpscalerMode::Off;
+    std::uint32_t         dlss_logged_display_w_ = 0;
+    std::uint32_t         dlss_logged_display_h_ = 0;
+    std::uint32_t         dlss_logged_render_w_  = 0;
+    std::uint32_t         dlss_logged_render_h_  = 0;
+    bool dlss_hdr_conflict_logged_  = false;
+    bool dlss_rr_pending_logged_    = false;
+    // --- end DLSS ----------------------------------------------------------
 
     // Physical lens flare (Hullin paraxial). LensSystem + traced
     // ghost matrices live for the engine's lifetime; per-frame we
@@ -2256,15 +2446,74 @@ private:
     //   OptixTemporalHdrAov  = OptixTemporalHdr + albedo + normal guide
     //                          layers. The strongest OptiX variant --
     //                          temporal smoothing AND AOV edge fidelity.
+    // MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx were removed with the
+    // macOS backend: MTLFXTemporalDenoisedScaler is an Apple API and no live
+    // backend could ever select them. Their one lasting consequence is
+    // recorded at want_specular_guidance_gbuffers -- the specular G-buffer
+    // trio was gated on those kinds, which made it dead code on Vulkan.
     enum class DenoiserKind : std::uint8_t {
-        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd,
-        SvgfBasicMetalFx, SvgfAtrousMetalFx,
+        Off, SvgfBasic, SvgfAtrous, Nrd,
         OptixHdr, OptixHdrAov,
         OptixTemporalHdr, OptixTemporalHdrAov,
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
+    // True when the user has asked for DLSS Ray Reconstruction: r_dlss is not
+    // `off` AND r_dlss_rr is set. Reads the cvars rather than a resolved state
+    // because the specular guidance G-buffers it gates must be allocated
+    // BEFORE the NGX feature is created -- DLSS-RR is handed its guide buffers
+    // at creation time, not per frame. Returns false while the NGX calls are
+    // unwired, which is correct: nothing consumes the buffers yet.
+    bool DlssRayReconstructionRequested() const;
+    // Ask the backend what render extent `mode` wants for a display of
+    // `display_w` x `display_h`, caching the answer per (mode, extent)
+    // so NGX is asked once per mode change or resize rather than per
+    // frame. Fills dlss_settings_ and returns whether the mode is
+    // usable; a false answer is the "fall back to off" signal and has
+    // already logged the reason.
+    //
+    // Called TWICE per frame by design, and the second call is normally
+    // free (cache hit). Once before BeginFrame against the window
+    // extent, because the denoiser-G-buffer gate is resolved there and
+    // needs to know whether DLSS is on; then again after BeginFrame
+    // against the real swapchain extent, which is the authoritative one
+    // and the only size the NGX feature may be created for. They differ
+    // only on a resize frame, and that is exactly the frame where
+    // trusting the window size would create a feature for the wrong
+    // extent.
+    bool ResolveDlssForDisplay(pt::rhi::UpscalerMode mode,
+                               std::uint32_t display_w,
+                               std::uint32_t display_h);
+    // True when the user has asked for ANY DLSS mode (r_dlss != off),
+    // Ray Reconstruction or not. Gates exposure_texture_id_: NGX takes the
+    // exposure as a 1x1 R32F texture for plain Super Resolution / DLAA as
+    // well as for RR, so the texture is wider than the RR-only guide trio.
+    // Same "reads the cvars, not a resolved state" reasoning as
+    // DlssRayReconstructionRequested().
+    bool DlssRequested() const;
+    // Issue #50 -- does the active backend have a working NVIDIA
+    // RayTracingDenoiser? Refreshed from Device::SupportsNrdLibrary()
+    // once per frame, because the runtime half of that answer can flip
+    // (once, downward) after NRD's first init attempt. Drives three
+    // things: which DenoiseDesc::Kind `r_denoiser nrd` maps to, the
+    // one-shot transition log, and PathTrace's write_nrd_hitdist gate.
+    bool                                        nrd_lib_active_        = false;
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
+    // --- Deterministic camera jitter (r_camera_jitter) --------------------
+    // The sub-pixel offset ACTUALLY applied to the camera basis this
+    // frame, in pixels of the INTERNAL render extent, each component in
+    // [-0.5, 0.5]. Zero on both axes when r_camera_jitter is off, which
+    // is the honest report: with the cvar off the path tracer draws an
+    // independent random offset per ray and there is no single frame
+    // offset to name. Distinct from last_jitter_* above, which always
+    // carries the raw Halton value because the denoiser's DenoiseDesc
+    // has consumed it since long before this cvar existed.
+    float                                       frame_jitter_x_        = 0.0f;
+    float                                       frame_jitter_y_        = 0.0f;
+    bool                                        camera_jitter_active_  = false;
+    // Engaged/disengaged edge latch for the one-line state log.
+    bool                                        camera_jitter_engaged_ = false;
+    // --- end deterministic camera jitter -----------------------------------
 
     // Auto-exposure now lives entirely on the GPU (see exposure_state_id_
     // above + AutoExposure.slang). The legacy CPU-side `current_exposure_`

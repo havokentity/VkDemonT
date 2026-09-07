@@ -19,9 +19,27 @@
 #     this exact runner-capability gap.  When a self-hosted runner
 #     with a real GPU shows up (or GitHub opens the Tesla-T4 tier to
 #     OSS), wire it back in here under the sanitizer env.
-#   - Linux software backend doesn't exist yet either (src/CMakeLists.txt
-#     gates rhi_software to WIN32; Linux has no SetDIBitsToDevice
-#     analog implemented).  Adding one is a separate work item.
+#   - There is no CPU backend to fall back to.  The software RHI (and
+#     Embree with it) was deleted -- this engine is Windows/Vulkan/
+#     NVIDIA-exclusive.  So with Vulkan off this lane compiles and
+#     sanitizes HOST code only: pt_core / pt_console / pt_renderer /
+#     pt_capture_encoder and the doctest binaries over them.  No RHI
+#     backend is compiled at all.
+#   - Neither NRD nor DLSS is fetched or built here, and that is
+#     enforced by construction rather than by convention.  Both gates in
+#     cmake/Dependencies.cmake AND in PT_ENABLE_VULKAN_BACKEND:
+#     PT_NRD_ACTIVE needs (PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND)
+#     and the FetchContent_Declare(nrd) sits inside that same block;
+#     the DLSS FetchContent_MakeAvailable sits inside
+#     (PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND WIN32).  With the
+#     preset's PT_ENABLE_VULKAN_BACKEND=OFF both are false regardless of
+#     the ON defaults those two options now carry, so this lane never
+#     pays for the NRD source build or the several-hundred-MB DLSS git
+#     clone.  Verified by executing cmake/Dependencies.cmake in cmake
+#     script mode with the preset's variables: declared deps come back
+#     as glm/fmt/mimalloc/glfw/enkits/civetweb/tomlplusplus/vma/
+#     nlohmann_json/manifold/doctest, with PT_NRD_ACTIVE=OFF and
+#     PT_DLSS_ACTIVE=OFF and neither nrd nor dlss in the list.
 #
 # What WE do run:
 #   - The full ctest suite (harness_smoke, cvar_roundtrip, capture_format,
@@ -29,6 +47,11 @@
 #     test executable links pt_console / pt_capture_encoder / etc. which
 #     themselves carry the project-wide sanitizer flags, so any UB / OOB
 #     in those libraries surfaces here.
+#   - No golden-image cells.  pt_add_golden_cell() returns early for a
+#     `vulkan` cell when PT_ENABLE_VULKAN_BACKEND is OFF, and every
+#     surviving cell in tests/CMakeLists.txt is a vulkan cell now that
+#     the software ones are gone, so zero golden tests register on this
+#     lane.  That is why the unfiltered `ctest` below is safe.
 #
 # Triggers: pull_request + push to main, same as build.yml.  No nightly
 # schedule needed (the main matrix is already nightly-scheduled; we
@@ -104,6 +127,20 @@ jobs:
           cmake --version
           ninja --version
 
+      - name: Cache Slang toolchain
+        # cmake/SetupBinaries.cmake is included UNCONDITIONALLY by the
+        # top-level CMakeLists, so this lane downloads the Slang release
+        # archive even though it compiles no shaders (PT_ENABLE_VULKAN_BACKEND
+        # is OFF, so pt_compile_slang is never invoked).  It lands in
+        # third_party/slang/ -- the SOURCE tree, gitignored -- which the
+        # build-directory cache below cannot cover.  Caching it is the cheap
+        # fix; gating SetupBinaries on the Vulkan backend is the real one and
+        # is a source change, not a CI change.
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
+
       - name: Cache CMake build directory
         uses: actions/cache@v4
         with:
@@ -117,13 +154,19 @@ jobs:
             linux-asan-ubsan-
 
       - name: Configure
-        # The preset disables Vulkan + OptiX so no SDK install is
-        # needed; Embree gets auto-fetched as a prebuilt tarball
-        # from the vendored/embree-* release (see EmbreeBinary.cmake).
-        # Even though Embree is ray-tracing code, it stays linked in
-        # because pt_renderer / pt_csg pull it transitively for CPU-
-        # side scene-build helpers; the sanitizer flags propagate into
-        # the project code linking against it.
+        # The preset disables Vulkan + OptiX so no SDK install is needed, and
+        # -- via the PT_NRD_ACTIVE / PT_DLSS_ACTIVE gates described in the
+        # header -- neither of the two heavyweight NVIDIA fetches runs either,
+        # despite both PT_ENABLE_NRD and PT_ENABLE_DLSS now defaulting ON.
+        # Embree is gone with the software RHI, so this job no longer fetches
+        # it -- one fewer dependency and a faster configure. What remains here
+        # is exactly what it always really was: a host-code sanitizer run over
+        # the CPU-side unit tests.
+        #
+        # No -DPT_ENABLE_DLSS=OFF is passed on purpose, unlike the Windows
+        # lanes. Passing it would imply the gate needs a workaround; it does
+        # not, and a redundant flag here would rot the day someone reads it
+        # as load-bearing.
         run: cmake --preset linux-asan-ubsan-debug
 
       - name: Build

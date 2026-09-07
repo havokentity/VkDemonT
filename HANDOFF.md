@@ -27,7 +27,7 @@ Each was rebased onto `fix/vulkan-native-bringup` (Mac strip + native-Vulkan fix
 
 **Systemic finding from the two rejections:** the engine's post-process chain — `Tonemap.slang`, the lens-flare composite, and `CloudsComposite` for raymarched clouds — is dispatched only inside `use_engine_tonemap = … && backend_is_metal`, which the strip made compile-time false. **That whole chain is dead on Vulkan.** A Vulkan dispatch path for it is now a first-class task: it unblocks the lens flare, raymarched clouds, and the engine tonemap operators.
 
-Known pre-existing, to file separately: `pt_math_sphere` bit-pin fails on the base tree; software goldens flake intermittently under heavy CPU load.
+Known pre-existing: `pt_math_sphere` bit-pin fails on the base tree (verified still failing on `origin/main` on 2026-09-07; spun out to its own task). The "software goldens flake under CPU load" note is retired with the software backend.
 
 ## The headline next task: smooth terrain streaming
 
@@ -56,12 +56,14 @@ builds clean (`demont.exe` + all targets, `win-clang-release`):
 
 - Deleted `src/rhi_metal/`, the 4 Cocoa `.mm` files, the Metal ocean GPU
   test, the Mac CMake presets, and the metal-cpp / MSL toolchain wiring.
-- `BackendType::Metal` removed; `r_backend` defaults to `vulkan` and its
-  allowed set is `none|software|vulkan` (a retired `r_backend metal` from
-  an old macOS cfg is normalized to `vulkan` at boot).
+- `BackendType::Metal` removed; `r_backend` defaults to `vulkan`. Its
+  allowed set is now `none|vulkan` — **the software backend was removed too**
+  (2026-09-07, see "Software RHI removed" below). A retired `r_backend metal`
+  from an old macOS cfg is normalized to `vulkan` at boot.
 - The Metal denoiser-selection branches and every `#if defined(__APPLE__)`
   block in the kept sources were removed; `OceanGpuActive()` (Metal-only)
-  now returns via the software-exclusion guard, behavior-identical.
+  now returns early on the id==0 test (its software-exclusion guard went
+  with the software backend).
 
 Also done since: the macOS CI jobs were removed from all three workflows
 (the nightly release now builds/packages on Windows), the
@@ -132,15 +134,92 @@ the smoke test renders a correct frame (gradient sky + ground, 0
   interactive app on the RTX 5090 — the presented swapchain renders correctly
   (confirming the `rgba8` revert) and everything is back in working order.
   That is the live check step 3 above was gated on, so the pending polish
-  branches can now be merged. Still owed: a Vulkan **golden** image cell
-  (goldens currently run on the software/Embree backend, which `-O0` does
-  not affect).
+  branches can now be merged. **The "owed Vulkan golden cell" is DONE and
+  then some** — the whole matrix is Vulkan now (40 cells), see below.
 
 ### Next-gen roadmap progress (see `docs/NEXTGEN_PLAN.md`)
 
-- **Step 0 — DONE** (`feat/vulkan-step0-features`, PR #4): Vulkan 1.4 requested and effective; the promoted 1.2/1.3/1.4 features and the RT-pipeline family (`VK_KHR_ray_tracing_pipeline`, `pipeline_library`, `ray_tracing_maintenance1`, `VK_EXT_ray_tracing_invocation_reorder`, `position_fetch`, `subgroup_uniform_control_flow`) enabled; every next-gen extension queried and logged at startup — all present on the RTX 5090 / 616.56 (SER in REORDER mode, cluster-AS rev 4, PTLAS, coopvec/coopmat, FP8, OMM; only `shaderBFloat16DotProduct` absent). Rendering bit-identical (md5). `docs/NVIDIA_DRIVER_BUG_REPORT.md` is ready for the owner to file — record the bug ID here.
+- **Step 0 — DONE** (`feat/vulkan-step0-features`, PR #4): Vulkan 1.4 requested and effective; the promoted 1.2/1.3/1.4 features and the RT-pipeline family (`VK_KHR_ray_tracing_pipeline`, `pipeline_library`, `ray_tracing_maintenance1`, `VK_EXT_ray_tracing_invocation_reorder`, `position_fetch`, `subgroup_uniform_control_flow`) enabled; every next-gen extension queried and logged at startup — all present on the RTX 5090 / 616.56 (SER in REORDER mode, cluster-AS rev 4, PTLAS, coopvec/coopmat, FP8, OMM; only `shaderBFloat16DotProduct` absent). Rendering bit-identical (md5). `docs/NVIDIA_DRIVER_BUG_REPORT.md` is **READY TO FILE — hold discharged, retest done** (2026-09-07). GPU-AV found a real out-of-bounds read of our own (`mesh_uvs`, binding 35, ~3 KB past a 16-byte placeholder), fixed in `a88f5a9`; that was a live alternative explanation for the hang, so the report was held. Retested at `-O2` with the fix in: **the hang survives** — 8.66 MB module, `VK_ERROR_DEVICE_LOST` after 254 s, 28 reports, Windows TDR **event 153 / `nvlddmkm` at 15:54:11 and 15:54:13**. The OOB was worth fixing and was not the cause. The hold still paid: the report can now state that the module is VALID (`spirv-val` clean at both `-O0` and `-O2`) and the application is CLEAN (GPU-AV reports zero OOB, zero validation errors), which closes the two questions NVIDIA would ask first. **Record the bug ID here once filed.** `PT_SLANGC_OPT` stays `-O0`; the retest confirms it cannot be lifted.
 - **Step 1 — design done** (`docs/STEP1_RT_PIPELINE_DESIGN.md`): 21 shader groups in 4 pipeline libraries, software tiers merged in raygen via portable `MakeMiss` records, 48 B payload, two SER reorder points, shared layout reused. Leads with a **2-day go/no-go probe** (raygen-only port at `-O2`, 16×16 soak) before the split; wavefront-compute is plan B. Note: `NEXTGEN_PLAN.md`'s `PathTrace.slang` line numbers are ~220 lines stale since the polish landed; the design cites current lines.
-- **Owed before 1b:** Vulkan golden cells for the planet fixtures (only `cornell_csg`, `sdf_smin_row`, `pbr_textured` have Vulkan pins today) and the determinism baseline for the A/B harness.
+- **Owed before 1b:** ~~Vulkan golden cells~~ **DONE** — the matrix is 40 Vulkan cells, all pinned, all passing. The determinism baseline for the A/B harness is still owed.
+
+## Software RHI removed; the golden matrix is GPU-only (2026-09-07, PR #41)
+
+The engine is Windows/Vulkan/NVIDIA-exclusive and targets 5090-class hardware,
+so the CPU tracer was carrying maintenance cost while validating nothing the
+renderer runs. Deleted `src/rhi_software/` (3,486 lines), `BackendType::Software`,
+`r_backend software`, and the vulkan→software HWND recreate path.
+
+**Embree went with it** — it existed solely to give that backend a CPU BVH, and
+every other reference in the tree was a comment. `cmake/EmbreeBinary.cmake`,
+`cmake/EmbreeConfig.cmake`, `cmake/embree-prebuild/` and
+`.github/workflows/prebuild-embree.yml` are gone. That removes the slowest
+dependency in the build (10–15 min from source, which is why the prebuilt-cache
+workflow existed).
+
+**The golden matrix moved rather than died.** All 20 committed Windows goldens
+were *software* cells, so the matrix could never detect a GPU rendering
+regression; the three registered Vulkan cells had no goldens at all. The cells
+were converted: **40 cells, all Vulkan, all pinned, all passing.**
+
+**CI CONSEQUENCE, and it is the important one.** `build.yml` ran
+`ctest -L golden_software` because that lane worked on any CPU. GitHub-hosted
+`windows-latest` has no usable Vulkan ICD, so **the golden matrix cannot run on
+hosted CI at all.** The step was removed rather than left silently red. Until a
+self-hosted RTX runner is attached, `ctest -R golden` is a **local gate** — run
+it before merging anything touching shaders or radiometry, because CI will not
+catch it. Unit tests still run on every push; the Linux sanitizer job is
+unaffected (CPU-only host code, and no longer fetches Embree).
+
+Testing rules that came out of the move, each measured rather than assumed:
+- **Star cells MUST use `DENOISER svgf_atrous`.** `r_star_split` routes stars
+  through `StarsComposite.slang` *after* the denoiser, so a `DENOISER off` cell
+  pins a starless frame and passes forever.
+- **Night cells are pinned PIXEL-EXACT (0/0/0).** A *complete* star wipeout is
+  only `mean_delta 0.019` over 0.44% of pixels — the matrix's usual `32/4/2`
+  would pass it. Threshold 0 is reachable because the render is bit-identical
+  run-to-run on this host. A driver update legitimately re-pins these:
+  regenerate, do not loosen.
+- **Still-painted terms keep their authored exposure**, documented in-fixture:
+  the moon disc (`lunar_night`) and the cloud path (`bsc_night_clouds`, which
+  rendered flat white at the derived night exposure). Migrating those is the
+  successor to the #338 radiometry work.
+
+## Night-sky radiometry landed (#338 closed, PR #41)
+
+Stars had no radiometry: Vega was `4.0` arbitrary units while the sky was in real
+W/m²/sr, the splat wrote *peak amplitude* (so energy went as `flux·σ²`), and σ was
+tiered *by magnitude* (applying the magnitude scale twice). Replaced with Pogson's
+ratio on a cited 3.19e-9 W/m² V-band zero point, a discretely-renormalised
+energy-conserving splat, one optical PSF σ, and footprint-integrated sampling.
+`kStarVeilK = 8.0` is **retired** — on a shared scale a star is ~2e-5 of a noon
+zenith, so daylight suppression needs no help. **demont-engine #338 is closed by
+this**; the "K=8 stays honestly labelled" note above is superseded.
+
+The stars were not the visible problem, though. `procSky`'s night floor was
+~2e5× too bright (0.0589 W/m²/sr of luma against a real dark sky's 2.5e-7),
+which is what actually drowned them. Fixed from V=22.0 mag/arcsec² dark-site
+brightness. `r_exposure_max` went 4.0 → 2000, *derived* from the naked-eye
+limiting magnitude. Daylight is unchanged (median 200.88 → 200.80); twilight
+moved toward truth (0.0954 → 0.0421 W/m²/sr against a real ~0.03).
+
+## DLSS / NRD in flight
+
+- `docs/DLSS_INTEGRATION_PLAN.md` — recommends **direct NGX over Streamline**,
+  reversing `NEXTGEN_PLAN.md` §2 item 5. Two blockers it found: Ray
+  Reconstruction's guide buffers (specular albedo / roughness / hit distance)
+  are **dead code** behind a MetalFX-only gate (`Engine.cpp:8118`), and the
+  G-buffer ray is traced **unjittered** while colour is jittered
+  (`PathTrace.slang:7995` vs `:8391`) — which degrades SVGF and NRD *today*,
+  not just future DLSS.
+- Build flags `PT_ENABLE_NRD` / `PT_ENABLE_DLSS` default **ON** (gated on
+  Vulkan, following the `PT_NRD_ACTIVE` pattern); the runtime cvars default
+  **off**, so the out-of-the-box render stays the physically-correct native one
+  and the pixel-exact goldens keep a ground-truth reference.
+- DLSS testing strategy: pin our *contract* with DLSS (render scale, jitter
+  value, guide-buffer sanity — deterministic and ours) plus one pixel-exact
+  end-to-end cell. No loose-tolerance DLSS cell: loose tolerances demonstrably
+  hide real regressions (see the star-wipeout figure above).
 
 ## Conventions (carried from the parent)
 

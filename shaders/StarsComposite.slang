@@ -225,7 +225,7 @@ cbuffer Frame {
     // --- end Planetary P0 ---
     // --- Planetarium (#281) ---
     // Per-slot: .xyz unit world-space direction to the planet, .w linear
-    // flux (already through pt::stars::MagnitudeToFlux and the
+    // irradiance in W/m^2 (already through pt::stars::MagnitudeToIrradianceWm2 and the
     // r_planets_brightness multiplier host-side) / .rgb linear Rec.709
     // tint at unit luminance, .w Gaussian angular sigma in radians.
     // Both arrays are std140 float4[7] = 112 B each; the tail this kernel
@@ -331,6 +331,52 @@ bool starRayHitsBody(float3 rd) {
     return t0 > 0.0;
 }
 
+// --- point-source sampling (issue #338) -----------------------------------
+// Verbatim mirror of PathTrace.slang's pair. See that file for the full
+// rationale; the two MUST stay identical or the composite will not cancel
+// the inline stars it is subtracting.
+float ptPixelAngleRad() {
+    uint2 d;
+    hdr_inout.GetDimensions(d.x, d.y);
+    return (2.0 * pos_fovtan.w) / float(max(d.y, 1u));
+}
+
+float3 ptStarMapFootprint(float3 j, float pix_ang) {
+    uint2 dim;
+    star_map.GetDimensions(dim.x, dim.y);
+
+    float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+    if (u < 0.0) u += 1.0;
+    float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+
+    float dtheta = 3.14159265358979 / float(max(dim.y, 1u));
+    float dphi   = 6.28318530718     / float(max(dim.x, 1u));
+
+    float cdec = sqrt(max(1.0 - j.z * j.z, 1e-6));
+
+    int hy = int(clamp(floor(0.5 * pix_ang / dtheta),          0.0,  8.0));
+    int hx = int(clamp(floor(0.5 * pix_ang / (dphi * cdec)),   0.0, 16.0));
+
+    int cx = int(floor(u * float(dim.x)));
+    int cy = int(floor(v * float(dim.y)));
+
+    float3 acc  = float3(0.0);
+    float  wsum = 0.0;
+    for (int dy = -hy; dy <= hy; ++dy) {
+        int yy = cy + dy;
+        if (yy < 0 || yy >= int(dim.y)) continue;
+        float om = sin((float(yy) + 0.5) * dtheta);
+        for (int dx = -hx; dx <= hx; ++dx) {
+            int xx = (cx + dx) % int(dim.x);
+            if (xx < 0) xx += int(dim.x);
+            acc  += star_map[uint2(uint(xx), uint(yy))].rgb * om;
+            wsum += om;
+        }
+    }
+    return (wsum > 0.0) ? acc / wsum : float3(0.0);
+}
+// --- end point-source sampling --------------------------------------------
+
 float3 starsOnly(float3 rd, float3 sun) {
     float3 up      = localUp(pos_fovtan.xyz);
     float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
@@ -349,15 +395,8 @@ float3 starsOnly(float3 rd, float3 sun) {
         j.x = dot(w2j_row0.xyz, rd);
         j.y = dot(w2j_row1.xyz, rd);
         j.z = dot(w2j_row2.xyz, rd);
-        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
-        if (u < 0.0) u += 1.0;
-        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
-        uint2 dim;
-        star_map.GetDimensions(dim.x, dim.y);
-        int xi = int(floor(u * float(dim.x))) % int(dim.x);
-        if (xi < 0) xi += int(dim.x);
-        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
-        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Footprint-integrated, mirroring PathTrace.slang's starsOnly().
+        float3 stars = ptStarMapFootprint(j, ptPixelAngleRad());
         // Per-star 1-3 Hz base scintillation, scaled by exposure_pad.w
         // (the r_stars_twinkle_speed multiplier; 0 means off). Must
         // match PathTrace.slang's starsOnly() copy verbatim -- see
@@ -426,9 +465,10 @@ float3 starsOnly(float3 rd, float3 sun) {
 //     gauss = exp(-ang2 / sigma^2)        note: no 1/2, matching the map
 //     cut   = ang2 > sigma^2 * K^2, K = 4
 //
-// with sigma from pt::stars::SplatAngularRadiusRad(vmag) and the peak from
-// pt::stars::MagnitudeToFlux(vmag) -- both host-side, both the identical
-// functions the catalogue stars go through. A planet at V = -2.7 therefore
+// with sigma from pt::stars::PsfSigmaRad() and the total illuminance from
+// pt::stars::MagnitudeToIrradianceWm2(vmag) -- both host-side, both the
+// identical functions the catalogue stars go through. The Gaussian is
+// NORMALISED by pi*sigma^2 below, so df.w is energy, not peak amplitude. A planet at V = -2.7 therefore
 // paints exactly what a catalogue star at V = -2.7 paints. That shared
 // scale is the whole point; if the two ever diverge, Jupiter stops being
 // comparable to Sirius and the sky is lying.
@@ -470,11 +510,33 @@ float3 planetSplat(float3 rd, float3 sun) {
         float4 ts = planet_tint_sigma[i];
         float sigma = ts.w;
         if (sigma <= 0.0 || df.w <= 0.0) continue;
+        // Floor the PSF at half a pixel. A planet's optical sigma can be
+        // narrower than the sampling grid, and a point-sampled Gaussian
+        // narrower than a pixel aliases savagely -- the planet flickers
+        // as sub-pixel ray jitter walks across its peak.
+        //
+        // Widening is safe precisely BECAUSE the Gaussian below is
+        // normalised: energy is fixed at df.w, so a wider sigma lowers
+        // the peak by exactly the area ratio and the planet keeps its
+        // photometric brightness while gaining a resolvable footprint.
+        // (Space Graphics Toolkit arrives at the same place empirically
+        // with `scale = saturate(size/sizeMin); colour *= scale*scale`.
+        // Same identity, derived instead of tuned.)
+        sigma = max(sigma, 0.5 * ptPixelAngleRad());
+
         float c    = clamp(dot(rd, df.xyz), -1.0, 1.0);
         float ang2 = 2.0 * (1.0 - c);
         float s2   = sigma * sigma;
         if (ang2 > s2 * 16.0) continue;          // K = 4 sigma, as the map
-        acc += ts.rgb * (df.w * exp(-ang2 / s2));
+        // NORMALISED: integral of exp(-ang2/s2) over the sphere is pi*s2,
+        // so dividing by it makes df.w the planet's total illuminance in
+        // W/m^2 and this expression its radiance in W/m^2/sr -- the units
+        // star_map now holds, which is what lets a planet and a star of
+        // equal magnitude paint equally. The previous form omitted the
+        // 1/(pi*s2) and so used df.w as a PEAK amplitude, making a
+        // planet's delivered energy scale with sigma^2 -- i.e. its
+        // apparent brightness depended on the size it was drawn at.
+        acc += ts.rgb * (df.w / (3.14159265358979 * s2)) * exp(-ang2 / s2);
     }
     return acc * (1.0 - day);
 }

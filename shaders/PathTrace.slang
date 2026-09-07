@@ -177,34 +177,61 @@ Texture2D<float4> moon_map;
 // every subsequent texture slot.
 [[vk::binding(22, 0), vk::image_format("r32f")]] RWTexture2D<float>  cloud_trans_tex;
 
-// MetalFX specular-guidance G-buffers (issue #118). Apple's
-// MTLFXTemporalDenoisedScaler exposes three optional specular inputs --
-// without them the scaler can't differentiate specular from diffuse
-// response and exhibits 8x8 halos around bright reflections / metals.
-// PR #114 wired normal + diffuse_albedo; this PR fills the remaining
-// trio so MetalFX can close the gap with DLSS Ray Reconstruction on
-// Apple Silicon.
+// Specular-guidance G-buffers. Originally added for MetalFX's
+// MTLFXTemporalDenoisedScaler (issue #118); MetalFX was removed in the
+// Vulkan-only strip and the sole remaining consumer is DLSS Ray
+// Reconstruction, whose `pInSpecularAlbedo` / `pInRoughness` /
+// `pInSpecularHitDistance` these three feed. Without them a neural
+// reconstructor cannot tell specular response from diffuse and halos
+// bright reflections and metals.
+//
+// The RR contract is what these now target, and it differs from the
+// MetalFX one in two places that were silently wrong while the buffers
+// were dead code (the allocation gate named only MetalFX kinds no live
+// backend could select, so nothing ever wrote or read them):
+//   * specular_albedo is the split-sum INTEGRATED specular reflectance,
+//     not F0. See envBrdfSplitSum().
+//   * specular_hit_distance is measured FROM THE PRIMARY HIT along the
+//     reflected ray, not from the camera, and comes from a real second
+//     trace rather than a smoothness-weighted proxy.
 //
 // Binding numbers: 24/25/26. Binding 23 is reserved for #115 SIGMA
 // shadow visibility (parallel-agent coordination). The cluster
-// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 (this PR) lives
+// 22 (cloud_trans) / 23 (shadow_vis, #115) / 24-26 lives
 // just past the SDF-cluster buffer at 21 and keeps the descriptor
 // pool sizing arithmetic simple.
 //
-// All three are declared on BOTH SPIR-V and Metal targets so Slang's
-// declaration-order MSL slot assignment stays stable -- same rule as
-// normal_tex / albedo_tex / cloud_trans_tex (see albedo_tex's comment
-// for the PR #108 history that motivates this). Runtime writes are
-// gated on the matching push.write_specular_*_gbuffer flag the engine
-// sets only for MetalFX-family denoiser kinds.
+// Runtime writes are gated on the matching push.write_specular_*_gbuffer
+// flag, which the engine sets from want_specular_guidance_gbuffers ==
+// DlssRayReconstructionRequested(). With r_dlss off (the default) the
+// textures are not allocated, the flags stay 0 and none of this executes.
 
-// specular_albedo: per-pixel F0 (Fresnel reflectance at normal
-// incidence). RGBA16F so it can carry the full RGB metal tint
-// (metal F0 = surface albedo, NOT a uniform value -- gold is yellow
-// because its specular reflectance is yellow, not because it tints
-// a white diffuse). Dielectrics use the standard float3(0.04) IOR=1.5
-// Schlick approximation; pure Lambert writes float3(0) since it has
-// no specular lobe. Sky / no-hit pixels write float3(0).
+// specular_albedo: the directional-hemispherical specular reflectance
+// R_s(v) = F0 * A(roughness, n.v) + B(roughness, n.v), i.e. the split-sum
+// environment BRDF (Karis 2013 / Lazarov's fit -- see envBrdfSplitSum()
+// for the derivation and the citations). This is the quantity a
+// demodulating consumer divides the specular radiance by, so it must be
+// the INTEGRATED reflectance and not F0: F0 is R_s at normal incidence
+// only, and every dielectric rises to R_s -> 1 at the horizon.
+//
+// RGBA16F so it can carry the full RGB metal tint (metal F0 = surface
+// albedo, NOT a uniform value -- gold is yellow because its specular
+// reflectance is yellow, not because it tints a white diffuse). The .a
+// channel is unused and written 0.
+//
+// Per-material F0 fed into the split-sum, mirroring what the shading
+// branches actually refract with so the guide and the render agree by
+// construction:
+//   MAT_METAL      : F0 = albedo.
+//   MAT_DIELECTRIC : F0 = ((1 - n)/(1 + n))^2 from h.ior, the same
+//                    Schlick base reflectance the MAT_DIELECTRIC branch
+//                    computes (n = 1.5 gives the familiar 0.04).
+//   MAT_WATER      : same expression from the water IOR
+//                    (n = 1.333 gives 0.0204, the "0.02 for water at
+//                    0 deg" the water BRDF names).
+//   MAT_LAMBERT    : 0 -- no specular lobe at all, so R_s is exactly 0
+//                    and the split-sum's B term must NOT be applied.
+// Sky / no-hit pixels write float3(0).
 //
 // Declared as WTexture2D (write-only) rather than RWTexture2D because
 // Apple Silicon GPUs cap compute kernels at 8 read_write textures per
@@ -215,41 +242,78 @@ Texture2D<float4> moon_map;
 // 8-RW cap. Vulkan's GLSL/SPIR-V emit uses a write-only `imageStore`
 // path; the host-side bind path is identical (storage image, same
 // VkDescriptorSet entry, same vk::binding number). Issue #118 / Slang
-// docs WTexture2D guidance: a2-03-wgsl-target-specific.md.
+// docs WTexture2D guidance: a2-03-wgsl-target-specific.md. Metal is gone
+// but the declaration is unchanged: WTexture2D is exactly as correct on
+// SPIR-V, and churning it would gain nothing.
 [[vk::binding(24, 0), vk::image_format("rgba16f")]] WTexture2D<float4> specular_albedo_tex;
 
-// roughness: linear surface roughness in [0, 1]. Single-channel.
-// 0 = perfect mirror, 1 = fully Lambertian. The path tracer's
-// material struct already carries a roughness param on PBR-style
-// hits (used in the GGX BRDF); this G-buffer just exposes it to
-// MetalFX as a guidance input so the scaler can vary its spatial
-// filter aggressiveness by surface response. Sky / no-hit pixels
-// write 1.0 (fully rough -- MetalFX won't try to sharpen a specular
-// highlight in empty space). See specular_albedo_tex's comment for
-// the WTexture2D vs RWTexture2D rationale (Apple's 8-RW cap).
+// roughness: PERCEPTUAL (a.k.a. linear / artist) roughness in [0, 1],
+// the parameter r for which the GGX microfacet width is alpha = r^2.
+// That is the engine's own convention everywhere (anisoAlpha():
+// `alpha = r * r`; terrainRoughnessFold(): `a = base^2`, returns
+// sqrt(...)), and it is the convention DLSS RR and NRD document for
+// `pInRoughness` (NRD spells it linearRoughness = sqrt(alpha)). No
+// remap is applied on the way out -- the two conventions already agree.
+// 0 = perfect mirror, 1 = fully Lambertian.
+//
+// Two per-material corrections the raw h.roughness does not carry:
+//   * MAT_LAMBERT has no microfacet lobe, so its roughness field is
+//     meaningless; write 1.0 so a consumer treats the pixel as having
+//     no specular to preserve.
+//   * MAT_WATER stores 0.0 (a perfect Fresnel interface at the macro
+//     scale) and gets ALL of its roughness from unresolved wave slope
+//     at shading time via oceanBrdfAlpha2(). Writing 0 would tell the
+//     consumer the open ocean seen from orbit is a mirror when it is
+//     in fact Cox & Munk's sigma^2 of mean-square slope. The same fold
+//     the shading pass runs is applied here.
+// Sky / no-hit pixels write 1.0 (fully rough -- there is no specular
+// highlight in empty space to sharpen). See specular_albedo_tex's
+// comment for the WTexture2D vs RWTexture2D rationale.
 [[vk::binding(25, 0), vk::image_format("r32f")]] WTexture2D<float>  roughness_tex;
 
-// specular_hit_distance: distance from the camera (in world units) to
-// the surface a reflection ray from the primary hit would land on.
-// Single-channel. Apple uses this for parallax-correct temporal
-// reprojection of specular highlights -- without it, reflections on
-// moving cameras smear because MetalFX has no way to know the
-// reflected-virtual-image depth differs from the visible-surface
-// depth.
+// specular_hit_distance: the distance, in metres, FROM THE PRIMARY HIT
+// along the mirror-reflected direction to whatever that reflected ray
+// hits. It is what lets a temporal reconstructor reproject a reflection
+// parallax-correctly: the reflected virtual image sits at
+// primary_t + specular_hit_distance from the eye, not at primary_t, so
+// without it reflections smear whenever the camera translates.
 //
-// MVP semantics: we don't run a second trace per pixel (the full
-// design would re-trace in r = reflect(view_dir, normal) from the
-// primary hit). Instead we use `primary_t` (the distance the camera
-// ray itself travelled) as a proxy, biased by the roughness: at
-// roughness=0 (perfect mirror) the reflected hit is at infinity for
-// curved surfaces / at primary_t for flat ones, so this proxy is
-// closer to right for shorter-distance reflections; at roughness=1
-// the field doesn't matter anyway (MetalFX won't try to reproject
-// a fully-rough surface as a sharp specular). A future PR can
-// replace this with a real reflection-ray trace; the visual diff
-// determines whether the perf cost is worth it.
-// Sky / no-hit pixels write 0 (no surface). See specular_albedo_tex's
-// comment for the WTexture2D vs RWTexture2D rationale.
+// This is a REAL second trace, not a proxy. It replaces
+// `h0.t * (1 - roughness)`, which was neither a distance nor
+// dimensionally a distance -- it collapsed to 0 on rough surfaces
+// (telling the consumer the reflection is glued to the surface) and
+// returned the PRIMARY distance on mirrors (telling it the reflection
+// is at the surface's own depth, which is the one case it demonstrably
+// is not). A wrong number in a distance field mis-reprojects actively;
+// it is worse than no input, which is why the plan's fallback was a
+// null binding rather than shipping the proxy.
+//
+// Conventions and their reasons:
+//   * FROM THE PRIMARY HIT, not from the camera. This is NRD's hitDist
+//     convention and the one Streamline documents for RR. (The original
+//     MetalFX-era comment here said "from the camera"; MetalFX is gone
+//     and RR is the only consumer.)
+//   * The MIRROR direction, deterministically, rather than a GGX-sampled
+//     lobe direction. The whole G-buffer pass is deliberately noise-free
+//     (unjittered primary ray, no stochastic sampling) because these are
+//     GUIDES; injecting a stochastic lobe sample would put per-pixel
+//     noise into the very buffer that is supposed to explain the noise
+//     in the colour. The mirror direction is the mode of the GGX lobe
+//     and is exact at roughness 0, where parallax correction matters
+//     most and where a rough surface's reprojection error is invisible
+//     anyway.
+//   * A reflected ray that escapes the scene writes 1.0e10 m -- the same
+//     sky sentinel depth_tex uses, chosen so a consumer comparing the
+//     two sees one consistent scene scale. It is the honest value: the
+//     reflected image of the sky IS at infinity, so there is no parallax
+//     to correct, and a finite small number (least of all 0) would
+//     manufacture some. See depth_view's sky branch for the sentinel's
+//     own derivation and its stated 1 AU ceiling.
+//   * Lambert and sky pixels write 0.0, meaning "no specular lobe here."
+//     This is the one place the 0 == "no specular" fallback is correct,
+//     and it is correct because there genuinely is no reflected ray.
+// See specular_albedo_tex's comment for the WTexture2D vs RWTexture2D
+// rationale.
 [[vk::binding(26, 0), vk::image_format("r32f")]] WTexture2D<float>  specular_hit_distance_tex;
 
 // --- Wave 8 ocean (#25) ----------------------------------------------------
@@ -1452,7 +1516,20 @@ cbuffer Push {
     uint write_specular_albedo_gbuffer;
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
-    uint _pad_specular_gbuffers0;
+    // NRD first-bounce hit distance (issue #50). 1 -> stash the distance
+    // from the primary hit to the FIRST INDIRECT hit in denoise_color.a
+    // instead of the constant 1.0 that site otherwise writes.
+    // NVIDIA's RayTracingDenoiser packs its noisy diffuse input as
+    // float4(radiance, hitDist) (RELAX_FrontEnd_PackRadianceAndHitDist),
+    // and RELAX sizes its pre-pass blur radius from that distance. The
+    // engine has no spare G-buffer slot for it -- denoise_color.a is
+    // read by nothing downstream (DenoiseTemporal / DenoiseAtrous /
+    // DenoiseFinalize all take .rgb), so it carries the channel.
+    // Set ONLY by DenoiserKind::Nrd with a working NRD library; every
+    // other path keeps the historical 1.0 and is bit-identical.
+    // Occupies what used to be `_pad_specular_gbuffers0` -- same wire
+    // offset, no push-constant growth.
+    uint write_nrd_hitdist;
     // --- Water Phase 1 (#134) -------------------------------------------------
     // See Engine.cpp's PtPush::water_params0 / water_params1 for full docs.
     //   water_params0.xyz = Beer's-law absorption per channel (1/m).
@@ -1945,7 +2022,9 @@ cbuffer Frame {
     uint write_specular_albedo_gbuffer;
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
-    uint _pad_specular_gbuffers0;
+    // See `write_nrd_hitdist` in the Metal Push cbuffer above (issue #50).
+    // Layout-equivalent; occupies the former `_pad_specular_gbuffers0`.
+    uint write_nrd_hitdist;
     // --- Water Phase 1 (#134) -------------------------------------------------
     // See `water_params0` / `water_params1` in the Metal Push cbuffer above.
     float4 water_params0;
@@ -2793,6 +2872,72 @@ float clearcoatFresnel(float cos_v) {
     return kClearcoatF0 + (1.0 - kClearcoatF0) * fc;
 }
 
+// --- Split-sum environment BRDF (the "specular albedo" a denoiser wants) ----
+//
+// The directional-hemispherical specular reflectance of a GGX surface: the
+// fraction of a uniform incident radiance field that leaves along v.
+//
+//     R_s(v) = INTEGRAL over the hemisphere of  f_s(l, v) * (n . l) dl
+//
+// Karis's split-sum factorisation of that integral (Karis, "Real Shading in
+// Unreal Engine 4", SIGGRAPH 2013 *Physically Based Shading in Theory and
+// Practice* course notes, eq. for the "environment BRDF") separates the
+// Schlick Fresnel's F0 into a scale and a bias:
+//
+//     R_s(v) ~= F0 * A(roughness, n.v)  +  B(roughness, n.v)
+//
+// A and B are the two moments of the masked GGX lobe against Schlick's
+// (1-cos)^5 expansion and depend on NOTHING but roughness and n.v -- which
+// is why they can be pre-integrated. The analytic fit to that 2D table used
+// here is Lazarov's, from the same 2013 course ("Getting More Physical in
+// Call of Duty: Black Ops II"), republished as `EnvBRDFApprox` in Karis's
+// mobile notes. `roughness` is the PERCEPTUAL parameter (alpha = r^2),
+// which is what the fit was built against and what this engine stores.
+//
+// HOW ACCURATE, HONESTLY. It is a three-ALU fit, not the integral. Measured
+// against a 65536-sample numerical split-sum (Karis's IntegrateBRDF with the
+// IBL Smith k = alpha/2) in tests/pt_dlss_guide_buffers_test.cpp: for
+// low-F0 dielectrics -- water, glass, the planet limb, i.e. what this engine
+// actually renders -- the reflectance agrees to under 0.05 over most of the
+// domain and 0.16 in the worst corner. For high-F0 metals it is coarser,
+// up to ~0.16 absolute / ~20% relative in the mid-roughness band. That is
+// still an order of magnitude better than the quantity it replaces (raw F0,
+// which is wrong by a factor of up to 1/F0 = ~50 on water at grazing), and
+// matching the form the consumer documents matters more than beating it on
+// accuracy: a demodulate/re-modulate pair only cancels if both sides
+// evaluate the same term. If a future consumer wants the exact table, the
+// upgrade is a rational fit (NRD's EnvironmentTerm_Rtg), not a tweak here.
+//
+// WHY THIS AND NOT F0. F0 is R_s at NORMAL incidence only. Every dielectric
+// goes to R_s -> 1 at grazing incidence -- that is the Fresnel effect, and it
+// is not small: water's F0 is 0.02, so handing a consumer F0 understates the
+// horizon reflectance of the ocean by a factor of ~50. A denoiser that
+// demodulates by the specular albedo (DLSS Ray Reconstruction's
+// `pInSpecularAlbedo` is exactly this quantity) would then re-modulate the
+// grazing band by 0.02 and crush it. The two places this engine cares about
+// most -- the ocean and the planet limb -- are both entirely grazing.
+//
+// Returns (A, B); the caller forms F0 * A + B per channel.
+float2 envBrdfSplitSumAB(float roughness, float n_dot_v) {
+    const float4 c0 = float4(-1.0, -0.0275, -0.572,  0.022);
+    const float4 c1 = float4( 1.0,  0.0425,  1.040, -0.040);
+    float4 r    = clamp(roughness, 0.0, 1.0) * c0 + c1;
+    float  a004 = min(r.x * r.x, exp2(-9.28 * clamp(n_dot_v, 0.0, 1.0)))
+                * r.x + r.y;
+    return float2(-1.04, 1.04) * a004 + r.zw;
+}
+
+// F0 * A + B, clamped to [0,1]. The clamp is energy conservation, not a
+// fudge: a reflectance above 1 would return more light than arrived. The fit
+// overshoots by ~4% in the one corner (roughness 0, n.v 0) where the true
+// value is exactly 1, and a consumer that DIVIDES by this term would amplify
+// rather than demodulate there.
+float3 envBrdfSplitSum(float3 f0, float roughness, float n_dot_v) {
+    float2 ab = envBrdfSplitSumAB(roughness, n_dot_v);
+    return clamp(f0 * ab.x + ab.y, float3(0.0), float3(1.0));
+}
+// --- end split-sum environment BRDF -----------------------------------------
+
 // Sample the clearcoat reflection lobe. Returns the world-space reflected
 // direction + the BRDF weight (G2/G1 masking ratio; Fresnel + the 1/p
 // selection weight are folded in by the caller). wo points toward the
@@ -3279,6 +3424,47 @@ bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) 
 // of it and of the origin, so traceScene derives `t_min` once here rather
 // than making every caller carry a second parameter that could drift out
 // of step with the first.
+// Barycentric-interpolated per-vertex UV, bounds-checked against the UV
+// buffer that is ACTUALLY bound.
+//
+// mesh_uvs (binding 35) is declared unconditionally, but when a mesh carries
+// no UVs the host binds a 16-BYTE PLACEHOLDER under PARTIALLY_BOUND. The
+// per-material tile gate downstream (tex_tiles != kPbrNoTexTile) was
+// documented -- in this shader and in VulkanDevice.cpp -- as the thing that
+// made that safe. It is not: it gates the texture SAMPLE, while the UV read
+// happens first and unconditionally. Every mesh hit on an untextured mesh
+// therefore read past the end of a 16-byte buffer.
+//
+// GPU-assisted validation reports it exactly:
+//
+//   VUID-vkCmdDispatch-storageBuffers-06936
+//   (set = 0, binding = 35) access out of bounds. The descriptor buffer
+//   size is 16 bytes, ... highest out of bounds access was at [3119] bytes
+//
+// That is undefined behaviour, and UB is precisely the licence an optimiser
+// needs to generate something pathological -- which is not academic here,
+// because this same kernel miscompiles into a non-terminating GPU hang at
+// slangc -O1 and above (see the PT_SLANGC_OPT comment in cmake/Slang.cmake).
+// A latent OOB read is a live candidate for that, so it is fixed before any
+// of it is blamed on a driver.
+//
+// Checked against the real element count via GetDimensions rather than a new
+// push constant: the descriptor already carries the length, so this cannot
+// drift out of sync with whatever the host actually bound. A missing UV
+// buffer yields uv_n = 4 (16 bytes / 4), every index fails the test, and the
+// hit gets uv = 0 -- which is what the tile gate was going to do with it.
+float2 ptMeshUv(uint i0, uint i1, uint i2, float w0, float w1, float w2) {
+    uint uv_n = 0u, uv_stride = 0u;
+    mesh_uvs.GetDimensions(uv_n, uv_stride);
+    // Highest float index any of the three vertices will touch.
+    uint hi = max(max(i0, i1), i2) * 2u + 1u;
+    if (hi >= uv_n) return float2(0.0);
+    float2 uv0 = float2(mesh_uvs[i0 * 2u + 0u], mesh_uvs[i0 * 2u + 1u]);
+    float2 uv1 = float2(mesh_uvs[i1 * 2u + 0u], mesh_uvs[i1 * 2u + 1u]);
+    float2 uv2 = float2(mesh_uvs[i2 * 2u + 0u], mesh_uvs[i2 * 2u + 1u]);
+    return uv0 * w0 + uv1 * w1 + uv2 * w2;
+}
+
 HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     float t_min = ptRayTMin(ro, cone);
     HitInfo h;
@@ -3747,10 +3933,8 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 // (b1, b2) for v1/v2; v0 weight = 1 - b1 - b2. When the
                 // mesh has no UV buffer the host forces the tile indices
                 // to kPbrNoTexTile so the sample is skipped (h.uv stays 0).
-                float2 uv0 = float2(mesh_uvs[i0 * 2 + 0], mesh_uvs[i0 * 2 + 1]);
-                float2 uv1 = float2(mesh_uvs[i1 * 2 + 0], mesh_uvs[i1 * 2 + 1]);
-                float2 uv2 = float2(mesh_uvs[i2 * 2 + 0], mesh_uvs[i2 * 2 + 1]);
-                h.uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+                h.uv = ptMeshUv(i0, i1, i2,
+                                1.0 - bary.x - bary.y, bary.x, bary.y);
 #if PT_PLANET_ENABLED
                 h.tex_tiles = idesc.tex_tiles;
 #else
@@ -3898,10 +4082,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 bw1 = (d11 * d20 - d01 * d21) / denom;   // weight of v1
                 bw2 = (d00 * d21 - d01 * d20) / denom;   // weight of v2
             }
-            float2 uv0 = float2(mesh_uvs[i0 * 2u + 0u], mesh_uvs[i0 * 2u + 1u]);
-            float2 uv1 = float2(mesh_uvs[i1 * 2u + 0u], mesh_uvs[i1 * 2u + 1u]);
-            float2 uv2 = float2(mesh_uvs[i2 * 2u + 0u], mesh_uvs[i2 * 2u + 1u]);
-            h.uv = uv0 * (1.0 - bw1 - bw2) + uv1 * bw1 + uv2 * bw2;
+            h.uv = ptMeshUv(i0, i1, i2, 1.0 - bw1 - bw2, bw1, bw2);
             h.tex_tiles = mesh_tex_indices;
         }
     }
@@ -3930,6 +4111,84 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
 // procSky() for the legacy (star-split off / denoiser off) and
 // secondary-bounce paths, so stars still contribute to indirect
 // lighting in the scene.
+// --- point-source sampling (issue #338) -----------------------------------
+//
+// Angular size of one pixel, in radians. The camera is a pinhole whose
+// image plane spans 2*fovYTan vertically across `height` pixels, so this
+// is the same quantity the ray-cone texture-LOD path calls cone_spread.
+float ptPixelAngleRad() {
+    uint2 d;
+    output.GetDimensions(d.x, d.y);
+    return (2.0 * pos_fovtan.w) / float(max(d.y, 1u));
+}
+
+// Footprint-integrated star-map fetch.
+//
+// star_map holds radiance in nits at ITS OWN texel resolution, with each
+// star's illuminance spread across the texels it covers and conserved
+// exactly (pt::stars::RasteriseJ2000Map). A pixel's radiance is therefore
+// the solid-angle-weighted MEAN of the texels its footprint covers -- not
+// the value of whichever single texel the ray centre happened to land in.
+//
+// That distinction is the whole ballgame for point sources. A nearest
+// fetch hands a star's peak texel radiance to any ray that lands on it
+// and zero to every ray that does not, so a star's apparent brightness
+// depends on render resolution, and it aliases hard as the camera turns
+// (a star pops between full brightness and nothing as the ray crosses a
+// texel edge). Averaging over the real footprint yields E_star /
+// omega_pixel, which is resolution-independent and is what a pinhole
+// camera actually measures.
+//
+// The box is separable in (u, v). Its longitude half-extent widens by
+// 1/cos(dec), tracking the equirectangular grid's convergence toward the
+// poles -- the same 1/cos(dec) the host rasteriser uses when it lays the
+// energy down. Texels are weighted by sin(theta), their true solid angle.
+//
+// Bounds: the half-extents are capped (8 in v, 16 in u) so a near-pole
+// ray, where 1/cos(dec) diverges, cannot walk an entire map row. Inside
+// ~3.6 deg of a celestial pole the cap means the mean is taken over a
+// sub-region of the true footprint, which reads slightly bright; that is
+// a bounded error over a negligible sky area, and it is the safe
+// direction (clamping never fabricates energy that is not in the map).
+float3 ptStarMapFootprint(float3 j, float pix_ang) {
+    uint2 dim;
+    star_map.GetDimensions(dim.x, dim.y);
+
+    float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
+    if (u < 0.0) u += 1.0;
+    float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
+
+    float dtheta = 3.14159265358979 / float(max(dim.y, 1u));   // rad per v texel
+    float dphi   = 6.28318530718     / float(max(dim.x, 1u));  // rad per u texel
+
+    // j.z is sin(dec), so cos(dec) = sqrt(1 - j.z^2).
+    float cdec = sqrt(max(1.0 - j.z * j.z, 1e-6));
+
+    int hy = int(clamp(floor(0.5 * pix_ang / dtheta),          0.0,  8.0));
+    int hx = int(clamp(floor(0.5 * pix_ang / (dphi * cdec)),   0.0, 16.0));
+
+    int cx = int(floor(u * float(dim.x)));
+    int cy = int(floor(v * float(dim.y)));
+
+    float3 acc  = float3(0.0);
+    float  wsum = 0.0;
+    for (int dy = -hy; dy <= hy; ++dy) {
+        int yy = cy + dy;
+        if (yy < 0 || yy >= int(dim.y)) continue;
+        // Solid angle of a texel in this row, up to the constant
+        // dphi*dtheta that cancels in the weighted mean.
+        float om = sin((float(yy) + 0.5) * dtheta);
+        for (int dx = -hx; dx <= hx; ++dx) {
+            int xx = (cx + dx) % int(dim.x);
+            if (xx < 0) xx += int(dim.x);
+            acc  += star_map[uint2(uint(xx), uint(yy))].rgb * om;
+            wsum += om;
+        }
+    }
+    return (wsum > 0.0) ? acc / wsum : float3(0.0);
+}
+// --- end point-source sampling --------------------------------------------
+
 float3 starsOnly(float3 rd, float3 sun) {
     // Planetary P0 (#254): the observer's local up, not world +Y. Sky-dome
     // helpers are evaluated in the CAMERA's frame -- see procSky()'s
@@ -3977,15 +4236,12 @@ float3 starsOnly(float3 rd, float3 sun) {
         j.z = dot(w2j_row2.xyz, rd);
         // Equirectangular: u from atan2(y, x) (RA), v from asin(z) (dec).
         // Match the host rasteriser: u = ra/360 wraps, v = (90-dec)/180.
-        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
-        if (u < 0.0) u += 1.0;
-        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
-        uint2 dim;
-        star_map.GetDimensions(dim.x, dim.y);
-        int xi = int(floor(u * float(dim.x))) % int(dim.x);
-        if (xi < 0) xi += int(dim.x);
-        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
-        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Footprint-integrated, not nearest-texel: a star's radiance is
+        // its illuminance spread over the pixel's solid angle. See
+        // ptStarMapFootprint. Secondary rays reuse the primary pixel
+        // angle rather than their own (wider) cone -- an approximation
+        // consistent with how the rest of the sky is sampled on bounces.
+        float3 stars = ptStarMapFootprint(j, ptPixelAngleRad());
         // Twinkle. Hash on a coarse-quantised J2000 direction (~1.5
         // deg bins) so every texel covering a single star agrees on
         // phase + frequency, and the whole star modulates as one
@@ -4096,37 +4352,28 @@ float3 starsOnly(float3 rd, float3 sun) {
 // L_inscatter and buries the star. No sun-elevation flag: the same physics that
 // blacks the sky in space is what hides the stars in daylight.
 //
-// WHY THE ADDITIVE SUM IS NOT ENOUGH ON ITS OWN, AND THE CONTRAST TERM (#333).
-// Two rendering realities make the raw sum leak the brightest stars into the
-// day sky:
+// WHY THE ADDITIVE SUM IS NOW ENOUGH ON ITS OWN (#333, closed by #338).
+// It did not used to be. Two rendering realities made the raw sum leak the
+// brightest stars into the day sky, and a Weber-contrast veiling term
+// (kStarVeilK) was added to suppress them:
 //   * skyPhysical is single-scatter-dominated and reads DARKER than the real
 //     sky (documented -- r_sky_mode's own docstring, and the planet_land_orbit
-//     fixture header). At noon the modelled L_inscatter at a bright-star pixel
-//     is ~13 W/m^2/sr against the star's ~2 after extinction -- 16%, where a
-//     correctly-bright sky would make it <<1% and invisible, as in life.
+//     fixture header), so the modelled L_inscatter was too small to bury a star.
 //   * ACES tonemaps per channel. The day sky is blue-dominated and saturates
-//     BLUE first, leaving RED with headroom, so a broadband star pokes through
-//     as a warm dot even while it is a small fraction of the sky's luminance.
-// The remedy is a CONTRAST attenuation, not a brightness flag: a point source is
-// seen only when its luminance beats the veiling sky background by more than the
-// observer's threshold contrast. In the photopic (daylit) regime that threshold
-// is approximately a CONSTANT Weber contrast dL/L -- Blackwell 1946 (JOSA 36,
-// 624) measures ~1-3% for small targets at high background luminance -- so the
-// criterion is the ratio ls/lk against a fixed contrast, and starsPhysical()
-// scales the star by the order-2 soft threshold (Hill / Naka-Rushton form)
-//     vis = C^2 / (C^2 + K^2),   C = ls / lk,   ls = luma(star*T), lk = luma(sky)
-// photopic Rec.709 luma, K = kStarVeilK the threshold contrast in RASTER units
-// (see starsPhysical() below for what K is and why it is NOT parameter-free --
-// it is a veiling factor that balances a deliberate rendering choice, tracked
-// for removal by issue #338). The order 2 is a smoothness choice -- C^1 at
-// C = 0, no kink where a star fades in -- not a derived exponent. What this is
-// NOT: Rose (1948)'s shot-noise-limited law B C^2 alpha^2 = const, under which
-// the threshold contrast FALLS as 1/sqrt(B); that is the photon-starved
-// (scotopic) regime and is not modelled here. vis tends to 1 as the sky
-// in-scatter tends to 0 (space AND ground night: stars full, unchanged, for ANY
-// K) and to 0 as the sky brightens (daylight: stars drowned). It is applied to
-// all channels off the LUMINANCE contrast (not per channel) precisely so the
-// warm dot on the bright blue sky is pulled down with the rest.
+//     BLUE first, leaving RED with headroom, so a broadband star poked through
+//     as a warm dot even while it was a small fraction of the sky's luminance.
+// But the dominant cause was neither: the star raster itself was ~500x too
+// bright, riding a night-visibility scale (Vega = 4.0 "units") while the sky was
+// in real photometric units. Nothing additive can be correct across that gap,
+// which is why a contrast term had to be bolted on.
+//
+// The raster is physical now (pt::stars::MagnitudeToIrradianceWm2, energy
+// conserved by RasteriseJ2000Map), so the sum stands unaided: a star's ~3.5e-4
+// W/m^2/sr is ~1200x a TRUE moonless night sky and ~2e-5 of a noon sky. The
+// remaining
+// two effects above are real but second-order at that ratio, and both are
+// better fixed at their source (multiple scattering; the tonemapper) than
+// cancelled by a constant. The veiling term and its tuned K are gone.
 //
 // starsRadianceRaw() is the star map / procedural sample WITHOUT the day fade,
 // kept a separate function (rather than sharing starsOnly's body) so modes
@@ -4156,15 +4403,12 @@ float3 starsRadianceRaw(float3 ro, float3 rd) {
         j.x = dot(w2j_row0.xyz, rd);
         j.y = dot(w2j_row1.xyz, rd);
         j.z = dot(w2j_row2.xyz, rd);
-        float u = atan2(j.y, j.x) * (1.0 / 6.28318530718);
-        if (u < 0.0) u += 1.0;
-        float v = (1.5707963267948966 - asin(clamp(j.z, -1.0, 1.0))) * (1.0 / 3.14159265358979);
-        uint2 dim;
-        star_map.GetDimensions(dim.x, dim.y);
-        int xi = int(floor(u * float(dim.x))) % int(dim.x);
-        if (xi < 0) xi += int(dim.x);
-        int yi = clamp(int(floor(v * float(dim.y))), 0, int(dim.y) - 1);
-        float3 stars = star_map[uint2(uint(xi), uint(yi))].rgb;
+        // Footprint-integrated, not nearest-texel: a star's radiance is
+        // its illuminance spread over the pixel's solid angle. See
+        // ptStarMapFootprint. Secondary rays reuse the primary pixel
+        // angle rather than their own (wider) cone -- an approximation
+        // consistent with how the rest of the sky is sampled on bounces.
+        float3 stars = ptStarMapFootprint(j, ptPixelAngleRad());
         if (exposure_pad.w > 0.001) {
             int3 q  = int3(floor(j * 38.0));
             uint qh = uint(q.x + 128) * 65536u
@@ -4496,13 +4740,18 @@ float3 procSky(float3 rd, float3 sun) {
     // palette goes to zero on its own when the sun is far enough below the
     // horizon -- that is what the integral does -- so the `day` smoothstep
     // that used to blend to night has nothing left to do and is gone.
-    // What remains is a floor standing in for airglow and integrated
-    // starlight, which this engine does not model and which really is
-    // additive: at noon it is 0.028 against a zenith of ~15, and at
-    // midnight it is the whole sky.  Carried across the unit rebase by the
-    // one documented factor, so its brightness relative to the physical
-    // sky is where its author put it.
-    sky += float3(0.005, 0.010, 0.030) * kPtLegacySkyScale;
+    // What remains stands in for airglow, zodiacal light and integrated
+    // faint starlight, none of which this engine integrates and all of
+    // which really are additive.
+    //
+    // #338 phase 2 put a real number on it. The painted value was
+    // float3(0.005, 0.010, 0.030) * kPtLegacySkyScale -- 0.0589 W/m^2/sr
+    // of luma, roughly 2e5 times a genuinely dark sky. Everything correct
+    // that was placed against it drowned: with physically-scaled stars the
+    // bsc_night fixture rendered a perfectly uniform frame, sky and stars
+    // at the same 19.9/255, not one star pixel above background. The stars
+    // were never what was broken.
+    sky += kPtNightSkyTint * kPtNightSkyRadiance;
 
     // Star contribution. Routed through starsOnly() so the same logic
     // is reusable from the primary-miss celestials-composite path
@@ -6898,55 +7147,50 @@ float3 sunDiscPhysical(float3 ro, float3 rd, float3 sun_dir) {
 // shell (space), and the reddened column transmittance in between. It is not
 // sun-specific; the name is historical.
 //
-// `sky_inscatter` is the skyPhysical() radiance skyColor() already computed for
-// this ray (passed in rather than recomputed). vis is the order-2 soft Weber-
-// contrast threshold of the star against the veiling sky (the form, and what it
-// is not, are derived at starsRadianceRaw()) -- 1 where the sky is dark, ->0
-// where it is bright.
+// There is no veiling term. Stars are ADDED to the sky radiance and nothing
+// suppresses them in daylight, because on a shared physical scale nothing needs
+// to: a star contributing ~3.5e-4 W/m^2/sr against a ~15 W/m^2/sr noon zenith
+// is already ~2e-5 of it.
 //
-// kStarVeilK is a TUNED veiling factor, not a derived or parameter-free constant.
-// It exists to balance a DELIBERATE rendering choice against daytime contrast:
-// the Bright Star Catalog is rasterised on a NIGHT-VISIBILITY scale, not in
-// W/m^2/sr. A magnitude-0 star is 4.0 "units" (BscCatalog kFluxScale) where its
-// true per-pixel radiance at this FOV is ~0.007 W/m^2/sr -- ~500x smaller -- and
-// the boost is intentional: a physically-scaled star renders as nothing under
-// the ACES tonemap, so the raster is pushed up until stars are visible at night.
-// That same boost makes a bright star (Sirius) read comparable to the (itself
-// single-scatter-underestimated) noon sky in linear light, so the raw contrast
-// leaks it into daylight. K is the multiplier on the sky's veiling luminance that
-// cancels the boost in the daytime contrast test. If the raster were physical, K
-// would tend to ~1; issue #338 tracks giving stars real radiometry + an exposure
-// model, after which this factor (and the raster boost) can be removed.
-//
-// K is NOT a day/night flag: at night and in space the sky in-scatter is ~0, so
-// K*lk is ~0 and vis is 1 for ANY K -- ground-night and orbit renders are
-// bit-identical across K (verified K = 1..20). K only sets how hard a LIT sky
-// washes stars out. K = 8 is a measured, conservative midpoint: K = 4 still
-// leaks a daytime dot at a low sun (+5 deg), K = 16 delays bright stars emerging
-// through twilight; 8 buries Sirius at noon (brightest daytime star +60 -> +0
-// sensor levels) while letting stars return by nautical/astronomical twilight as
-// the in-scatter falls. See starsRadianceRaw() for the surrounding rationale.
-//
-// fp32 FORM. Both luminances are normalised by the larger of the two before
-// the ratio is formed, so the denominator lies in [1, 2]: no 0/0 when a star
-// with s > 0 is extincted to ls = 0 against a dark sky (T -> 0 at the limb,
-// lk = 0 -- a case the s <= 0 early-out does NOT exclude), no overflow when
-// lk/ls is huge, and no epsilon. ls = 0 has nothing to veil and returns black,
-// which is what star * vis would be anyway. lk = 0 gives a = 1, b = 0 and
-// vis = 1 EXACTLY, which is the K-independence of night and space stated above.
-static const float kStarVeilK = 8.0;
-float3 starsPhysical(float3 ro, float3 rd, float3 sky_inscatter) {
+// What used to be here was kStarVeilK = 8.0 and an order-2 Weber-contrast
+// factor. Its own comment named the reason it had to exist: "the Bright Star
+// Catalog is rasterised on a NIGHT-VISIBILITY scale, not in W/m^2/sr [...] a
+// magnitude-0 star is 4.0 units where its true per-pixel radiance at this FOV
+// is ~500x smaller", and "if the raster were physical, K would tend to ~1".
+// The raster IS physical now -- pt::stars::MagnitudeToIrradianceWm2 puts Vega
+// at its real 3.19e-9 W/m^2 and RasteriseJ2000Map conserves it -- so K has
+// nothing left to cancel and the whole contrast test goes with it. That closes
+// the removal issue #338 was opened for, by the route it proposed.
+float3 starsPhysical(float3 ro, float3 rd) {
     float3 s = starsRadianceRaw(ro, rd);
     if (all(s <= float3(0.0))) return float3(0.0);
-    float3 star = s * sunSlantTransmittance(ro, rd);
-    float ls = dot(star,         float3(0.2126, 0.7152, 0.0722));
-    float lk = dot(sky_inscatter, float3(0.2126, 0.7152, 0.0722)) * kStarVeilK;
-    if (!(ls > 0.0)) return float3(0.0);    // fully extinct: nothing to veil
-    float m = max(ls, lk);                  // > 0 because ls > 0
-    float a = ls / m;                       // in (0, 1]
-    float b = lk / m;                       // in [0, 1]; one of a, b is exactly 1
-    float vis = (a * a) / (a * a + b * b);  // denominator in [1, 2]
-    return star * vis;
+    // Atmospheric extinction along the slant path, and nothing else. The
+    // star's radiance is simply ADDED to the sky's by the caller, because
+    // both are now in the same physical units (W/m^2/sr) -- so daylight
+    // suppression is no longer something the renderer has to arrange.
+    //
+    // This is what retires kStarVeilK. That constant (8.0, admittedly
+    // "empirical" and tracked for removal by issue #338) existed to fake
+    // the disappearance of stars in daylight, which was necessary only
+    // because stars rode an arbitrary scale where Vega was 4.0 while the
+    // sky was in real nits: with mismatched units, no amount of adding
+    // could make a star both visible at night and invisible by day.
+    //
+    // On the shared scale the arithmetic does it unaided. Vega contributes
+    // ~3.5e-4 W/m^2/sr of pixel radiance at a 60 deg / 384 px framing.
+    // Against a TRUE ~2.9e-7 W/m^2/sr moonless night sky that is ~1200x --
+    // overwhelming. Against a ~15 W/m^2/sr noon zenith it is ~2e-5 --
+    // utterly lost, which is why you cannot see stars by day in reality.
+    //
+    // CAVEAT, and it is the live one: procSky's night floor is NOT that
+    // true night sky. It is a painted stand-in, (0.005, 0.010, 0.030) *
+    // kPtLegacySkyScale = 0.0589 W/m^2/sr of luma -- some 2e5 times a real
+    // moonless sky, which is the "five orders of magnitude" the golden
+    // matrix's own night-cell hold note records. Against THAT floor Vega
+    // is 0.6% of the background and stays invisible. Physical stars are a
+    // precondition for a night sky that reads correctly; they are not on
+    // their own sufficient, and the floor is the next thing to fix.
+    return s * sunSlantTransmittance(ro, rd);
 }
 // --- end Planetary P6 physical sky ------------------------------------------
 
@@ -6978,7 +7222,7 @@ float3 skyColor(float3 ro, float3 rd, inout uint seed) {
         // whole sunlit hemisphere of any orbit.
         float3 sky = skyPhysical(ro, rd, 1.0e30, int(max(vol_params.w, 1.0)), seed);
         return sky
-             + starsPhysical(ro, rd, sky)
+             + starsPhysical(ro, rd)
              + moonDisc(rd, moon_dir_phase, sun_and_mode.xyz)
              + sunDiscPhysical(ro, rd, sun_and_mode.xyz);
     }
@@ -8134,77 +8378,168 @@ void main(uint2 tid : SV_DispatchThreadID) {
             }
             albedo_tex[tid] = float4(hit_albedo, guide_trans);
         }
-        // MetalFX specular-guidance G-buffers (issue #118). Three
-        // textures fed to MTLFXTemporalDenoisedScaler so it can tell
-        // specular from diffuse response -- without them the scaler
-        // produces 8x8 halos around bright reflections / metals.
+        // Specular-guidance G-buffers: DLSS Ray Reconstruction's
+        // pInSpecularAlbedo / pInRoughness / pInSpecularHitDistance. See
+        // the three texture declarations at the top of this file for the
+        // full contract, the citations and the reasons each convention is
+        // what it is. All three are gated on their own push flag, which is
+        // 0 unless the engine allocated the textures for RR, so with
+        // r_dlss off none of this block executes.
         //
-        // F0 (specular_albedo) per material kind:
-        //   MAT_METAL      : F0 = albedo (the material colour reflects
-        //                    directly; gold's yellow specular IS its
-        //                    yellow albedo, not a tinted white highlight).
-        //   MAT_DIELECTRIC : F0 = float3(0.04) — the standard Schlick
-        //                    approximation for IOR~1.5 (glass, plastic,
-        //                    coated dielectrics). Engine's dielectric
-        //                    primitives are nominally IOR=1.5 unless
-        //                    overridden in the prim material struct.
-        //   MAT_LAMBERT    : F0 = float3(0) — no specular lobe at all.
-        // Pulled from h0 (not hit_albedo / hit_normal which collapse
-        // to sentinels on sky pixels) so we can preserve the material-
-        // kind discriminator.
-        //
-        // roughness: from h0.roughness directly. The material struct
-        // packs roughness in primitive .v1.a / SDF cluster header /
-        // mesh material — already plumbed through traceScene as h.roughness.
-        //
-        // specular_hit_distance: MVP proxy using `primary_t * (1 - rough)`,
-        // i.e. attenuated by smoothness so a perfect mirror keeps the
-        // full distance and a rough surface trends toward 0 where
-        // MetalFX has no specular reproject to do. A future PR (real
-        // reflection-ray trace from the primary hit) can replace this
-        // with the actual reflected-virtual-image depth; see the
-        // texture's declaration comment for the design trade-off.
-        //
-        // All three are sky-aware: hit_normal == float3(0) means h0.hit
-        // == false, so we write the "no surface" sentinel for that
-        // pixel. roughness sentinel is 1.0 (fully rough -> MetalFX
-        // skips specular handling); F0 + hit_distance sentinel is 0.
-        if (write_specular_albedo_gbuffer != 0u) {
+        // The three writes share three quantities, computed once here.
+        // Everything is pulled from h0 (not hit_albedo / hit_normal, which
+        // collapse to sentinels on sky pixels) so the material-kind
+        // discriminator survives.
+        const bool want_any_specular_guide =
+            (write_specular_albedo_gbuffer != 0u) ||
+            (write_roughness_gbuffer != 0u) ||
+            (write_specular_hit_distance_gbuffer != 0u);
+        if (want_any_specular_guide) {
+            // (0) The shading normal FACED AGAINST the incoming ray, the same
+            //     `nf` every shading branch builds from the sign of
+            //     dot(n, rd). Thin geometry, a submerged body and a displaced
+            //     ocean crest seen from below all deliver a normal pointing
+            //     away from the eye; reflecting about the raw one would send
+            //     the specular ray into the surface it started on, and would
+            //     report n.v = 0 (full grazing rise) on a face seen head-on.
+            //     Fresnel is symmetric about the interface, so facing it is
+            //     the physically correct read, not a clamp.
+            float3 gn = (dot(h0.normal, rd0) < 0.0) ? h0.normal : -h0.normal;
+
+            // (1) Guide roughness, in the perceptual convention alpha = r^2
+            //     that both this engine and RR use -- see roughness_tex's
+            //     declaration comment for the audit.
+            float guide_rough = h0.hit ? saturate(h0.roughness) : 1.0;
+            if (h0.hit && h0.mat == MAT_LAMBERT) {
+                // Lambert has no microfacet lobe, so whatever the prim
+                // seeding left in h.roughness is meaningless here.
+                guide_rough = 1.0;
+            }
+#if PT_WATER_ENABLED
+            if (h0.hit && h0.mat == MAT_WATER && planet_ocean.x > 0.0) {
+                // Water carries h.roughness == 0 by construction: at the
+                // macro scale it is a perfect Fresnel interface, and every
+                // bit of roughness it has is wave slope the shading pass
+                // folds in through oceanBrdfAlpha2(). Run the SAME fold
+                // here or the guide would call the open ocean a mirror at
+                // every distance -- which is exactly the surface RR would
+                // then fail to reconstruct. The gate matches the shading
+                // pass's: alpha^2 is Cox & Munk's mean-square slope minus
+                // whatever the cascades still resolve geometrically, and
+                // with r_ocean off the cascades resolve nothing so the
+                // whole of sigma^2 lands in the BRDF (the conservation law
+                // documented at oceanBrdfAlpha2).
+                float3 res_g = float3(0.0);
+                if (ocean_params0.x != 0.0) {
+                    res_g = oceanCascadeResolvedAll(
+                        uint(max(planet_ocean.y, 1.0)),
+                        uint(max(ocean_params1.y, 1.0)),
+                        ptConeWidthAt(cone0, h0.t));
+                }
+                // oceanBrdfAlpha2 returns alpha^2 (the shading pass takes
+                // a_ggx = sqrt of it), and the guide wants r = sqrt(alpha),
+                // so r = (alpha^2)^(1/4).
+                float alpha2_g = oceanBrdfAlpha2(res_g);
+                guide_rough = saturate(sqrt(sqrt(max(alpha2_g, 0.0))));
+            }
+#endif
+
+            // (2) Fresnel reflectance at normal incidence, per material
+            //     kind, mirroring what each shading branch actually
+            //     refracts with so the guide and the render cannot drift.
             float3 f0 = float3(0.0);
+            bool   has_specular_lobe = false;
             if (h0.hit) {
-                if      (h0.mat == MAT_METAL)      f0 = h0.albedo;
-                else if (h0.mat == MAT_DIELECTRIC) f0 = float3(0.04);
-                // Lambert keeps f0 = 0.
+                if (h0.mat == MAT_METAL) {
+                    // The material colour reflects directly; gold's yellow
+                    // specular IS its yellow albedo, not a tinted white
+                    // highlight.
+                    f0 = h0.albedo;
+                    has_specular_lobe = true;
+                } else if (h0.mat == MAT_DIELECTRIC) {
+                    // Schlick base reflectance of an air -> medium
+                    // interface, ((n1 - n2)/(n1 + n2))^2 with n1 = 1, from
+                    // the SAME h0.ior the MAT_DIELECTRIC branch refracts
+                    // with. n = 1.5 reproduces the familiar 0.04. A prim
+                    // that left ior at the 1.0 sentinel genuinely has no
+                    // index step and correctly yields F0 = 0; max() only
+                    // keeps a 0 sentinel from inverting the expression.
+                    float n  = max(h0.ior, 1.0);
+                    float r0 = (1.0 - n) / (1.0 + n);
+                    f0 = float3(r0 * r0);
+                    has_specular_lobe = true;
+                }
+#if PT_WATER_ENABLED
+                else if (h0.mat == MAT_WATER) {
+                    // Same expression, water's index: h.ior when the prim
+                    // overrides it, otherwise the global r_water_ior in
+                    // water_params0.w -- the exact fallback chain the
+                    // MAT_WATER shading branch uses. n = 1.333 gives
+                    // 0.0204, i.e. the "accurate F0 for water at 0 deg"
+                    // the water BRDF names as 0.02.
+                    float nw = clamp(h0.ior > 0.0 ? h0.ior : water_params0.w,
+                                     1.0, 2.4);
+                    float rw = (1.0 - nw) / (1.0 + nw);
+                    f0 = float3(rw * rw);
+                    has_specular_lobe = true;
+                }
+#endif
+                // MAT_LAMBERT keeps f0 = 0 and has_specular_lobe = false.
             }
-            // WTexture2D.Store(coord, value) instead of subscript
-            // assignment -- WTexture2D is write-only (lowers to Metal
-            // access::write to stay under the 8-RW-texture cap) and
-            // doesn't support the [] = ... HLSL convenience syntax.
-            specular_albedo_tex.Store(tid, float4(f0, 0.0));
-        }
-        if (write_roughness_gbuffer != 0u) {
-            float r = h0.hit ? saturate(h0.roughness) : 1.0;
-            // Lambert lobe is fully rough; the engine's prim seeding
-            // sets h.roughness based on the material's GGX param, but
-            // for MAT_LAMBERT the value is meaningless (Lambert doesn't
-            // have a roughness). Force = 1.0 so MetalFX sees Lambert
-            // pixels as "no specular surface to preserve."
-            if (h0.hit && h0.mat == MAT_LAMBERT) r = 1.0;
-            roughness_tex.Store(tid, r);
-        }
-        if (write_specular_hit_distance_gbuffer != 0u) {
-            float dist = 0.0;
-            if (h0.hit) {
-                // MVP proxy: primary hit distance weighted by smoothness
-                // (1 - roughness). At roughness=0 the reflection comes
-                // from somewhere far past the primary hit, but we don't
-                // trace it -- the value is "as far as we know, primary_t."
-                // At roughness=1 we'd write 0 anyway since MetalFX won't
-                // try to reproject a fully-rough specular.
-                float smoothness = 1.0 - saturate(h0.roughness);
-                dist = h0.t * smoothness;
+
+            if (write_specular_albedo_gbuffer != 0u) {
+                // The split-sum integrated specular reflectance, NOT F0.
+                // Lambert and sky are excluded rather than passed through
+                // the fit: with F0 = 0 the fit still returns its B term,
+                // which rises toward 1 at grazing incidence, and telling a
+                // reconstructor that a matte surface mirrors the horizon is
+                // the same class of error as telling it water does not.
+                float3 spec_albedo = float3(0.0);
+                if (has_specular_lobe) {
+                    // n.v from the primary ray: rd0 points away from the
+                    // eye, so -rd0 is the view vector, and `gn` is already
+                    // faced against it so this is non-negative by
+                    // construction.
+                    float n_dot_v = saturate(dot(gn, -rd0));
+                    spec_albedo = envBrdfSplitSum(f0, guide_rough, n_dot_v);
+                }
+                // WTexture2D.Store(coord, value) instead of subscript
+                // assignment -- WTexture2D is write-only (lowers to Metal
+                // access::write to stay under the 8-RW-texture cap) and
+                // doesn't support the [] = ... HLSL convenience syntax.
+                specular_albedo_tex.Store(tid, float4(spec_albedo, 0.0));
             }
-            specular_hit_distance_tex.Store(tid, dist);
+            if (write_roughness_gbuffer != 0u) {
+                roughness_tex.Store(tid, guide_rough);
+            }
+            if (write_specular_hit_distance_gbuffer != 0u) {
+                // A real reflection ray. Sky and Lambert pixels have no
+                // specular lobe, so they write 0 -- the one case where the
+                // "0 means no specular" fallback is the truth rather than a
+                // stand-in for a number we did not compute.
+                float dist = 0.0;
+                if (has_specular_lobe) {
+                    float3 hit_p  = ro0 + rd0 * h0.t;
+                    float3 refl_d = reflect(rd0, gn);
+                    // The cone carried to the hit, so the secondary ray's
+                    // self-intersection offset and t_min scale with the
+                    // footprint exactly as every other secondary ray in
+                    // this renderer does (ptRayOrigin / ptRayTMin).
+                    PtRayCone cone_r = ptConeAdvance(cone0, h0.t);
+                    float3 refl_o = ptRayOrigin(hit_p, gn, cone_r, refl_d);
+                    // shutter_t01 = 1.0, matching the G-buffer's primary
+                    // ray: guides must not be jittered along the shutter or
+                    // the reprojection sees a different scene than the
+                    // depth it was handed.
+                    HitInfo hr = traceScene(refl_o, refl_d, 1.0, cone_r);
+                    // 1.0e10 m == depth_tex's sky sentinel. The reflected
+                    // image of the sky is at infinity: there is no parallax
+                    // to correct, and any small finite number would invent
+                    // some.
+                    dist = hr.hit ? hr.t : 1.0e10;
+                }
+                specular_hit_distance_tex.Store(tid, dist);
+            }
         }
     }
 
@@ -8250,6 +8585,29 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // between samples is well below cloud feature size, so any single
     // sample is a faithful proxy for the unjittered camera ray.
     float frame_cloud_trans = 1.0;
+    // NRD first-bounce hit distance (issue #50). NVIDIA's RELAX packs
+    // its noisy diffuse input as float4(radiance, hitDist) and sizes
+    // the pre-pass blur radius from that distance, so it wants the
+    // length of the segment that CARRIED the incoming light -- the
+    // primary hit to the first indirect hit -- not the camera segment
+    // (that is IN_VIEWZ, which the engine already writes to depth_tex).
+    // Captured from sample 0 / bounce 1 only, in the same spirit as
+    // frame_cloud_trans above: NRD consumes it as a filter-radius
+    // scale, not a radiometric quantity, so one sample is a faithful
+    // proxy and averaging over spp would just cost registers.
+    // Sentinel 0 means "unknown" -- NRD documents that value and RELAX
+    // has a fallback for it (a path with r_max_bounces = 1 never
+    // reaches b == 1 and so reports 0 for every pixel).
+    //
+    // HONESTY NOTE: the passes VulkanNrdLibDenoiser currently enables
+    // (RELAX_DIFFUSE with diffusePrepassBlurRadius = 0 -- see the long
+    // comment at that assignment for why) do not read this channel.
+    // It is written anyway because it is what NRD's own front-end pack
+    // function is defined to carry, and because the alternative (a
+    // constant 0) silently becomes wrong the moment the pre-pass is
+    // re-enabled or a specular signal is added. Cost when unused is a
+    // single register and one predicated store.
+    float frame_nrd_hitdist = 0.0;
     // Sun-NEE shadow-ray visibility accumulator (issue #115). Sums the
     // primary-hit shadow-ray transmittance toward the sun across all
     // spp samples; divided by sample_count at the end of main() to give
@@ -8627,6 +8985,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 #endif
         // --- end Wave 8 ocean -----------------------------------------------
+        // NRD first-bounce hit distance (issue #50). b == 1 is the first
+        // INDIRECT segment: its origin is the primary hit and h.t is the
+        // distance to whatever produced the bounce radiance. An escaping
+        // ray (nothing occluding, lit by the sky) reports NRD's fp16
+        // ceiling -- the value RELAX_FrontEnd_PackRadianceAndHitDist
+        // itself saturates at, so it is the library's own "as far as
+        // this channel can say". Runtime-gated so every non-NRD dispatch
+        // is untouched.
+        if (write_nrd_hitdist != 0u && b == 1u && s == 0u) {
+            frame_nrd_hitdist = h.hit ? h.t : 65504.0;
+        }
         if (b == 0u) {
             // Sky pixels (no hit) keep the 50km default so cloud
             // marches reach the layer; object hits override.
@@ -11369,13 +11738,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
             w2j_row0.w > 0.5) {
             hdr_src = max(hdr_src - frame_sun_shadowed, float3(0.0));
         }
+        // denoise_color.a: 1.0 historically (nothing downstream reads
+        // it -- DenoiseTemporal / DenoiseAtrous / DenoiseFinalize all
+        // take .rgb). Issue #50 borrows the channel to carry the NRD
+        // first-bounce hit distance to NrdPack.slang, which packs it
+        // into IN_DIFF_RADIANCE_HITDIST.w. Gated so every other path
+        // writes the historical 1.0 bit-for-bit.
+        const float hdr_aux_alpha =
+            (write_nrd_hitdist != 0u) ? frame_nrd_hitdist : 1.0;
         if (w2j_row0.w > 0.5) {
-            denoise_color[tid] = float4(hdr_src, 1.0);
+            denoise_color[tid] = float4(hdr_src, hdr_aux_alpha);
         } else {
             // --- Wave 9 tonemap --- operator from tonemap_params.x (op 0
             // == acesTonemap, byte-identical to the previous default).
             float3 mapped = tonemapDispatch(hdr_src * exposure, tonemap_params.x);
-            denoise_color[tid] = float4(mapped, 1.0);
+            denoise_color[tid] = float4(mapped, hdr_aux_alpha);
         }
     }
     // Cloud-transmittance G-buffer (issue #46 follow-up). DIFFERENT

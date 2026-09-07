@@ -124,6 +124,42 @@ public static const float3 kPtSolarIrradiance =
 // per-term retune would be a second set of tuned constants, which is the
 // pattern this issue exists to remove.
 public static const float kPtLegacySkyScale = 5.67;
+
+// --- night-sky background (#338 phase 2) ------------------------------------
+// The light that is left when the sun is gone and the moon is down. Not one
+// source but four, none of which this engine integrates:
+//   airglow ~60%, zodiacal light ~25%, integrated faint starlight ~10%,
+//   diffuse galactic + extragalactic ~5%.
+//
+// A dark, moonless site measures V = 22.0 mag/arcsec^2 of sky surface
+// brightness (Benn & Ellison 1998, "La Palma night-sky brightness", measure
+// V = 21.9 at solar minimum; 22.0 is the canonical dark-site figure).
+// Converting with the standard relation L[cd/m^2] = 1.08e5 * 10^(-0.4 S):
+//     1.08e5 * 10^(-8.8) = 1.71e-4 cd/m^2
+// and dividing by the engine's own 555 nm luminous efficacy (683 lm/W -- the
+// same kLuminousEfficacy555nm the light-decompose test converts with):
+//     1.71e-4 / 683 = 2.5e-7 W/m^2/sr.
+//
+// This REPLACES a painted floor of 0.0589 W/m^2/sr of luma -- about 2e5 times
+// too bright, the "five orders of magnitude" the golden matrix's own night-cell
+// hold note already recorded. That floor, not the stars, is what made night
+// skies read as a uniform grey wash with nothing in them.
+public static const float kPtNightSkyRadiance = 2.5e-7;   // W/m^2/sr
+
+// Unit-Rec.709-luminance tint for the night floor. PROVISIONAL, and
+// deliberately the pre-#338 painted floor's own hue (0.005, 0.010, 0.030,
+// normalised) so this phase moves exactly ONE variable -- the magnitude, which
+// was wrong by five orders -- and leaves the colour where its author put it.
+//
+// Physically a dark sky is nearer neutral with a slight green cast, from the
+// O I 557.7 nm airglow line. The blue that night scenes are expected to have is
+// largely the PURKINJE SHIFT: at scotopic levels vision is rod-dominated and
+// peaks at 507 nm rather than 555 nm. That is an OBSERVER effect and belongs in
+// the eye / tonemap model, not in the sky's spectral radiance. Moving it there
+// is follow-up work; encoding it here would be baking an observer into a scene.
+public static const float3 kPtNightSkyTint =
+    float3(0.4817, 0.9633, 2.8900);        // Rec.709 luma == 1
+// --- end night-sky background -----------------------------------------------
 // --- end radiometric anchor -------------------------------------------------
 
 // Stratified hero-wavelength sample for path sample index `s` of `n` total.

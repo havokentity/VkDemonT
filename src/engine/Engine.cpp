@@ -345,7 +345,7 @@ namespace cvar {
             "list. 0 = strict exact-match like before.",
             CVAR_ARCHIVE);
     // Default backend: native Vulkan + RT extensions on Windows/Linux.
-    PT_CVAR(r_backend,         "vulkan",   "One of none|software|vulkan",      CVAR_ARCHIVE);
+    PT_CVAR(r_backend,         "vulkan",   "One of none|vulkan. The software backend was removed when the engine went Vulkan-exclusive.", CVAR_ARCHIVE);
     // Software backend's present path on Windows. Default 'vulkan' uses
     // a minimal VkInstance/VkSurface/VkSwapchain owned by SoftwareDevice
     // so the window stays in DXGI flip-model presentation throughout
@@ -706,6 +706,188 @@ namespace cvar {
             "the same constant at every distance.",
             CVAR_ARCHIVE);
     // --- end Planetary P5 ----------------------------------------------------
+    // --- Render-scale / jitter: the DLSS prerequisites -----------------------
+    // These two cvars exist to DECOUPLE the two things a temporal
+    // upscaler needs decoupled, and nothing else. Neither implements
+    // DLSS; both are the plumbing DLSS Super Resolution / DLAA / Ray
+    // Reconstruction plug into.
+    // --- DLSS (docs/DLSS_INTEGRATION_PLAN.md) ------------------------------
+    PT_CVAR(r_dlss, "off",
+            "NVIDIA DLSS Super Resolution. The renderer traces at a reduced "
+            "resolution and DLSS reconstructs the display-resolution image "
+            "from the render-resolution colour plus depth, motion vectors and "
+            "the frame's sub-pixel jitter offset.\n"
+            "off = no upscaling; the path tracer renders at the swapchain "
+            "size and r_render_scale is the user's knob. dlaa = render at "
+            "native resolution and use DLSS purely as an anti-aliaser (ratio "
+            "1.0); it costs GPU time rather than saving it, and is the "
+            "highest-quality option. quality / balanced / performance / "
+            "ultra_performance select NVIDIA's published presets, whose "
+            "per-axis render ratios are 2/3, 0.58, 1/2 and 1/3 -- at "
+            "3840x2160 that is 2560x1440, 2227x1253, 1920x1080 and 1280x720, "
+            "or 44.4%%, 33.6%%, 25%% and 11.1%% of the display pixel count.\n"
+            "Those ratios are DOCUMENTATION, NOT CONSTANTS: the engine calls "
+            "NGX_DLSS_GET_OPTIMAL_SETTINGS for the current swapchain size and "
+            "uses whatever render extent comes back, so an SDK that changes a "
+            "ratio is followed automatically and a rounding mismatch between "
+            "the size DLSS was created for and the size it is fed -- which is "
+            "an error, not a nuisance -- cannot happen.\n"
+            "UltraQuality is deliberately absent: it exists in NVIDIA's enum "
+            "but has historically not been implemented by the runtime. An "
+            "`auto` mode is also absent, because NVIDIA's per-resolution "
+            "default table is a user-experience convention rather than a "
+            "derived quantity, and this engine does not smuggle conventions "
+            "in as if they were physics.\n"
+            "While this is not off the engine OWNS r_render_scale and "
+            "overwrites it with the queried ratio, so the console, the perf "
+            "overlay and config.cfg all report the truth; writes to "
+            "r_render_scale are latched but inert until DLSS is off again. "
+            "Falls back to off with a log line if the build lacks "
+            "PT_ENABLE_DLSS, if the GPU/driver does not support the feature, "
+            "or if the optimal-settings query fails for the requested mode.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_dlss_rr, "0",
+            "NVIDIA DLSS Ray Reconstruction. 0 = DLSS upscales only, and "
+            "whatever r_denoiser selects still does the denoising. 1 = DLSS "
+            "REPLACES the denoiser: Ray Reconstruction is a denoiser and an "
+            "upscaler in one pass, so stacking it on top of SVGF or NRD would "
+            "denoise twice and lose detail the second pass cannot recover. "
+            "When this is on the engine forces the denoiser chain off and "
+            "logs the reason once -- it is not a silent override.\n"
+            "Requires r_dlss != off -- RR is a mode of the same feature, not "
+            "an independent one. The specular guidance G-buffers it needs "
+            "(specular albedo, roughness, specular hit distance) are "
+            "allocated off THIS cvar: they used to be gated on the MetalFX "
+            "denoiser kinds, which no live backend selected, which is how "
+            "they came to be allocated, written and read by nobody. Setting "
+            "this is what brings them into existence, and it has to happen "
+            "before the NGX feature is created because DLSS-RR is handed its "
+            "guide buffers at creation time.",
+            CVAR_ARCHIVE);
+    // --- end DLSS ----------------------------------------------------------
+    PT_CVAR(r_render_scale, "1.0",
+            "Internal render resolution as a fraction of the presentation "
+            "(swapchain) resolution. 1.0 (default) means the path tracer, "
+            "its accumulator, every denoiser G-buffer and every composite "
+            "pass run at the window's own pixel count and the path tracer "
+            "writes the swapchain directly -- byte-for-byte the behaviour "
+            "this engine has always had, which is what keeps the golden "
+            "matrix pinned at the default. Below 1.0 the entire internal "
+            "chain is allocated and dispatched at round(scale * extent) and "
+            "a final resolve pass magnifies the result onto the swapchain. "
+            "The resolve is a plain gamma-correct bilinear magnify "
+            "(shaders/Upscale.slang) -- a deliberate placeholder, not a "
+            "quality feature: this cvar's job is to give a temporal "
+            "upscaler a smaller image to consume and a bigger one to write, "
+            "and DLSS replaces the resolve when it lands. Expect the raw "
+            "bilinear result to look SOFTER than native at any scale below "
+            "1; that softness is the thing DLSS removes.\n"
+            "Clamped to [0.25, 1.0]. The upper bound is 1.0 because "
+            "supersampling is a different feature with different costs "
+            "(the accumulator, the SVGF history and the ReSTIR reservoir "
+            "ring all scale with the internal pixel count, and the "
+            "swapchain-extent readback paths assume they are never asked "
+            "to shrink). The lower bound is 0.25 because DLSS's own preset "
+            "ladder bottoms out at Ultra Performance = 1/3 linear "
+            "(Performance = 1/2, Balanced = 1/1.7, Quality = 1/1.5), so "
+            "0.25 already sits below every ratio a real upscaler mode "
+            "asks for -- and because the per-pixel angular footprint the "
+            "path tracer derives from the internal extent (ray-cone "
+            "spread, and through it texture LOD and the star point-spread "
+            "function) widens as 1/scale: past 4x the cones are wide "
+            "enough that texture detail and star cores are gone before "
+            "any upscaler gets to see them.\n"
+            "IMPORTANT for anyone extending the renderer: the angular "
+            "footprint above is derived in-shader from "
+            "output.GetDimensions(), and `output` is bound to the "
+            "INTERNAL target, so it follows this cvar automatically. A "
+            "new pass that derives a pixel footprint from the swapchain "
+            "extent instead would silently change star brightness and "
+            "texture LOD the moment this is set below 1.\n"
+            "Requires the `upscale` resolve kernel. If it is unavailable "
+            "the engine pins the scale back to 1.0 and logs once, rather "
+            "than presenting a swapchain nothing wrote.\n"
+            "NOTE for the DLSS integration (docs/DLSS_INTEGRATION_PLAN.md "
+            "P0.1 / SS3.1): this cvar is a RATIO, and the internal extent "
+            "is round(ratio * output). NGX hands back an exact render "
+            "extent for the mode it was created with, and a rounding "
+            "mismatch against that extent is an error rather than a "
+            "nuisance -- so the DLSS path wants to write the extent, not "
+            "the ratio. The single place to hook that is the render-scale "
+            "block at the top of Engine::RenderFrame, where render_w / "
+            "render_h are computed; everything downstream reads those two "
+            "and nothing else.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_camera_jitter, "0",
+            "Deterministic per-frame sub-pixel camera jitter. OFF (0, the "
+            "default) leaves sampling exactly as it has always been: the "
+            "path tracer draws a fresh RANDOM sub-pixel offset per ray, "
+            "which is what makes the accumulator converge to an "
+            "antialiased image, and the denoiser-only Halton offset in "
+            "PathTrace.slang keeps its existing narrow role. ON (1) "
+            "replaces that with a single Halton(2, 3) low-discrepancy "
+            "offset per FRAME, shared by every pixel and every sample, "
+            "applied on the host as a shear of the camera basis -- "
+            "mathematically identical to offsetting every primary ray's "
+            "pixel coordinate, and therefore also applied to the "
+            "unjittered-in-shader depth/motion G-buffer pass, which is "
+            "what a temporal upscaler expects.\n"
+            "This exists because a temporal upscaler needs to KNOW the "
+            "offset it is reconstructing from, and random per-ray "
+            "sampling has no offset to report. Halton(2, 3) is the "
+            "conventional choice for exactly this -- J. H. Halton, 'On "
+            "the efficiency of certain quasi-random sequences of points "
+            "in evaluating multi-dimensional integrals', Numerische "
+            "Mathematik 2 (1960) 84-90; it is the sequence NVIDIA's DLSS "
+            "programming guide recommends for the jitter pattern, and "
+            "the one Unreal's TAA/TSR uses -- because its radical-"
+            "inverse construction keeps every prefix of the sequence "
+            "well-stratified -- so a 4-frame window is as evenly spread "
+            "over the pixel as a 16-frame one, and the upscaler gets "
+            "usable coverage before its history is full.\n"
+            "The offset actually applied is reported by "
+            "Engine::FrameJitterX() / FrameJitterY() (pixels, in "
+            "[-0.5, 0.5], zero when this cvar is off) for the DLSS "
+            "integration to feed the upscaler. Sequence length is "
+            "r_camera_jitter_period frames.\n"
+            "Three properties an upscaler needs follow from shearing the "
+            "BASIS rather than offsetting each sample's uv in the shader, "
+            "and they are the three breaks docs/DLSS_INTEGRATION_PLAN.md "
+            "SS4.2 lists: (1) every spp sample shares the offset, so the "
+            "frame stays a point sample at the reported location instead "
+            "of becoming a box-filtered estimate as r_spp rises; (2) the "
+            "depth / motion / normal / albedo G-buffer pass -- which "
+            "traces at the pixel centre and never saw the in-shader "
+            "jitter -- is jittered identically to the colour, so the "
+            "guides describe the surface the colour sample actually hit; "
+            "and (3) the motion vectors stay jitter-free, because "
+            "curr_view_proj / prev_view_proj are built from the "
+            "UNSHEARED basis. None of the three needs a shader flag or a "
+            "PathTrace.slang edit -- they are properties of where the "
+            "offset is applied.\n"
+            "Turning this on WITHOUT a temporal reconstruction consuming "
+            "it makes the image marginally worse, not better: every "
+            "sample in a frame lands on the same sub-pixel point, so a "
+            "single frame is aliased and the accumulator needs the full "
+            "sequence period to average out. That is why it defaults off.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_camera_jitter_period, "16",
+            "Number of frames in the r_camera_jitter Halton(2, 3) cycle "
+            "before it repeats. Only meaningful when r_camera_jitter is 1. "
+            "16 matches the phase count the denoiser-side Halton offset in "
+            "PathTrace.slang has always used and comfortably exceeds the "
+            "history depth of every temporal filter in this engine, so a "
+            "pixel never sees the same sub-pixel position twice inside one "
+            "reconstruction window. DLSS's guide suggests a base period of "
+            "8 scaled by the reciprocal SQUARE of the render scale "
+            "(8 / scale^2 -- 18 phases at 2/3 scale, 32 at 1/2), so raise "
+            "this when running an aggressive scale and the reconstruction "
+            "looks like it is missing coverage. Clamped to [1, 256]; 1 "
+            "pins a single fixed offset, which is useful for A/B-ing "
+            "jitter against no jitter without the frame-to-frame shimmer "
+            "confusing the comparison.",
+            CVAR_ARCHIVE);
+    // --- end render-scale / jitter -------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "svgf_basic = in-house temporal accumulation only "
@@ -713,9 +895,23 @@ namespace cvar {
             "motion, slightly noisier on disocclusions). svgf_atrous = "
             "svgf_basic + 3-pass a-trous edge-aware spatial filter (~5 ms; "
             "cleaner on disocclusions, mild softening of micro detail). "
-            "nrd = same dispatch chain as svgf_atrous today; reserved for "
-            "the proper NVIDIA RayTracingDenoiser library integration once "
-            "that's wired up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). "
+            "nrd = NVIDIA RayTracingDenoiser library, RELAX_DIFFUSE "
+            "(temporal accumulation + history fix/clamp + anti-firefly + "
+            "5-pass a-trous, all inside NRD). RELAX rather than REBLUR "
+            "because REBLUR's filter is driven by a NORMALISED hit "
+            "distance whose (A, B, C) curve has to be tuned per scene "
+            "scale, and this renderer spans a Cornell box to a 400 km "
+            "orbit; RELAX takes the raw hit distance and is NVIDIA's "
+            "path-tracing / high-variance choice. The engine feeds it "
+            "motion vectors, linear view Z, oct-packed normal+roughness, "
+            "and radiance demodulated by the SAME aerial-perspective "
+            "guide the SVGF chain uses (G = T*A + (1-T)), then "
+            "remodulates on the far side. Sky pixels are passed through "
+            "un-denoised on purpose -- they are analytic here. Requires a "
+            "build configured with -DPT_ENABLE_NRD=ON (default OFF) and "
+            "the Vulkan backend; without it, or if NRD's instance "
+            "creation fails at runtime, `nrd` degrades to the in-house "
+            "svgf_atrous chain and says so once in the log. "
             "optix_hdr = NVIDIA OptiX HDR denoiser "
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
@@ -794,7 +990,7 @@ namespace cvar {
     PT_CVAR(r_exposure,        "1.5","Manual HDR exposure multiplier applied before ACES tonemap. Used when r_auto_exposure = 0.", CVAR_ARCHIVE);
     PT_CVAR(r_auto_exposure,   "1",  "Auto-exposure: 0 = use r_exposure manual value, 1 = sample accum_hdr each frame and adapt exposure toward r_exposure_target (eye-adaptation feel).", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_min,    "1e-6",  "Minimum exposure scalar that auto-exposure can settle on. Used as a floor; the geometric-mean metering in AutoExposure.slang produces values down to ~1e-5 for genuine outdoor daylight (sky luminance of ~1e4 units / 0.18 target = ~1.8e-5). 1e-6 leaves headroom and prevents NaN pathologies; bump up to ~0.05 if you want auto-exposure to refuse to dim below a certain level for stylistic reasons.", CVAR_ARCHIVE);
-    PT_CVAR(r_exposure_max,    "4.0",   "Maximum exposure scalar that auto-exposure can settle on. The reason nights stay dark instead of being boosted to look like day -- bumping this lets the eye adapt further into the dark, lowering it caps the boost.", CVAR_ARCHIVE);
+    PT_CVAR(r_exposure_max,    "2000.0", "Maximum exposure scalar that auto-exposure can settle on -- how far the eye is allowed to dark-adapt. NOT a look knob: 2000 is derived from the naked-eye limiting magnitude. A V = 6 star (the faintest a dark-adapted human sees) delivers 3.19e-9 * 10^(-0.4*6) = 1.27e-11 W/m^2, which over a 9.04e-6 sr pixel (60 deg vertical FOV, 384 px) is 1.40e-6 W/m^2/sr; the exposure that lands that on the display's ~2/255 visibility threshold through ACES is ~2000. At that same exposure a 2.5e-7 W/m^2/sr dark sky reads 0.4/255 (black) and Vega reads 219/255 -- i.e. the night sky comes out looking like night, with the right stars in it, without a single tuned term. The previous 4.0 was ~500x too low to let any night scene adapt at all, which is why nights rendered as a flat grey wash. Raising it only changes scenes dark enough to CLAMP (mean below ~1e-4); lit scenes never reach it.", CVAR_ARCHIVE);
     PT_CVAR(r_exposure_target, "0.18",  "Middle-grey target for auto-exposure. 0.18 matches the Zone-V/Munsell middle-grey convention; lower values aim for a darker overall look.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_adapt_speed, "0.20",  "Per-update interpolation factor for auto-exposure (0..1). Smaller = slower eye adaptation. The update fires every frame on the GPU (single-workgroup reduction over accum_hdr), so 0.20 settles ~80% in 5 frames, ~95% in 16 frames -- roughly 'eye-adapted in a quarter second at 60fps'.", CVAR_ARCHIVE);
     PT_CVAR(r_eye_model,       "human", "Preset 'iris/lens' tuning: human (default), cat (better dim-light dynamic range), owl (nocturnal -- huge max), dslr_iso100 (locked, narrow), dslr_iso6400 (locked, high gain), phone (auto, modest range), linear (no tonemap, debug). Selecting a preset writes r_exposure_min/max/target/r_eye_adapt_speed; 'custom' leaves them as-is.", CVAR_ARCHIVE);
@@ -1216,7 +1412,7 @@ namespace cvar {
             "1 = write per-pixel sun-NEE visibility to a separate "
             "G-buffer, denoise it with a depth+normal bilateral, "
             "multiply the denoised visibility into the post-denoise "
-            "HDR for sharp sun shadows under SVGF / MetalFX. "
+            "HDR for sharp sun shadows under SVGF / NRD. "
             "0 = legacy fold-into-radiance behaviour where the active "
             "radiance denoiser smudges sun shadow boundaries. "
             "No effect when r_denoiser = off.",
@@ -1429,7 +1625,7 @@ namespace cvar {
             "Larger jumps (e.g. user typed a coordinate in console, or "
             "moved through a sphere whose inside is black) clear the "
             "current denoiser's history -- consumed by SVGF/NRD's "
-            "temporal accumulation path, MetalFX's history-state "
+            "temporal accumulation path, the denoiser's history-state "
             "reset, AND the OptiX temporal denoisers' "
             "prev_output / internal-guide-layer ping-pong -- instead "
             "of bleeding stale pre-jump color into post-jump frames. "
@@ -2523,7 +2719,120 @@ Engine::Engine() {
         v->allowed_values = {"aces", "agx", "khronos_pbr_neutral",
                              "reinhard", "linear"};
     }
+    // r_dlss: attached here rather than at PT_CVAR so the console rejects
+    // typos and the web console renders a dropdown, same as r_tonemap_op
+    // above. "ultra_quality" is deliberately NOT in this list -- it exists in
+    // NVIDIA's NVSDK_NGX_PerfQuality_Value enum but has historically not been
+    // implemented by the runtime, and offering a mode that resolves to
+    // "unavailable" is worse than not offering it.
+    if (auto* v = pt::console::Console::Get().FindCVar("r_dlss")) {
+        v->allowed_values = {"off", "dlaa", "quality", "balanced",
+                             "performance", "ultra_performance"};
+    }
 }
+// See the declaration in Engine.h for why this reads cvars rather than a
+// resolved denoiser state.
+bool Engine::DlssRayReconstructionRequested() const {
+    auto& C = pt::console::Console::Get();
+    const auto* rr = C.FindCVar("r_dlss_rr");
+    if (!rr) return false;
+    // RR is a mode of DLSS, not independent.
+    if (!DlssRequested()) return false;
+    return rr->GetInt() != 0;
+}
+// See the declaration in Engine.h for why this reads cvars rather than a
+// resolved DLSS state.
+bool Engine::DlssRequested() const {
+    const auto* mode = pt::console::Console::Get().FindCVar("r_dlss");
+    if (!mode) return false;
+    return mode->value != "off";
+}
+
+// See the declaration in Engine.h for why this is called twice a frame.
+bool Engine::ResolveDlssForDisplay(pt::rhi::UpscalerMode mode,
+                                   std::uint32_t display_w,
+                                   std::uint32_t display_h) {
+    if (mode == pt::rhi::UpscalerMode::Off) return false;
+    if (device_ == nullptr)                 return false;
+    if (display_w == 0 || display_h == 0)   return false;
+
+    const bool query_stale = (dlss_query_mode_      != mode)      ||
+                             (dlss_query_display_w_ != display_w) ||
+                             (dlss_query_display_h_ != display_h);
+    if (query_stale) {
+        pt::rhi::UpscalerSettings s{};
+        const bool ok =
+            device_->QueryUpscalerSettings(mode, display_w, display_h, s);
+        dlss_settings_        = ok ? s : pt::rhi::UpscalerSettings{};
+        dlss_query_mode_      = mode;
+        dlss_query_display_w_ = display_w;
+        dlss_query_display_h_ = display_h;
+
+        std::string mode_str = "off";
+        if (auto* v = pt::console::Console::Get().FindCVar("r_dlss")) {
+            mode_str = v->value;
+        }
+        if (ok) {
+            // Log on a change of ANSWER, not on a cache refill -- see
+            // dlss_logged_* in Engine.h for why the distinction matters.
+            const bool answer_changed =
+                (dlss_logged_mode_      != mode)             ||
+                (dlss_logged_display_w_ != display_w)        ||
+                (dlss_logged_display_h_ != display_h)        ||
+                (dlss_logged_render_w_  != s.render_width)   ||
+                (dlss_logged_render_h_  != s.render_height);
+            if (answer_changed) {
+                dlss_logged_mode_      = mode;
+                dlss_logged_display_w_ = display_w;
+                dlss_logged_display_h_ = display_h;
+                dlss_logged_render_w_  = s.render_width;
+                dlss_logged_render_h_  = s.render_height;
+                // THE line that answers "what render extent did DLSS
+                // actually pick?" -- the number that has to be
+                // reviewable, printed where a bug report can find it,
+                // and derived from the query rather than from any ratio
+                // in this source tree.
+                LOG_INFO("engine: DLSS optimal settings for r_dlss={} at "
+                         "display {}x{} -> render {}x{} (ratio {:.4f}, {:.1f}% "
+                         "of display pixels); runtime's dynamic range "
+                         "{}x{}..{}x{}, unused -- this engine renders at a "
+                         "fixed per-mode extent",
+                         mode_str, display_w, display_h,
+                         s.render_width, s.render_height,
+                         float(s.render_width) / float(display_w),
+                         100.0f * float(s.render_width) * float(s.render_height)
+                             / (float(display_w) * float(display_h)),
+                         s.min_width, s.min_height, s.max_width, s.max_height);
+            }
+            // Re-arm the degradation line on ANY success, not just a
+            // changed answer: a later genuine failure still deserves to
+            // be said out loud.
+            dlss_fallback_logged_ = false;
+        } else if (!dlss_fallback_logged_) {
+            // THE degradation line: one line, naming the mode and the
+            // extent that was asked about. The backend has already
+            // logged which specific check said no (build without
+            // PT_ENABLE_DLSS / missing nvngx_dlss.dll / driver too old /
+            // GPU unsupported / mode not implemented), so this does not
+            // repeat that -- it says what the engine is going to do
+            // about it.
+            LOG_WARN("engine: r_dlss={} is unavailable on this build / GPU / "
+                     "driver at display {}x{} -- falling back to off. "
+                     "r_render_scale returns to being the user's knob. See the "
+                     "preceding `DLSS:` line for which check failed.",
+                     mode_str, display_w, display_h);
+            dlss_fallback_logged_ = true;
+        }
+    }
+    // A supported answer still has to carry a usable extent. Belt and
+    // braces against a runtime that reports success with a zero size:
+    // the alternative is a zero-sized render, which the plan explicitly
+    // forbids degrading into.
+    return dlss_settings_.supported &&
+           dlss_settings_.render_width  > 0 &&
+           dlss_settings_.render_height > 0;
+}
+
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }
 
 Engine* Engine::Instance() { return g_instance; }
@@ -3021,8 +3330,7 @@ bool Engine::Init() {
             v->value = "vulkan";
         }
         BackendType t = BackendType::None;
-        if      (v->value == "software") t = BackendType::Software;
-        else if (v->value == "vulkan")   t = BackendType::Vulkan;
+        if (v->value == "vulkan") t = BackendType::Vulkan;
         if (t != BackendType::None) RequestBackendSwitch(t);
     }
 
@@ -3646,6 +3954,14 @@ void Engine::TearDownDevice() {
             id = 0;
         }
         if (bloom_dummy_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{bloom_dummy_tex_id_});
+        // Render-scale internal present target (r_render_scale). Only
+        // ever allocated on a scaled frame, so this is usually a no-op.
+        if (present_ldr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+        // DLSS display-extent HDR target, and the NGX feature that
+        // writes it. The feature must go before the device does: it
+        // holds driver-side GPU resources keyed to this VkDevice.
+        if (dlss_output_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+        device_->ReleaseUpscalerFeature();
         if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
@@ -3655,6 +3971,8 @@ void Engine::TearDownDevice() {
         // autoexpose_pipeline_id_) are owned by the device handle and
         // released by device_.reset() below, same as tonemap / bloom.
         if (exposure_state_id_      != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{exposure_state_id_});
+        // The 1x1 R32F image view of the same scalar (DLSS pInExposureTexture).
+        if (exposure_texture_id_    != 0) device_->DestroyTexture(pt::rhi::TextureHandle{exposure_texture_id_});
         if (perfoverlay_drawlist_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{perfoverlay_drawlist_id_});
         if (editor_overlay_segs_buf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{editor_overlay_segs_buf_id_});
         if (placeholder_storage_id_  != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{placeholder_storage_id_});
@@ -3764,6 +4082,20 @@ void Engine::TearDownDevice() {
     specular_albedo_tex_id_       = 0;
     roughness_tex_id_             = 0;
     specular_hit_distance_tex_id_ = 0;
+    // DLSS. The extent fields go to 0 too so the next engaged frame
+    // reallocates rather than trusting a size that belonged to a
+    // destroyed device, and the query cache is cleared so the new device
+    // is asked afresh (a backend switch can change the answer).
+    dlss_output_tex_id_   = 0;
+    dlss_output_w_        = 0;
+    dlss_output_h_        = 0;
+    dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+    dlss_query_display_w_ = 0;
+    dlss_query_display_h_ = 0;
+    dlss_settings_        = pt::rhi::UpscalerSettings{};
+    dlss_mode_            = pt::rhi::UpscalerMode::Off;
+    dlss_active_          = false;
+    dlss_engaged_logged_  = false;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     aurora_composite_pipeline_id_ = 0;
@@ -3790,6 +4122,20 @@ void Engine::TearDownDevice() {
     editor_overlay_segs_buf_id_      = 0;
     editor_overlay_segs_buf_capacity_ = 0;
     bloom_dummy_tex_id_      = 0;
+    // Render scale (r_render_scale). The pipeline id goes with the
+    // device; the target and the cached extents go with it so the next
+    // device's first scaled frame reallocates instead of handing the
+    // resolve a dangling handle. The engaged latch and the
+    // missing-kernel warning re-arm too, so a backend switch that
+    // gains or loses the resolve kernel logs its new state once.
+    present_ldr_tex_id_      = 0;
+    present_ldr_w_           = 0;
+    present_ldr_h_           = 0;
+    render_w_ = render_h_ = output_w_ = output_h_ = 0;
+    render_scale_engaged_    = false;
+    upscale_pipeline_id_     = 0;
+    upscale_absent_frames_   = 0;
+    upscale_missing_logged_  = false;
     for (auto& id : bloom_mip_tex_id_) id = 0;
     for (auto& w  : bloom_mip_w_)      w  = 0;
     for (auto& h  : bloom_mip_h_)      h  = 0;
@@ -3802,6 +4148,7 @@ void Engine::TearDownDevice() {
     moon_map_tex_id_      = 0;
     autoexpose_pipeline_id_ = 0;
     exposure_state_id_      = 0;
+    exposure_texture_id_    = 0;
     placeholder_storage_id_ = 0;
     denoiser_active_      = false;
     prev_frame_valid_ = false;
@@ -3857,8 +4204,14 @@ void Engine::RequestBackendSwitch(BackendType to) {
     // path runs as the loop exits).
     bool need_recreate = false;
     bool need_warn     = false;
-    if (to == BackendType::Software &&
-        current_backend_ == BackendType::Vulkan) {
+    // Vulkan -> software was the only switch that needed an HWND
+    // recreate (Microsoft's DXGI flip-model lockout leaves GDI unable to
+    // blit to an HWND that has hosted a swapchain). With the software
+    // backend gone there is no such switch left, so this is dead and the
+    // condition is pinned false rather than deleted, keeping the
+    // surrounding warn/recreate machinery intact for any future backend
+    // that needs it.
+    if (false) {
         if (auto* v = pt::console::Console::Get().FindCVar("r_software_blit");
             v && v->value == "gdi") {
             std::string mode = "auto";
@@ -6483,6 +6836,14 @@ void Engine::EnsurePipelineHandles() {
     resolve(tonemap_pipeline_id_,      "tonemap");
     resolve(bloom_down_pipeline_id_,   "bloom_down");
     resolve(bloom_up_pipeline_id_,     "bloom_up");
+    // Render-scale resolve (r_render_scale). Registered by the Vulkan
+    // backend's pipeline-build worker from the embedded Upscale.spv.
+    // An id of 0 means render scaling is unavailable -- either the
+    // async build has not reached this kernel yet or the backend has no
+    // such pipeline; RenderFrame pins the scale to 1.0 in both cases
+    // rather than presenting a swapchain nothing wrote, and only warns
+    // once the async window has demonstrably closed.
+    resolve(upscale_pipeline_id_, "upscale");
     resolve(autoexpose_pipeline_id_,   "autoexpose");
     resolve(perfoverlay_pipeline_id_,  "perfoverlay");
     // Editor 3D-transform gizmo overlay (issue: editor 3D gizmos).
@@ -6843,7 +7204,7 @@ void Engine::RegisterCameraBookmarkCommands() {
         "bookmark saved with cam_save_named. Use cam_list_bookmarks "
         "to see available names. Fires the active denoiser's "
         "history-reset flag so the temporal denoise pipeline "
-        "(SVGF/NRD/MetalFX/OptiX-temporal) doesn't blend pre-teleport "
+        "(SVGF/NRD/OptiX-temporal) doesn't blend pre-teleport "
         "content forward.",
         [this, parse_cam_state](auto args, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_load_named: no camera"); return; }
@@ -6864,7 +7225,7 @@ void Engine::RegisterCameraBookmarkCommands() {
                                name, it->second);
                 return;
             }
-            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/OptiX-temporal)
             out.FormatLine("cam_load_named: '{}' = {}", name, it->second);
         });
 
@@ -7796,6 +8157,121 @@ void Engine::RenderFrame() {
 
     auto& C = pt::console::Console::Get();
 
+    // --- DLSS Super Resolution / DLAA -------------------------------------
+    //
+    // Resolved HERE, before the denoiser state and long before the
+    // render-scale block, because it decides two things that everything
+    // downstream depends on: whether the denoiser G-buffers get
+    // allocated at all, and what the internal render extent IS.
+    //
+    // The ladder of things that can say no, in the order they are asked
+    // (each one falls back to `off` with ONE log line, never a crash and
+    // never a zero-sized render):
+    //   1. the cvar itself is `off`, or names something unparseable
+    //   2. r_hdr_pipeline is 0 -- DLSS consumes linear HDR
+    //   3. the backend has no upscaler: build without PT_ENABLE_DLSS, no
+    //      NVIDIA driver, a GPU without the feature, or a missing
+    //      nvngx_dlss.dll. Device::QueryUpscalerSettings folds all four
+    //      into one answer, exactly as SupportsNrdLibrary() does for NRD.
+    //   4. the optimal-settings query fails, or returns a zero extent
+    //      (how the runtime signals a mode it does not implement)
+    //
+    // The r_dlss cvar is NOT rewritten on a fallback. The user asked for
+    // a mode; the engine says why it could not have it and runs without
+    // it. Silently editing the setting would hide the failure and make
+    // the next `r_dlss` read look like the user never asked.
+    {
+        std::string dlss_str = "off";
+        if (auto* v = C.FindCVar("r_dlss")) dlss_str = v->value;
+        pt::rhi::UpscalerMode want_dlss = pt::rhi::UpscalerMode::Off;
+        if      (dlss_str == "dlaa")              want_dlss = pt::rhi::UpscalerMode::Dlaa;
+        else if (dlss_str == "quality")           want_dlss = pt::rhi::UpscalerMode::Quality;
+        else if (dlss_str == "balanced")          want_dlss = pt::rhi::UpscalerMode::Balanced;
+        else if (dlss_str == "performance")       want_dlss = pt::rhi::UpscalerMode::Performance;
+        else if (dlss_str == "ultra_performance") want_dlss = pt::rhi::UpscalerMode::UltraPerformance;
+        // Anything else (including "off" and any typo the console's
+        // allowed_values would have rejected) stays Off.
+
+        // DLSS consumes linear HDR. With r_hdr_pipeline 0 the path
+        // tracer has ALREADY tonemapped into denoise_color, so handing
+        // that to a feature created with the IsHDR flag would feed it
+        // display-referred colour while telling it the values are
+        // radiance. Refuse rather than produce a quietly wrong image.
+        bool hdr_pipeline_on = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline_on = v->GetBool();
+        if (want_dlss != pt::rhi::UpscalerMode::Off && !hdr_pipeline_on) {
+            if (!dlss_hdr_conflict_logged_) {
+                LOG_WARN("engine: r_dlss={} requested with r_hdr_pipeline 0 -- "
+                         "DLSS consumes linear HDR radiance and the path tracer "
+                         "has already tonemapped at that setting. Running "
+                         "without DLSS; set r_hdr_pipeline 1 to use it.",
+                         dlss_str);
+                dlss_hdr_conflict_logged_ = true;
+            }
+            want_dlss = pt::rhi::UpscalerMode::Off;
+        } else if (hdr_pipeline_on) {
+            dlss_hdr_conflict_logged_ = false;
+        }
+
+        // The DLSS path finishes through Denoise(Kind::FinalizeOnly)
+        // (bloom composite + tonemap + sRGB + swapchain write) because
+        // Tonemap.slang produces a black swapchain on Vulkan. So DLSS
+        // needs the denoiser pipelines built, the same way the
+        // bloom-without-denoiser path does. On Vulkan those build on an
+        // async worker, so this is also the natural "not yet" gate for
+        // the first few frames -- no log, because it resolves itself.
+        if (want_dlss != pt::rhi::UpscalerMode::Off &&
+            (device_ == nullptr || !device_->SupportsDenoise())) {
+            want_dlss = pt::rhi::UpscalerMode::Off;
+        }
+
+        // Provisional resolve against the WINDOW extent. The swapchain
+        // does not exist yet this frame (BeginFrame is further down),
+        // but the denoiser-G-buffer gate immediately below has to know
+        // whether DLSS is on, and the window size is what the swapchain
+        // will be built from. The render-scale block re-resolves against
+        // the real swapchain extent once BeginFrame has returned; the
+        // two agree on every frame except a resize, and on that frame
+        // the second call is the one that counts.
+        pt::rhi::UpscalerMode resolved_dlss = pt::rhi::UpscalerMode::Off;
+        if (want_dlss != pt::rhi::UpscalerMode::Off && device_ != nullptr) {
+            const std::uint32_t disp_w =
+                (window_ != nullptr) ? static_cast<std::uint32_t>(window_->Width())  : 0u;
+            const std::uint32_t disp_h =
+                (window_ != nullptr) ? static_cast<std::uint32_t>(window_->Height()) : 0u;
+            if (ResolveDlssForDisplay(want_dlss, disp_w, disp_h)) {
+                resolved_dlss = want_dlss;
+            }
+        }
+
+        if (resolved_dlss == pt::rhi::UpscalerMode::Off) {
+            // Reset the query cache so a later retry (window resize,
+            // driver update, or the denoiser pipelines finishing their
+            // async build) re-asks rather than reusing a stale "no".
+            dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+            dlss_query_display_w_ = 0;
+            dlss_query_display_h_ = 0;
+        }
+        dlss_mode_   = resolved_dlss;
+        dlss_active_ = (resolved_dlss != pt::rhi::UpscalerMode::Off);
+
+        // Ray Reconstruction: the cvar exists and its G-buffers are
+        // allocated off it, but the NGX RR feature belongs to a separate
+        // workstream. Say so once rather than letting a user conclude
+        // r_dlss_rr 1 is doing something.
+        if (dlss_active_ && DlssRayReconstructionRequested() &&
+            !dlss_rr_pending_logged_) {
+            LOG_INFO("engine: r_dlss_rr is set. The specular guidance "
+                     "G-buffers are being allocated and written, but the NGX "
+                     "Ray Reconstruction feature is not wired yet -- this "
+                     "frame runs Super Resolution and whatever r_denoiser "
+                     "selects still does the denoising.");
+            dlss_rr_pending_logged_ = true;
+        }
+        if (!dlss_active_) dlss_rr_pending_logged_ = false;
+    }
+    // --- end DLSS ----------------------------------------------------------
+
     // P10/P12 denoiser state. Resolved before BeginFrame so we know
     // whether to allocate the G-buffer textures this frame. The cvar
     // value chooses the kind (off / svgf / nrd / optix_*); per-backend
@@ -7809,14 +8285,15 @@ void Engine::RenderFrame() {
         const auto& s = v->value;
         if (current_backend_ == BackendType::Vulkan) {
             // The *_metalfx variants chained MetalFX as a finalizer on the
-            // retired Mac backend. Here they silently degrade to the
-            // corresponding plain SVGF mode so a demont.cfg / preset value
-            // carried over from macOS still works -- it just loses the
-            // (now-removed) MetalFX finalizer, matching the cvar help text.
+            // The svgf_*_metalfx aliases and `metalfx` itself are GONE, not
+            // silently degraded. They used to map down to the plain SVGF
+            // modes so a demont.cfg carried over from macOS still worked;
+            // that grace period ended with the MetalFX kinds themselves.
+            // An old cfg naming one now falls through to the unknown-value
+            // path and says so, which is better than quietly running a
+            // different denoiser than the one that was asked for.
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrous;
             else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
             else if (s == "optix_hdr")             want_kind = DenoiserKind::OptixHdr;
             else if (s == "optix_hdr_aov")         want_kind = DenoiserKind::OptixHdrAov;
@@ -7831,7 +8308,44 @@ void Engine::RenderFrame() {
         // SupportsDenoise flips true.
         want_kind = DenoiserKind::Off;
     }
-    const bool want_denoiser = (want_kind != DenoiserKind::Off);
+    // `denoiser_active_` is the engine's name for "the G-buffer
+    // machinery is alive", not for "a denoiser is running" -- it gates
+    // denoise_color / depth / motion / normal / albedo / cloud_trans
+    // allocation, the celestial-composite seam, the ReSTIR dispatch and
+    // the SIGMA shadow buffer. DLSS needs exactly that machinery
+    // (colour + depth + motion at the render extent) whether or not a
+    // denoiser is selected, so it turns the flag on the same way
+    // docs/DLSS_INTEGRATION_PLAN.md SS5.1 prescribes for Ray
+    // Reconstruction: keep denoiser_active_ true, and let the KIND
+    // decide whether a denoising dispatch actually happens.
+    //
+    // The consequence to be aware of: with `r_dlss quality` and
+    // `r_denoiser off`, denoiser_active_ is true and denoiser_kind_ is
+    // Off. Every site that means "should I run the denoiser?" must
+    // therefore test the kind, not the flag. There is exactly one such
+    // site (the device_->Denoise dispatch block) and it is marked.
+    const bool want_denoiser = (want_kind != DenoiserKind::Off) || dlss_active_;
+    // NRD library availability (issue #50). Folded into one bool the
+    // rest of the frame reads: false on a build without PT_ENABLE_NRD,
+    // and false once the backend's NRD instance has failed at runtime.
+    // Re-read every frame because the runtime half can flip (once,
+    // downward) after the first Kind::Nrd dispatch.
+    {
+        const bool nrd_now = (device_ != nullptr) && device_->SupportsNrdLibrary();
+        if (nrd_now != nrd_lib_active_ && denoiser_kind_ == DenoiserKind::Nrd) {
+            LOG_INFO("engine: NVIDIA RayTracingDenoiser availability changed "
+                     "({} -> {}); `r_denoiser nrd` now routes through {}",
+                     nrd_lib_active_ ? "available" : "unavailable",
+                     nrd_now ? "available" : "unavailable",
+                     nrd_now ? "the NRD library (RELAX_DIFFUSE)"
+                             : "the in-house SVGF a-trous chain");
+            // The two chains keep history in different buffers and (for
+            // NRD) a different colour space, so a mid-session switch has
+            // to start clean.
+            prev_frame_valid_ = false;
+        }
+        nrd_lib_active_ = nrd_now;
+    }
     if (want_denoiser != denoiser_active_ || want_kind != denoiser_kind_) {
         // Toggle (or kind switch -- e.g. svgf -> nrd): free the G-buffer
         // and force a history reset on the next allocation.
@@ -7839,26 +8353,31 @@ void Engine::RenderFrame() {
         denoiser_kind_        = want_kind;
         prev_frame_valid_ = false;
         // One-time log on transitions so the user sees which path
-        // they're on (especially for the nrd-as-svgf-placeholder case).
+        // they're on (especially for `nrd`, which is the real NVIDIA
+        // library on a PT_ENABLE_NRD build and the in-house SVGF chain
+        // everywhere else).
         if (want_kind == DenoiserKind::Nrd) {
-            LOG_INFO("engine: r_denoiser=nrd accepted -- routing through the in-house "
-                     "SVGF kernels (atrous chain) until the NVIDIA RayTracingDenoiser "
-                     "library is integrated. See Raytracer Plan/FOLLOW_UPS.md for the "
-                     "integration plan.");
+            if (nrd_lib_active_) {
+                LOG_INFO("engine: r_denoiser=nrd -- NVIDIA RayTracingDenoiser "
+                         "(RELAX_DIFFUSE): demodulated radiance + hit distance, "
+                         "oct-packed normal/roughness, linear view Z and the "
+                         "engine's motion vectors, denoised in-library and "
+                         "remodulated before bloom + tonemap");
+            } else {
+                // Same shape as the OptiX-unavailable path: say exactly
+                // why, say what runs instead, and don't pretend.
+                LOG_INFO("engine: r_denoiser=nrd requested but the NVIDIA "
+                         "RayTracingDenoiser is unavailable on this build "
+                         "(configure with -DPT_ENABLE_NRD=ON, Vulkan backend) "
+                         "-- running the in-house SVGF a-trous chain instead. "
+                         "Image quality is the svgf_atrous tier, not NRD's.");
+            }
         } else if (want_kind == DenoiserKind::SvgfBasic) {
             LOG_INFO("engine: r_denoiser=svgf_basic -- temporal accumulation only "
                      "(no spatial filter)");
         } else if (want_kind == DenoiserKind::SvgfAtrous) {
             LOG_INFO("engine: r_denoiser=svgf_atrous -- temporal + a-trous "
                      "edge-aware filter");
-        } else if (want_kind == DenoiserKind::SvgfBasicMetalFx) {
-            LOG_INFO("engine: r_denoiser=svgf_basic_metalfx -- SVGF (temporal only) "
-                     "-> MetalFX TemporalDenoisedScaler chain");
-        } else if (want_kind == DenoiserKind::SvgfAtrousMetalFx) {
-            LOG_INFO("engine: r_denoiser=svgf_atrous_metalfx -- SVGF (temporal + a-trous) "
-                     "-> MetalFX TemporalDenoisedScaler chain");
-        } else if (want_kind == DenoiserKind::MetalFX) {
-            LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
         } else if (want_kind == DenoiserKind::OptixHdr) {
             LOG_INFO("engine: r_denoiser=optix_hdr -- NVIDIA OptiX denoiser (HDR model) "
                      "via CUDA-Vulkan interop active");
@@ -7883,10 +8402,7 @@ void Engine::RenderFrame() {
             // the write gates -- keyed on texture-id != 0 -- kept the
             // path tracer writing G-buffers nothing reads) until the
             // denoiser was toggled fully off.
-            const bool new_kind_wants_specular =
-                (want_kind == DenoiserKind::MetalFX          ||
-                 want_kind == DenoiserKind::SvgfBasicMetalFx ||
-                 want_kind == DenoiserKind::SvgfAtrousMetalFx);
+            const bool new_kind_wants_specular = DlssRayReconstructionRequested();
             if (!new_kind_wants_specular) {
                 if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
                 if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -7954,6 +8470,302 @@ void Engine::RenderFrame() {
         PT_ZONE_SCOPED_N("Device::BeginFrame");
         fc = device_->BeginFrame();
     }
+
+    // --- Render scale: split the internal extent from the output extent ----
+    //
+    // THE TRICK, stated plainly: `fc.width` / `fc.height` are REWRITTEN
+    // below to the INTERNAL render extent, and `fc.swapchain_image`
+    // keeps meaning the swapchain. Every `fc.width` / `fc.height` from
+    // here to the end of RenderFrame -- the accumulator, all thirteen
+    // denoiser G-buffers, the ReSTIR reservoir ring, the SIGMA shadow
+    // buffer, the bloom mip chain, the camera aspect ratio, and every
+    // Dispatch's workgroup count -- therefore follows the internal
+    // extent with no further edits. That is deliberate, not laziness:
+    // an opt-in list of "which of these seventy-odd sites should scale"
+    // would rot the first time someone adds a pass, whereas this makes
+    // "internal extent" the default and forces the two genuine
+    // exceptions (the resolve, and the output-resolution overlays after
+    // it) to say so explicitly by using output_w / output_h.
+    //
+    // It also settles the subtlest coupling in the renderer for free.
+    // PathTrace.slang derives its per-pixel angular footprint from
+    // `output.GetDimensions()` -- `cone_spread = 2 * fovYTan / dim.y`,
+    // the ray-cone width that drives texture LOD and the star
+    // point-spread function. `output` is engine texture slot 0, which
+    // is bound to the internal target below, so the footprint widens
+    // with the internal extent exactly as it must. Bind the swapchain
+    // there instead and stars silently change brightness and textures
+    // silently change mip level.
+    const std::uint32_t output_w = fc.width;
+    const std::uint32_t output_h = fc.height;
+    float render_scale = 1.0f;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_render_scale")) {
+        render_scale = v->GetFloat();
+    }
+    // NaN-safe clamp: the comparisons below are false for NaN, so a
+    // garbage cvar value falls through to the 1.0 initialiser rather
+    // than propagating into an extent computation.
+    if (render_scale >= kMinRenderScale && render_scale <= kMaxRenderScale) {
+        // in range; keep it
+    } else if (render_scale > kMaxRenderScale) {
+        render_scale = kMaxRenderScale;
+    } else {
+        render_scale = (render_scale < kMinRenderScale) ? kMinRenderScale : 1.0f;
+    }
+    std::uint32_t render_w = std::max<std::uint32_t>(1u,
+        static_cast<std::uint32_t>(float(output_w) * render_scale + 0.5f));
+    std::uint32_t render_h = std::max<std::uint32_t>(1u,
+        static_cast<std::uint32_t>(float(output_h) * render_scale + 0.5f));
+    // --- DLSS OWNS THE EXTENT --------------------------------------------
+    //
+    // When DLSS is engaged the relationship above inverts: the extent is
+    // not derived from a ratio, it is the extent NGX's optimal-settings
+    // query returned, and the RATIO is derived from it for reporting.
+    // Doing it the other way round -- round(display * published_ratio) --
+    // is the specific bug docs/DLSS_INTEGRATION_PLAN.md SS3.1 item 2
+    // forbids: the NGX feature is created for the queried size, and a
+    // mismatch between the size DLSS was created for and the size it is
+    // fed is an error, not a rounding nuisance.
+    //
+    // The ratio is then written BACK into r_render_scale so the console,
+    // the perf overlay and config.cfg all report what is actually
+    // happening rather than a stale user value. Writes the user makes to
+    // r_render_scale while DLSS is on are latched into the cvar and
+    // overwritten here -- the docstring says so, and the one-shot log
+    // below says so again the first time it matters.
+    //
+    // Re-resolve against the REAL swapchain extent first. The pre-
+    // BeginFrame pass used the window size; they agree on every frame
+    // but a resize, and on a resize frame this is what stops the NGX
+    // feature being created for the old size.
+    if (dlss_active_ && !ResolveDlssForDisplay(dlss_mode_, output_w, output_h)) {
+        dlss_active_ = false;
+        dlss_mode_   = pt::rhi::UpscalerMode::Off;
+    }
+    if (dlss_active_ && dlss_settings_.supported) {
+        render_w = dlss_settings_.render_width;
+        render_h = dlss_settings_.render_height;
+        const float queried_ratio = (output_w > 0)
+                                        ? float(render_w) / float(output_w)
+                                        : 1.0f;
+        if (auto* v = pt::console::Console::Get().FindCVar("r_render_scale")) {
+            // Format to 6 places: the ratio is a quotient of two integer
+            // pixel counts (e.g. 1707/2560 = 0.666797), and rounding it
+            // for display would make the reported number disagree with
+            // the extents printed beside it.
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.6f",
+                          static_cast<double>(queried_ratio));
+            const std::string want = buf;
+            if (v->value != want) {
+                if (!dlss_owns_scale_logged_) {
+                    LOG_INFO("engine: DLSS owns r_render_scale while r_dlss is "
+                             "not off -- overwriting {} with the queried ratio "
+                             "{} ({}x{} render for {}x{} display). Writes to "
+                             "r_render_scale are latched but inert until DLSS "
+                             "is off again.",
+                             v->value, want, render_w, render_h,
+                             output_w, output_h);
+                    dlss_owns_scale_logged_ = true;
+                }
+                v->value = want;
+            }
+            render_scale = queried_ratio;
+        }
+    } else {
+        // Back under the user's control; re-arm the explanation so a
+        // later re-engage says it again rather than staying silent for
+        // the rest of the session.
+        dlss_owns_scale_logged_ = false;
+    }
+    // Compare EXTENTS, not the scale factor: a scale of 0.999 on a
+    // 512-wide window rounds back to 512, and that frame must take the
+    // untouched direct-to-swapchain path rather than pay for a 1:1
+    // resolve. This is also what guarantees r_render_scale 1.0 is
+    // bit-identical to the pre-render-scale engine -- the branch is
+    // never entered.
+    bool render_scaled = (render_w != output_w) || (render_h != output_h);
+    // The pin-back below must not fire on the DLSS path. DLSS does not
+    // use the bilinear resolve kernel at all -- it writes a display-
+    // extent HDR target and the tonemap finalize takes that straight to
+    // the swapchain -- so a missing `upscale` kernel is not a reason to
+    // change the extent. And changing it would be actively harmful:
+    // render_w/h here are the extent the NGX feature was CREATED for,
+    // and silently pinning them to the display extent would feed the
+    // feature a size it was not built for, which is the one failure mode
+    // SS3.1 calls an error rather than a nuisance.
+    if (render_scaled && !dlss_active_ && upscale_pipeline_id_ == 0) {
+        // No resolve kernel available: the internal target would be
+        // rendered and then never copied anywhere, leaving the
+        // presented swapchain as whatever the last frame left in it.
+        // Pin back to native. The warning waits out a grace period
+        // because on Vulkan this is also what a still-building async
+        // pipeline looks like (the loading-frame gate only waits on
+        // `pathtrace`), and a start-up false alarm would teach people
+        // to ignore the message.
+        if (upscale_absent_frames_ < kUpscaleProbeGraceFrames) {
+            ++upscale_absent_frames_;
+        } else if (!upscale_missing_logged_) {
+            LOG_WARN("engine: r_render_scale {:.3f} requested but no `upscale` "
+                     "resolve kernel is available on this backend -- pinning "
+                     "internal resolution to the swapchain extent ({}x{})",
+                     render_scale, output_w, output_h);
+            upscale_missing_logged_ = true;
+        }
+        render_scaled = false;
+        render_w = output_w;
+        render_h = output_h;
+    } else if (upscale_pipeline_id_ != 0) {
+        // Kernel showed up (or was never missing): re-arm, so a later
+        // genuine loss -- device teardown / backend switch -- still
+        // gets its one warning.
+        upscale_absent_frames_  = 0;
+        upscale_missing_logged_ = false;
+    }
+    // Rewrite the frame context. From here on `fc.width`/`fc.height`
+    // ARE the internal extent.
+    fc.width  = render_w;
+    fc.height = render_h;
+    render_w_ = render_w;
+    render_h_ = render_h;
+    output_w_ = output_w;
+    output_h_ = output_h;
+    if (render_scaled != render_scale_engaged_) {
+        if (render_scaled) {
+            LOG_INFO("engine: render scale engaged -- internal {}x{}, "
+                     "presented {}x{} (scale {:.3f}); resolve = {}",
+                     render_w, render_h, output_w, output_h, render_scale,
+                     // Naming the resolve matters: with DLSS engaged the
+                     // bilinear kernel does not run at all, and a line
+                     // claiming it does would send anyone comparing
+                     // sharpness to the wrong pass.
+                     dlss_active_ ? "DLSS (see the DLSS lines below)"
+                                  : "bilinear upscale (placeholder for DLSS)");
+        } else {
+            LOG_INFO("engine: render scale disengaged -- rendering natively "
+                     "at {}x{}", output_w, output_h);
+        }
+        render_scale_engaged_ = render_scaled;
+    }
+    // The internal LDR target: what the path tracer's inline tonemap
+    // (or the denoiser finalize, or Tonemap.slang) writes instead of
+    // the swapchain on a scaled frame, and what the resolve reads.
+    // RGBA8_UNORM because it holds exactly what the swapchain holds --
+    // tonemapped, sRGB-encoded, display-referred colour -- and giving
+    // the placeholder resolve a wider format would only misrepresent
+    // where the precision actually is.
+    if (render_scaled &&
+        (present_ldr_tex_id_ == 0 ||
+         present_ldr_w_ != render_w || present_ldr_h_ != render_h)) {
+        if (present_ldr_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+            present_ldr_tex_id_ = 0;
+        }
+        auto ph = device_->CreateTexture({
+            .width = render_w, .height = render_h,
+            .format = pt::rhi::TextureFormat::RGBA8_UNORM,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "present_ldr",
+        });
+        present_ldr_tex_id_ = ph.id;
+        present_ldr_w_      = render_w;
+        present_ldr_h_      = render_h;
+        if (present_ldr_tex_id_ == 0) {
+            LOG_ERROR("engine: present_ldr allocation failed at {}x{} -- "
+                      "falling back to native resolution for this frame",
+                      render_w, render_h);
+            render_scaled = false;
+            render_w = output_w; render_h = output_h;
+            fc.width = output_w; fc.height = output_h;
+            render_w_ = output_w; render_h_ = output_h;
+            render_scale_engaged_ = false;
+            present_ldr_w_ = present_ldr_h_ = 0;
+        }
+    } else if (!render_scaled && present_ldr_tex_id_ != 0) {
+        // Scale returned to 1.0 (or the window resized to meet it):
+        // give the VRAM back rather than keeping a target nothing on
+        // the default path will ever read again.
+        device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+        present_ldr_tex_id_ = 0;
+        present_ldr_w_ = present_ldr_h_ = 0;
+    }
+    // --- DLSS display-extent HDR target -----------------------------------
+    //
+    // What DLSS writes: linear HDR at the PRESENTATION extent, which the
+    // tonemap finalize then reads. This is the texture
+    // docs/DLSS_INTEGRATION_PLAN.md SS2.1 lists as MISSING
+    // ("pInOutput -- linear HDR at display res"); post_denoise_hdr could
+    // not serve because it is allocated at the internal extent along
+    // with every other G-buffer.
+    //
+    // Allocated only while DLSS is engaged and freed the moment it is
+    // not, so a default configuration pays no VRAM for it (RGBA16F at
+    // 3840x2160 is 63 MB).
+    if (dlss_active_ &&
+        (dlss_output_tex_id_ == 0 ||
+         dlss_output_w_ != output_w || dlss_output_h_ != output_h)) {
+        if (dlss_output_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+            dlss_output_tex_id_ = 0;
+        }
+        auto dh = device_->CreateTexture({
+            .width = output_w, .height = output_h,
+            .format = pt::rhi::TextureFormat::RGBA16F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "dlss_output_hdr",
+        });
+        dlss_output_tex_id_ = dh.id;
+        dlss_output_w_      = output_w;
+        dlss_output_h_      = output_h;
+        if (dlss_output_tex_id_ == 0) {
+            LOG_ERROR("engine: dlss_output_hdr allocation failed at {}x{} -- "
+                      "disengaging DLSS for this frame", output_w, output_h);
+            dlss_active_   = false;
+            dlss_output_w_ = dlss_output_h_ = 0;
+        }
+    } else if (!dlss_active_ && dlss_output_tex_id_ != 0) {
+        device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+        dlss_output_tex_id_ = 0;
+        dlss_output_w_ = dlss_output_h_ = 0;
+        // The feature itself holds far more VRAM than this texture does
+        // (DLSS's internal history pyramid). Give it back too rather
+        // than leaving a feature alive for a mode nobody selected.
+        device_->ReleaseUpscalerFeature();
+    }
+    if (dlss_active_ != dlss_engaged_logged_) {
+        if (dlss_active_) {
+            LOG_INFO("engine: DLSS engaged -- internal {}x{}, presented {}x{}; "
+                     "path tracer + denoiser chain run at the internal extent, "
+                     "DLSS reconstructs to the presentation extent, and the "
+                     "bloom + tonemap finalize runs on the reconstructed image",
+                     render_w, render_h, output_w, output_h);
+        } else {
+            LOG_INFO("engine: DLSS disengaged");
+        }
+        dlss_engaged_logged_ = dlss_active_;
+    }
+    // --- end DLSS display-extent HDR target --------------------------------
+
+    // The handle every "write the final image here" site binds. On an
+    // unscaled frame this IS fc.swapchain_image, so those sites are
+    // byte-identical to what they were before render scaling existed.
+    const pt::rhi::TextureHandle present_target =
+        render_scaled ? pt::rhi::TextureHandle{present_ldr_tex_id_}
+                      : fc.swapchain_image;
+    // Set true by the DLSS block further down once the NGX evaluate has
+    // actually recorded AND the tonemap finalize has written the
+    // swapchain from its display-extent output. Read by the bilinear
+    // resolve near the end of the frame, which must then NOT run --
+    // magnifying present_ldr over a swapchain DLSS already wrote would
+    // replace the reconstructed image with the soft one.
+    //
+    // It is deliberately a "did it happen" flag rather than "is DLSS on":
+    // when the evaluate fails (a resize race, a driver hiccup) the frame
+    // falls back to exactly the bilinear path it would have taken with
+    // r_dlss off, instead of presenting whatever the swapchain happened
+    // to contain.
+    bool dlss_wrote_swapchain = false;
+    // --- end render scale ---------------------------------------------------
 
     auto& cam = *camera_;
 
@@ -8069,9 +8881,6 @@ void Engine::RenderFrame() {
     const bool want_normal_gbuffer =
         (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
-         denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
@@ -8090,12 +8899,9 @@ void Engine::RenderFrame() {
     const bool want_albedo_gbuffer =
         (denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
-         denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
          // SVGF / NRD albedo demod (#119): the in-house chain reads
-         // albedo at the demod-divide site too, not just the MetalFX
-         // family. SvgfBasic / SvgfAtrous / Nrd join the gbuffer set.
+         // albedo at the demod-divide site too. SvgfBasic / SvgfAtrous /
+         // Nrd are the gbuffer set now that the MetalFX kinds are gone.
          denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
          denoiser_kind_ == DenoiserKind::Nrd);
@@ -8107,13 +8913,33 @@ void Engine::RenderFrame() {
     // 8x8 specular halos the user reported. Gated on MetalFX-family
     // kinds only -- SVGF / NRD / OptiX paths don't accept these
     // (separate issue for SVGF wiring; see #118's "Out of scope"
-    // section). All three travel together: they all feed the same
-    // MTLFXTemporalDenoisedScalerDescriptor so partial allocation
-    // would just stall on a half-bound scaler.
-    const bool want_specular_guidance_gbuffers =
-        (denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
+    // section). All three travel together -- a consumer that gets a
+    // partial set is worse off than one that gets none.
+    //
+    // THIS GATE USED TO TEST THE MetalFX KINDS, and that is precisely how the
+    // trio became dead code: MTLFXTemporalDenoisedScaler is an Apple API, no
+    // live backend could ever select those kinds, so the textures were never
+    // allocated, the write gates (keyed on texture-id != 0) never fired, and
+    // the shader paths that fill them never ran. The allocation, the push
+    // flags, the binds and the shader writes all still existed and were all
+    // unreachable. docs/DLSS_INTEGRATION_PLAN.md section 2.3 found it while
+    // listing what blocks Ray Reconstruction -- which needs exactly these
+    // three -- and the MetalFX removal is what frees them.
+    //
+    // Gated on RR INTENT rather than on a resolved denoiser kind, because
+    // allocation has to happen before the NGX feature is created: DLSS-RR is
+    // handed its guide buffers at creation time, not per-frame.
+    //
+    // KNOWN REMAINING COUPLING, stated rather than hidden: the allocation
+    // site this flag reaches sits inside `if (denoiser_active_)`, so asking
+    // for RR with `r_denoiser off` still allocates nothing. Every other
+    // G-buffer the path tracer produces (depth, motion, normal, albedo) has
+    // the same shape, so untangling it is one change for all of them, not a
+    // special case for these three -- and it belongs to whoever wires the
+    // NGX evaluate, because plan section 5.1 has RR REPLACING the denoiser
+    // chain rather than composing with it. Until then, exercising the guide
+    // writes needs an r_denoiser kind selected alongside r_dlss_rr.
+    const bool want_specular_guidance_gbuffers = DlssRayReconstructionRequested();
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -8413,7 +9239,7 @@ void Engine::RenderFrame() {
                 });
                 albedo_tex_id_ = albedo_h.id;
                 LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) "
-                         "(consumers: OptiX AOV, MetalFX, SVGF demod)", fc.width, fc.height);
+                         "(consumers: OptiX AOV, SVGF/NRD demod)", fc.width, fc.height);
             } else {
                 albedo_tex_id_ = 0;
             }
@@ -8456,7 +9282,7 @@ void Engine::RenderFrame() {
                     .debug_name = "denoise_specular_hit_distance",
                 });
                 specular_hit_distance_tex_id_ = spec_hit_dist_h.id;
-                LOG_INFO("engine: allocated MetalFX specular guidance G-buffers ({}x{}) "
+                LOG_INFO("engine: allocated specular guidance G-buffers ({}x{}) "
                          "[specular_albedo RGBA16F + roughness R32F + specular_hit_distance R32F]",
                          fc.width, fc.height);
             } else {
@@ -8528,6 +9354,54 @@ void Engine::RenderFrame() {
         }
     }
 
+    // DLSS exposure texture (docs/DLSS_INTEGRATION_PLAN.md 2.3 item 4).
+    // 1x1 R32F holding the same pre-tonemap multiplier exposure_state[0]
+    // carries, because NGX takes the exposure as a texture and cannot read
+    // a storage buffer. Resolution-independent, so it deliberately does NOT
+    // ride the size_changed G-buffer block above -- its only lifetime input
+    // is whether the user has asked for DLSS at all, which is a cvar they
+    // can flip at runtime. Created / destroyed here, BEFORE the frame's
+    // command buffer is acquired, because DestroyTexture wait-idles the
+    // device and must not land in the middle of recording.
+    {
+        const bool want_exposure_tex = DlssRequested();
+        if (want_exposure_tex && exposure_texture_id_ == 0) {
+            auto eh = device_->CreateTexture({
+                .width = 1, .height = 1,
+                .format = pt::rhi::TextureFormat::R32F,
+                .usage  = pt::rhi::TextureUsage::Storage,
+                .debug_name = "dlss_exposure",
+            });
+            exposure_texture_id_ = eh.id;
+            if (exposure_texture_id_ == 0) {
+                LOG_ERROR("dlss_exposure 1x1 R32F creation failed -- DLSS will "
+                          "have to fall back to NGX auto-exposure");
+            } else {
+                // Seed with the live scalar so the very first DLSS frame does
+                // not read an undefined image. AutoExposure overwrites it one
+                // frame later in auto mode; in manual mode this IS the value
+                // and the r_exposure / r_auto_exposure handlers keep it fresh.
+                float seed = 1.0f;
+                auto& Cs = pt::console::Console::Get();
+                bool auto_exp_seed = true;
+                if (auto* av = Cs.FindCVar("r_auto_exposure")) auto_exp_seed = av->GetBool();
+                if (!auto_exp_seed) {
+                    if (auto* ev = Cs.FindCVar("r_exposure")) seed = ev->GetFloat();
+                } else if (exposure_state_id_ != 0) {
+                    float live = 1.0f;
+                    if (device_->ReadbackBuffer(pt::rhi::BufferHandle{exposure_state_id_},
+                                                &live, sizeof(float))) {
+                        seed = live;
+                    }
+                }
+                device_->WriteTexture(eh, &seed, sizeof(float));
+            }
+        } else if (!want_exposure_tex && exposure_texture_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{exposure_texture_id_});
+            exposure_texture_id_ = 0;
+        }
+    }
+
     auto* cb = device_->AcquireCommandBuffer();
     // --- #259 / #133 Phase 2: the ocean cascade pre-pass -------------------
     // FIRST in the frame's command buffer, before PathTrace's pipeline is
@@ -8552,7 +9426,16 @@ void Engine::RenderFrame() {
     }
     GpuPassMark(cb, "PathTrace");
     cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
-    cb->BindStorageTexture(0, fc.swapchain_image);
+    // Engine texture slot 0 is `output` in PathTrace.slang -- the
+    // inline-tonemap destination AND the texture whose GetDimensions()
+    // sets the whole kernel's notion of screen size (thread bounds,
+    // primary-ray uv, motion-vector pixel space, and the ray-cone
+    // spread that drives texture LOD and the star PSF). Binding the
+    // internal-extent target here is therefore what makes render
+    // scaling correct rather than merely smaller: every angular
+    // quantity in the megakernel follows the internal extent because
+    // it is derived from this binding.
+    cb->BindStorageTexture(0, present_target);
     cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
 
     // Slot mapping (matches PathTrace.slang and the Metal-buffer layout
@@ -9278,7 +10161,13 @@ void Engine::RenderFrame() {
         std::uint32_t write_specular_albedo_gbuffer;
         std::uint32_t write_roughness_gbuffer;
         std::uint32_t write_specular_hit_distance_gbuffer;
-        std::uint32_t _pad_specular_gbuffers0;
+        // NRD first-bounce hit distance (issue #50). Occupies what used
+        // to be `_pad_specular_gbuffers0` -- same wire offset, no push
+        // growth. 1 -> PathTrace stashes the primary-hit -> first-
+        // indirect-hit distance in denoise_color.a for NrdPack.slang to
+        // fold into IN_DIFF_RADIANCE_HITDIST.w. Set only for
+        // DenoiserKind::Nrd on a build with a live NRD library.
+        std::uint32_t write_nrd_hitdist;
         // --- Water Phase 1 (#134) ----------------------------------------
         // water_params0.xyz = absorption per channel (1/m, Beer's law);
         //                .w = ior (clamped to [1.0, 2.4] in shader).
@@ -9753,12 +10642,13 @@ void Engine::RenderFrame() {
     // denoiser_kind_ that flips want_albedo_gbuffer above.
     push.write_albedo_gbuffer =
         (denoiser_active_ && albedo_tex_id_ != 0) ? 1u : 0u;
-    // MetalFX specular-guidance G-buffer write gates (issue #118). Same
-    // gating logic as the normal/albedo gates: only ever set when the
-    // engine actually owns the matching texture for this dispatch.
-    // The host's want_specular_guidance_gbuffers flag drives allocation
-    // (set only for DenoiserKind::MetalFX / SvgfBasicMetalFx /
-    // SvgfAtrousMetalFx); the runtime gate here is the descriptor-
+    // Specular-guidance G-buffer write gates. Same gating logic as the
+    // normal/albedo gates: only ever set when the engine actually owns the
+    // matching texture for this dispatch. The host's
+    // want_specular_guidance_gbuffers flag drives allocation (it is
+    // DlssRayReconstructionRequested(); it used to name the MetalFX denoiser
+    // kinds, which no live backend could select -- that is what made the
+    // trio dead code); the runtime gate here is the descriptor-
     // is-actually-bound signal. Under partially-bound semantics the
     // shader-side write MUST elide when the slot is unbound; the
     // per-texture gate is what enables that elision.
@@ -9768,7 +10658,15 @@ void Engine::RenderFrame() {
         (denoiser_active_ && roughness_tex_id_ != 0) ? 1u : 0u;
     push.write_specular_hit_distance_gbuffer =
         (denoiser_active_ && specular_hit_distance_tex_id_ != 0) ? 1u : 0u;
-    push._pad_specular_gbuffers0 = 0u;
+    // NRD first-bounce hit distance (issue #50). `nrd_lib_active_` was
+    // refreshed from Device::SupportsNrdLibrary() earlier in this
+    // frame -- it is false on a build without PT_ENABLE_NRD and on a
+    // build where NRD's instance creation failed, so the extra
+    // trace-loop capture (and the denoise_color.a semantic change it
+    // implies) never runs on any other path.
+    push.write_nrd_hitdist =
+        (denoiser_active_ && denoiser_kind_ == DenoiserKind::Nrd &&
+         nrd_lib_active_) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -10070,22 +10968,10 @@ void Engine::RenderFrame() {
     // chain on MetalFX-family kinds. Must run BEFORE the PushConstants
     // emit below (line 6837) so PathTrace.slang sees push.restir_enabled
     // == 0 and falls into the legacy NEE branch.
-    const bool kind_is_metalfx_family =
-        (denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
-    if (kind_is_metalfx_family && restir_dispatch_active) {
-        static bool s_restir_force_off_logged = false;
-        if (!s_restir_force_off_logged) {
-            LOG_INFO("engine: ReSTIR force-disabled for MetalFX-family kind "
-                     "(issue #164) -- MetalFX's TAA neighborhood clamp "
-                     "rejects ReSTIR's 1-survivor spike pattern, leaving "
-                     "analytic lights invisible. Falling back to PathTrace's "
-                     "per-spp legacy NEE for many-light variance.");
-            s_restir_force_off_logged = true;
-        }
-        restir_dispatch_active = false;
-    }
+    // ReSTIR was force-disabled here for the MetalFX-family kinds (#164):
+    // MetalFX's TAA neighbourhood clamp rejected ReSTIR's 1-survivor spike
+    // pattern. Those kinds are gone with the macOS backend, so the override
+    // is gone with them -- no live denoiser needs ReSTIR suppressed.
     push.restir_enabled = restir_dispatch_active ? 1u : 0u;
     // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
     // evaluates to 0 (so the user-visible "nothing happens" mismatch
@@ -10097,12 +10983,9 @@ void Engine::RenderFrame() {
         static bool s_restir_gate_failure_logged = false;
         // Skip this generic gate-failure log when the MetalFX-family
         // gate above already explained the disengagement (issue #164):
-        // the dedicated "ReSTIR force-disabled for MetalFX-family kind"
-        // log is the user-actionable message, and emitting the generic
-        // "denoiser_active=true, pipes=truetruetrue, ..." right after
-        // it would be redundant noise.
+        // (The MetalFX-family suppression this used to exclude is gone
+        // with those kinds; the generic message is now the only one.)
         if (restir_user_on && !restir_dispatch_active &&
-            !kind_is_metalfx_family &&
             !s_restir_gate_failure_logged) {
             LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
                      "(denoiser_active={}, pipes_t/s/f={}{}{}, "
@@ -10132,19 +11015,146 @@ void Engine::RenderFrame() {
     // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
-    // 16-sample period before repeating; ample for the denoiser's
-    // internal history depth. Use frame_index_ which already advanced
-    // above, so each frame's color ray is a unique sub-pixel sample.
+    // Period is r_camera_jitter_period frames (default 16 -- the value
+    // this has always used, ample for the denoiser's internal history
+    // depth). Use frame_index_ which already advanced above, so each
+    // frame's color ray is a unique sub-pixel sample.
+    //
+    // TWO CONSUMERS, one sequence. (1) The long-standing denoiser path:
+    // the offset travels in push.halton_jitter and PathTrace.slang
+    // applies it to sample 0 when a denoiser is active. (2) The opt-in
+    // r_camera_jitter path below, which bakes it into the camera basis
+    // for EVERY ray and zeroes the push field so the two cannot
+    // double-count.
     auto halton = [](std::uint32_t i, std::uint32_t base) -> float {
         float f = 1.0f, r = 0.0f;
         while (i > 0) { f /= float(base); r += f * float(i % base); i /= base; }
         return r;
     };
-    std::uint32_t hi = (push.frame_index % 16u) + 1u;
+    // Sequence period. The denoiser-side offset above has always used
+    // 16; r_camera_jitter_period lets the (opt-in) camera-shear path
+    // pick its own, because a temporal upscaler running at an
+    // aggressive render scale wants more phases than a denoiser does --
+    // DLSS's guide asks for base_period / scale^2. Reading the cvar
+    // unconditionally (rather than inside the jitter branch) keeps the
+    // two paths on one sequence definition; with r_camera_jitter off
+    // it resolves to 16 unless the operator deliberately changed it,
+    // and the DEFAULT value of 16 is what preserves the pre-existing
+    // denoiser jitter bit-for-bit.
+    std::uint32_t jitter_period = 16u;
+    if (auto* v = C.FindCVar("r_camera_jitter_period")) {
+        int n = v->GetInt();
+        if (n < 1)   n = 1;
+        if (n > 256) n = 256;
+        jitter_period = static_cast<std::uint32_t>(n);
+    }
+    std::uint32_t hi = (push.frame_index % jitter_period) + 1u;
     push.halton_jitter[0] = halton(hi, 2) - 0.5f;
     push.halton_jitter[1] = halton(hi, 3) - 0.5f;
     last_jitter_x_ = push.halton_jitter[0];
     last_jitter_y_ = push.halton_jitter[1];
+
+    // --- Deterministic camera jitter (r_camera_jitter) ---------------------
+    //
+    // WHY A CAMERA SHEAR AND NOT A SHADER FLAG. The primary ray the
+    // megakernel builds is
+    //
+    //     uv = ((tid + 0.5 + jitter) / dim) * 2 - 1;  uv.y = -uv.y
+    //     rd = fwd + right * (uv.x * aspect * fovYTan)
+    //              + up    * (uv.y * fovYTan)
+    //
+    // so a sub-pixel offset that is CONSTANT across the frame is
+    // algebraically identical to a constant addend on `rd` -- i.e. to
+    // shearing the camera's forward vector. Folding it into
+    // push.fwd_aspect.xyz on the host therefore needs no shader change
+    // and, more importantly, applies to every ray the frame traces:
+    // the spp loop, the unjittered-in-shader depth/motion G-buffer
+    // pass, and the eight downstream composite passes that rebuild the
+    // same primary ray from a memcpy of this camera basis. A temporal
+    // upscaler needs colour and depth jittered together and its motion
+    // vectors NOT jittered (NVIDIA's DLSS guide is explicit: motion
+    // vectors are jitter-free unless you set the jittered-MV flag), and
+    // that is exactly what this produces -- curr_view_proj / prev_view_
+    // proj below are built from the UNSHEARED basis, so the motion
+    // vectors stay clean.
+    //
+    // With the cvar off nothing here executes and push.fwd_aspect keeps
+    // the value written from `fwd` earlier: bit-identical.
+    bool want_camera_jitter = false;
+    if (auto* v = C.FindCVar("r_camera_jitter")) want_camera_jitter = v->GetBool();
+    // DLSS REQUIRES this, so it turns it on regardless of the cvar.
+    //
+    // This is not a convenience: the shear is what makes the jitter
+    // offset the engine REPORTS to DLSS true. With the cvar off, the
+    // path tracer draws an independent random sub-pixel offset per ray
+    // and there is no single frame offset to report -- FrameJitterX/Y()
+    // correctly return 0, and DLSS fed a constant zero jitter while the
+    // frames underneath it move randomly reconstructs a smeared image
+    // and cannot be debugged into working. It is also what fixes the two
+    // sampling breaks docs/DLSS_INTEGRATION_PLAN.md SS4.2 lists: every
+    // spp sample shares the offset (so the frame stays a point sample as
+    // r_spp rises), and the depth/motion G-buffer pass is jittered
+    // identically to the colour (so the guides describe the surface the
+    // colour sample actually hit).
+    //
+    // Forcing it here rather than writing the cvar keeps the user's
+    // setting intact: turn r_dlss off and r_camera_jitter means what it
+    // did before.
+    if (dlss_active_ && !want_camera_jitter) {
+        want_camera_jitter = true;
+        static bool s_logged_forced_jitter = false;
+        if (!s_logged_forced_jitter) {
+            LOG_INFO("engine: DLSS requires a reportable per-frame sub-pixel "
+                     "offset, so the deterministic camera jitter is forced on "
+                     "while r_dlss is not off (r_camera_jitter itself is left "
+                     "at the user's value). Halton(2,3), period "
+                     "r_camera_jitter_period.");
+            s_logged_forced_jitter = true;
+        }
+    }
+    camera_jitter_active_ = want_camera_jitter;
+    if (want_camera_jitter) {
+        const float jx = push.halton_jitter[0];
+        const float jy = push.halton_jitter[1];
+        // Pixel offset -> NDC offset, in the INTERNAL render extent
+        // (fc.width/fc.height carry that; see the render-scale block).
+        // The y flip mirrors the shader's `uv.y = -uv.y`.
+        const float fovYTan = push.pos_fovtan[3];
+        const float dux =  2.0f * jx / float(std::max(1u, fc.width));
+        const float duy = -2.0f * jy / float(std::max(1u, fc.height));
+        const float sx  = dux * push.fwd_aspect[3] * fovYTan;   // aspect
+        const float sy  = duy * fovYTan;
+        push.fwd_aspect[0] = fwd.x + right.x * sx + up.x * sy;
+        push.fwd_aspect[1] = fwd.y + right.y * sx + up.y * sy;
+        push.fwd_aspect[2] = fwd.z + right.z * sx + up.z * sy;
+        // The shader must not ALSO add its own offset on top: with a
+        // denoiser active it applies halton_jitter to sample 0, and
+        // that offset is now baked into the basis above. Zeroing the
+        // push field is what keeps the two from double-counting.
+        // last_jitter_x_/y_ deliberately keep the real value -- the
+        // denoiser's DenoiseDesc uses them to describe the offset the
+        // colour was rendered with, which is still exactly this.
+        push.halton_jitter[0] = 0.0f;
+        push.halton_jitter[1] = 0.0f;
+        frame_jitter_x_ = jx;
+        frame_jitter_y_ = jy;
+    } else {
+        // Honest report: with the cvar off there is no single offset
+        // that describes the frame (the path tracer draws an
+        // independent random one per ray), so we publish zero and
+        // JitterActive() == false rather than a number a future DLSS
+        // integration might mistake for the truth.
+        frame_jitter_x_ = 0.0f;
+        frame_jitter_y_ = 0.0f;
+    }
+    if (want_camera_jitter != camera_jitter_engaged_) {
+        LOG_INFO("engine: deterministic camera jitter {} -- Halton(2,3), "
+                 "period {} frames, internal extent {}x{}",
+                 want_camera_jitter ? "engaged" : "disengaged",
+                 jitter_period, fc.width, fc.height);
+        camera_jitter_engaged_ = want_camera_jitter;
+    }
+    // --- end deterministic camera jitter -----------------------------------
 
     // pad3 already 0.0f from value-init
     //
@@ -10810,17 +11820,22 @@ void Engine::RenderFrame() {
                 planet_dir_flux[slot][0] =  ce_p * std::sin(a_r);
                 planet_dir_flux[slot][1] =  se_p;
                 planet_dir_flux[slot][2] = -ce_p * std::cos(a_r);
-                // THE shared photometric scale. Same two functions every
-                // Bright Star Catalog entry goes through -- a planet at
-                // V = -2.7 must paint what a star at V = -2.7 paints.
+                // THE shared photometric scale, now in real lux. Same two
+                // functions every Bright Star Catalog entry goes through --
+                // a planet at V = -2.7 must paint what a star at V = -2.7
+                // paints.
                 const float vmag = static_cast<float>(pp.vmag);
                 planet_dir_flux[slot][3] =
-                    pt::stars::MagnitudeToFlux(vmag) * brightness;
+                    pt::stars::MagnitudeToIrradianceWm2(vmag) * brightness;
                 pt::stars::BvToLinearSrgbTint(
                     static_cast<float>(pt::astro::planetBvColorIndex(p)),
                     planet_tint_sigma[slot]);
+                // Optical PSF sigma -- magnitude-independent, exactly as
+                // for catalogue stars. planetSplat() floors it at half a
+                // pixel on its own (energy-preserving), so no sampling
+                // floor is imposed here.
                 planet_tint_sigma[slot][3] =
-                    pt::stars::SplatAngularRadiusRad(vmag) * size_mult;
+                    pt::stars::PsfSigmaRad(0.0f) * size_mult;
                 ++planet_slot_count;
             }
         }
@@ -12755,7 +13770,10 @@ void Engine::RenderFrame() {
             std::uint32_t width;
             std::uint32_t height;
             std::uint32_t stride;
-            std::uint32_t pad0;
+            // Was `pad0`; now AutoExposure.slang's write gate for the 1x1
+            // R32F DLSS exposure image at binding 48. Reusing the pad keeps
+            // the struct at 32 B, so both static_asserts below still hold.
+            std::uint32_t write_exposure_tex;
             float key;
             float exp_min;
             float exp_max;
@@ -12807,6 +13825,16 @@ void Engine::RenderFrame() {
         // declared buffer(7)) -- exposure converges to garbage.
         cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
         cb->BindBuffer(6, pt::rhi::BufferHandle{exposure_state_id_}, 0);
+        // DLSS exposure image. Bound and written only while it exists, i.e.
+        // only while the user has asked for DLSS -- the kernel's gate is the
+        // push flag, so with r_dlss off the image store is never reached and
+        // slot 19 is never bound (PARTIALLY_BOUND covers the empty slot).
+        // The write rides this kernel so the buffer and the image can never
+        // disagree: same invocation, same `current`.
+        if (exposure_texture_id_ != 0) {
+            cb->BindStorageTexture(19, pt::rhi::TextureHandle{exposure_texture_id_});
+            ae.write_exposure_tex = 1u;
+        }
         cb->PushConstants(&ae, sizeof(ae));
         cb->Dispatch(1, 1, 1);  // single workgroup of 64 threads
     }
@@ -12894,11 +13922,14 @@ void Engine::RenderFrame() {
         // tolerates it. MetalFX uses the diffuse albedo as a spatial-
         // filter guidance signal.
         dd.albedo_in     = pt::rhi::TextureHandle{albedo_tex_id_};
-        // MetalFX specular-guidance G-buffers (issue #118). Engine
-        // allocates these only for MetalFX-family kinds; for all
-        // other denoiser modes the IDs are 0 and the backend treats
-        // them as "no guidance for this frame" (matching the existing
-        // nil-handle convention used for albedo_in on SVGF/NRD).
+        // Specular-guidance G-buffers. Engine allocates these only when
+        // DLSS Ray Reconstruction is requested (they were gated on the
+        // MetalFX kinds, which no live backend could select -- that is what
+        // made them dead code); for every other mode the IDs are 0 and the
+        // backend treats them as "no guidance for this frame" (matching the
+        // existing nil-handle convention used for albedo_in on SVGF/NRD).
+        // See rhi/Device.h for what each one now actually contains -- the
+        // quantities changed with the consumer.
         dd.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
         dd.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
         dd.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
@@ -12934,18 +13965,19 @@ void Engine::RenderFrame() {
         // finalize step so it ignores this field either way.
         dd.final_output    = use_engine_tonemap
                                  ? pt::rhi::TextureHandle{0}
-                                 : fc.swapchain_image;
+                                 : present_target;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
+        // Same scalar, 1x1 R32F image, for NGX's pInExposureTexture. 0
+        // unless r_dlss != off; every other consumer ignores it.
+        dd.exposure_texture = pt::rhi::TextureHandle{exposure_texture_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
         dd.reset_history = !prev_frame_valid_;
         // Map the engine's denoiser kind to the RHI quality tier. Nrd
         // and the various Atrous variants all run the full a-trous
-        // chain; only SvgfBasic / SvgfBasicMetalFx skip the spatial
-        // filter. MetalFX ignores the quality field entirely.
+        // chain; only SvgfBasic skips the spatial filter.
         const bool quality_is_basic =
-            (denoiser_kind_ == DenoiserKind::SvgfBasic ||
-             denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx);
+            (denoiser_kind_ == DenoiserKind::SvgfBasic);
         dd.quality = quality_is_basic
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
@@ -13014,11 +14046,13 @@ void Engine::RenderFrame() {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
-        } else if (denoiser_kind_ == DenoiserKind::MetalFX) {
-            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::MetalFX;
-        } else if (denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx ||
-                   denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx) {
-            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfMetalFx;
+        } else if (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_) {
+            // Issue #50. `nrd` is no longer an alias for svgf_atrous:
+            // it routes to the real NVIDIA RayTracingDenoiser when the
+            // build has one. Without it we fall through to Kind::Svgf
+            // below, which is the documented graceful degradation (the
+            // transition log above already told the user).
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Nrd;
         } else {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
         }
@@ -13433,8 +14467,14 @@ void Engine::RenderFrame() {
         // engine cb can't safely interleave a StarsComposite dispatch
         // between OptiX's input copy and its deferred finalize. OptiX +
         // StarsComposite is its own follow-up if a user needs it.
+        // DLSS takes over the whole "render extent -> presentation
+        // extent" hand-off, so it replaces the dual-Denoise sequence
+        // rather than composing with it -- see the block below for the
+        // ordering it uses instead. Excluded here so the two cannot both
+        // claim the finalize and write the swapchain twice.
         const bool vulkan_dual_denoise =
-            (!backend_is_metal && denoiser_active_ &&
+            (!backend_is_metal && denoiser_active_ && !dlss_active_ &&
+             denoiser_kind_ != DenoiserKind::Off &&
              engine_composite_active && !kind_is_optix &&
              device_->SupportsDenoise() &&
              post_denoise_hdr_tex_id_ != 0);
@@ -13454,7 +14494,15 @@ void Engine::RenderFrame() {
         // above was just unused setup work. The downstream branches
         // (use_vulkan_bloom_finalize on Vulkan, use_engine_tonemap on
         // Metal) still write the swapchain from denoise_color.
-        if (denoiser_active_) {
+        //
+        // NOTE the `denoiser_kind_ != Off` term. denoiser_active_ now
+        // means "the G-buffer machinery is alive", and DLSS turns it on
+        // even with r_denoiser off (see the want_denoiser comment). This
+        // is the one site that has to ask the narrower question, because
+        // dd.kind defaults to Kind::Svgf -- without the term, `r_dlss
+        // quality` + `r_denoiser off` would silently run the SVGF chain.
+        if (denoiser_active_ && denoiser_kind_ != DenoiserKind::Off &&
+            !dlss_active_) {
             PT_ZONE_SCOPED_N("Device::Denoise");
             if (vulkan_dual_denoise) {
                 // Step 1: SVGF chain that stops before the internal
@@ -13462,7 +14510,23 @@ void Engine::RenderFrame() {
                 // dd.kind and (for SvgfNoFinalize) routes through
                 // VulkanNrdDenoiser::Encode with final_output=0, which
                 // leaves the denoised linear-HDR in dd.output.
-                dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                // Issue #50: the NRD library path expresses the same
+                // "stop before the finalize" contract by zeroing
+                // final_output (Kind::SvgfNoFinalize is the SVGF-only
+                // spelling of it -- VulkanDevice zeroes final_output
+                // internally for that kind). Without this branch the
+                // dual-Denoise path would silently route every frame
+                // after StarsComposite engages back through SVGF, and
+                // `r_denoiser nrd` would only reach NRD on the handful
+                // of frames before the composite turns on.
+                const bool step1_is_nrd =
+                    (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_);
+                dd.kind = step1_is_nrd
+                              ? pt::rhi::Device::DenoiseDesc::Kind::Nrd
+                              : pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                if (step1_is_nrd) {
+                    dd.final_output = pt::rhi::TextureHandle{0};
+                }
                 device_->Denoise(dd);
                 // Step 2: stateless celestial composite over the same
                 // texture. composite_stars_to issues its own RAW barrier
@@ -13475,12 +14539,171 @@ void Engine::RenderFrame() {
                 // Svgf-path setup and apply to FinalizeOnly identically.
                 dd.kind         = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
                 dd.color_in     = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
-                dd.final_output = fc.swapchain_image;
+                dd.final_output = present_target;
                 device_->Denoise(dd);
             } else {
                 device_->Denoise(dd);
             }
         }
+
+        // ---- DLSS Super Resolution / DLAA sequence ----------------------
+        //
+        // THE PASS ORDERING, and why it is this and not the dual-Denoise
+        // sequence it replaces (docs/DLSS_INTEGRATION_PLAN.md SS5.2):
+        //
+        //   at the RENDER extent
+        //     PathTrace (jittered colour AND jittered G-buffers, because
+        //       the jitter is a camera-basis shear -- see the
+        //       want_camera_jitter block)
+        //     -> denoiser chain, if r_denoiser selects one, stopping
+        //        BEFORE its finalize so the result stays linear HDR
+        //     -> celestial composite
+        //     -> `dlss_src`: noisy-or-denoised linear HDR
+        //   the boundary
+        //     -> DLSS evaluate: dlss_src + depth + motion + this frame's
+        //        jitter  ->  dlss_output_hdr at the DISPLAY extent
+        //   at the DISPLAY extent
+        //     -> bloom composite + tonemap + sRGB OETF -> swapchain,
+        //        via Denoise(Kind::FinalizeOnly), which derives its
+        //        dispatch extent from color_in and therefore runs at the
+        //        display extent with no further plumbing
+        //
+        // WHERE THIS DEVIATES FROM THE PLAN, deliberately and with the
+        // cost stated: SS5.2 wants the celestial composite AFTER the
+        // upscale, because stars are sub-pixel point sources with an
+        // energy-conserving PSF and a neural reconstructor at render
+        // resolution will smear them. That is correct and it is not done
+        // here. StarsComposite reads depth_tex and indexes it with the
+        // same tid it uses for its output target, so compositing at the
+        // display extent requires a DISPLAY-EXTENT DEPTH BUFFER, which
+        // the engine does not have and which is not a change to this
+        // pass -- it is a change to what the path tracer produces. The
+        // honest consequence: with r_dlss on and celestials composited,
+        // stars go through the reconstructor. That is a quality
+        // regression on night scenes specifically, it is why this frame
+        // graph is not finished, and it is the first thing to fix after
+        // the SR path is proven.
+        //
+        // The bloom pyramid is built at the render extent from
+        // denoise_color and composited onto the display-extent image.
+        // That one is fine rather than a compromise: DenoiseFinalize's
+        // sampleBloom maps (tid + 0.5) * bloom_dim / dim, i.e. by
+        // fraction of the frame, so a pyramid built at any extent lands
+        // correctly on a target of any other extent -- and bloom is a
+        // low-frequency signal, which is exactly what survives that.
+        if (dlss_active_ && dlss_output_tex_id_ != 0 &&
+            denoise_color_tex_id_ != 0 && depth_tex_id_ != 0 &&
+            motion_tex_id_ != 0) {
+            PT_ZONE_SCOPED_N("Device::Upscale(DLSS)");
+
+            // Step 1 -- produce linear HDR at the render extent.
+            //
+            // With a denoiser selected, run its chain but stop before
+            // the finalize (final_output = 0), leaving the denoised
+            // result in post_denoise_hdr. With r_denoiser off, DLSS
+            // consumes the path tracer's raw per-frame radiance
+            // directly, which is what denoise_color already holds.
+            std::uint64_t dlss_src_id = denoise_color_tex_id_;
+            if (denoiser_kind_ != DenoiserKind::Off &&
+                post_denoise_hdr_tex_id_ != 0 && !kind_is_optix) {
+                const bool step1_is_nrd =
+                    (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_);
+                dd.kind = step1_is_nrd
+                              ? pt::rhi::Device::DenoiseDesc::Kind::Nrd
+                              : pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                dd.color_in     = pt::rhi::TextureHandle{denoise_color_tex_id_};
+                dd.output       = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
+                dd.final_output = pt::rhi::TextureHandle{0};
+                device_->Denoise(dd);
+                dlss_src_id = post_denoise_hdr_tex_id_;
+            }
+
+            // Step 2 -- celestial composite, at the render extent. See
+            // the deviation note above. No-ops when the composite is not
+            // active, in which case PathTrace rendered celestials inline
+            // and there is nothing to add back.
+            composite_stars_to(dlss_src_id);
+
+            // Step 3 -- the reconstruction itself.
+            pt::rhi::UpscaleDesc ud{};
+            ud.color_in  = pt::rhi::TextureHandle{dlss_src_id};
+            ud.depth_in  = pt::rhi::TextureHandle{depth_tex_id_};
+            ud.motion_in = pt::rhi::TextureHandle{motion_tex_id_};
+            ud.output    = pt::rhi::TextureHandle{dlss_output_tex_id_};
+            ud.render_width   = render_w;
+            ud.render_height  = render_h;
+            ud.display_width  = output_w;
+            ud.display_height = output_h;
+            // FrameJitterX/Y(), not last_jitter_x_/y_. The two differ:
+            // last_jitter_* is the raw Halton value the denoiser has
+            // consumed since long before any of this existed, while
+            // frame_jitter_* is the offset that was ACTUALLY applied to
+            // the camera basis -- zero if the shear did not run. DLSS
+            // must be told what the frame was really sampled at, so it
+            // gets the second one. (They are equal on every DLSS frame,
+            // because DLSS forces the shear on; using the honest field
+            // is what keeps them equal if that ever changes.)
+            ud.jitter_x = FrameJitterX();
+            ud.jitter_y = FrameJitterY();
+            // Pixel-space motion needs no rescale (plan SS2.1 caveat C).
+            ud.mv_scale_x = 1.0f;
+            ud.mv_scale_y = 1.0f;
+            ud.reset_history = !prev_frame_valid_;
+            ud.hdr           = dd_hdr_pipeline;
+            // Auto-exposure: let DLSS meter the HDR input itself. The
+            // engine's exposure_state is a POST-tonemap scalar in a
+            // storage buffer, not the 1x1 R32F pre-exposure texture NGX
+            // wants, and this renderer's radiance spans many decades.
+            // Plan SS2.1 caveat E stages the alternative; step (1) there
+            // is exactly this.
+            ud.auto_exposure = true;
+            ud.pre_exposure  = 1.0f;
+            // 0 = "unknown", which is the documented value for this
+            // optional field. The engine has no single frame-delta
+            // member to hand over (the perf overlay derives its numbers
+            // from GPU timestamps and a separate CPU clock), and
+            // inventing one from the wrong clock would be worse than
+            // saying nothing: the runtime uses it to reason about how
+            // far the scene moved between samples.
+            ud.frame_time_delta_ms = 0.0f;
+            ud.mode = dlss_mode_;
+            // The RR seam, populated but not acted on by the SR path --
+            // a separate workstream owns the NGX RR feature. Filling
+            // these in costs nothing and means that workstream changes
+            // the backend, not this call site.
+            ud.ray_reconstruction       = DlssRayReconstructionRequested();
+            ud.albedo_in                = pt::rhi::TextureHandle{albedo_tex_id_};
+            ud.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
+            ud.normal_in                = pt::rhi::TextureHandle{normal_tex_id_};
+            ud.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
+            ud.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
+            ud.world_to_view = glm::value_ptr(view);
+            ud.view_to_clip  = glm::value_ptr(proj);
+
+            const bool upscaled = device_->Upscale(ud);
+
+            // Step 4 -- bloom + tonemap + sRGB + swapchain.
+            //
+            // On success this runs at the DISPLAY extent over DLSS's
+            // output and writes the swapchain directly, and the bilinear
+            // resolve later in the frame is suppressed.
+            //
+            // On failure it runs at the RENDER extent over the same
+            // image the upscaler was going to read, writing
+            // present_target -- i.e. the frame degrades into exactly the
+            // bilinear render-scale path, which the resolve at the end
+            // of the frame then completes. A dropped upscale therefore
+            // costs sharpness for one frame rather than presenting an
+            // unwritten swapchain.
+            dd.kind         = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
+            dd.color_in     = upscaled
+                                  ? pt::rhi::TextureHandle{dlss_output_tex_id_}
+                                  : pt::rhi::TextureHandle{dlss_src_id};
+            dd.final_output = upscaled ? fc.swapchain_image : present_target;
+            device_->Denoise(dd);
+            dlss_wrote_swapchain = upscaled;
+        }
+        // ---- end DLSS sequence ------------------------------------------
 
         // Vulkan bloom-without-denoiser: build the bloom pyramid from
         // PathTrace's denoise_color, then call Denoise(FinalizeOnly)
@@ -13507,7 +14730,7 @@ void Engine::RenderFrame() {
             // / exposure_state / hdr_pipeline when kind == FinalizeOnly.
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
             dd.color_in     = pt::rhi::TextureHandle{denoise_color_tex_id_};
-            dd.final_output = fc.swapchain_image;
+            dd.final_output = present_target;
             dd.bloom_in     = (bloom_can_run && bloom_mip_tex_id_[0] != 0)
                                   ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                   : pt::rhi::TextureHandle{0};
@@ -14272,7 +15495,7 @@ void Engine::RenderFrame() {
         GpuPassMark(cb, "Tonemap");
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
-        cb->BindStorageTexture(1, fc.swapchain_image);
+        cb->BindStorageTexture(1, present_target);
         // exposure_state is already bound at engine slot 6 from the
         // path-trace dispatch earlier this frame. Tonemap.slang has
         // been padded with dummy bindings so its MSL emission puts
@@ -14537,6 +15760,80 @@ void Engine::RenderFrame() {
         vulkan_optix_bloom_engaged_ = false;
     }
 
+    // ---- Render-scale resolve (r_render_scale) ---------------------------
+    //
+    // THE BOUNDARY. Everything above this line ran at the internal
+    // extent; everything below runs at the presentation extent. Whoever
+    // produced the final image this frame -- the path tracer's inline
+    // tonemap, VulkanNrdDenoiser's finalize, or Tonemap.slang -- wrote
+    // it into `present_target`, which on a scaled frame is the
+    // internal-extent `present_ldr` texture rather than the swapchain.
+    // This pass magnifies it onto the swapchain.
+    //
+    // Elided entirely at r_render_scale = 1.0: `render_scaled` is false,
+    // present_target IS the swapchain, and the frame is byte-identical
+    // to the pre-render-scale engine.
+    //
+    // Placed AFTER every colour pass and BEFORE the editor gizmo and the
+    // perf HUD, because those two are UI: drawing them at the internal
+    // extent and then magnifying would give the operator soft, blurred
+    // gizmo handles and an unreadable HUD. They are the only two passes
+    // downstream of here, and both use output_w / output_h rather than
+    // fc.width / fc.height for exactly this reason.
+    //
+    // DLSS replaces this dispatch, and MOVES the boundary upstream of
+    // it. Per docs/DLSS_INTEGRATION_PLAN.md SS5.2 the upscaler consumes
+    // the internal-extent noisy linear HDR plus depth / motion (all
+    // still allocated at fc.width x fc.height above) and
+    // FrameJitterX/Y(), and emits display-resolution linear HDR --
+    // after which the celestial composite, the bloom pyramid and the
+    // tonemap all want to run at DISPLAY resolution, because stars are
+    // sub-pixel point sources a neural reconstructor would smear. So
+    // this pass goes away and the passes above it split around the new
+    // boundary. What survives unchanged is the extent bookkeeping: the
+    // internal/output split, output_w / output_h for anything past the
+    // boundary, and the rule that a pass which derives a pixel
+    // footprint must say which extent it means.
+    //
+    // DLSS suppresses this pass -- but via `dlss_wrote_swapchain`, which
+    // is "the evaluate actually ran AND the finalize wrote the swap",
+    // not "r_dlss is on". A frame where the NGX evaluate was skipped
+    // (resize race, transient driver failure) has written present_ldr
+    // instead, and must still get magnified here or the presented image
+    // is whatever was left in the swapchain.
+    if (render_scaled && !dlss_wrote_swapchain && upscale_pipeline_id_ != 0 &&
+        present_ldr_tex_id_ != 0) {
+        // RAW on present_ldr: the pass that wrote it (path tracer /
+        // denoiser finalize / tonemap) is a compute write and this is
+        // a compute read.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+        GpuPassMark(cb, "Upscale");
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{upscale_pipeline_id_});
+        // Engine texture slot 0 -> vk::binding(0) = dst (swapchain),
+        // slot 1 -> vk::binding(1) = src (present_ldr). Slot 1 is
+        // `accum_hdr` for the path tracer; the shared descriptor-set
+        // layout only fixes the descriptor TYPE per binding and both
+        // are storage images, so the reuse is the same pattern
+        // StarsComposite.slang already relies on. See Upscale.slang.
+        cb->BindStorageTexture(0, fc.swapchain_image);
+        cb->BindStorageTexture(1, pt::rhi::TextureHandle{present_ldr_tex_id_});
+        struct UpscalePush {
+            std::uint32_t src_w, src_h;
+            std::uint32_t dst_w, dst_h;
+        } up{ render_w, render_h, output_w, output_h };
+        static_assert(sizeof(UpscalePush) == 16,
+                      "UpscalePush must match the Push cbuffer in "
+                      "shaders/Upscale.slang");
+        cb->PushConstants(&up, sizeof(up));
+        cb->Dispatch((output_w + 7) / 8, (output_h + 7) / 8, 1);
+        // The gizmo / HUD passes below read-modify-write the swapchain
+        // this pass just wrote.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeWrite});
+    }
+    // ---- end render-scale resolve ----------------------------------------
+
     // ---- Editor 3D-transform gizmo dispatch (issue: editor 3D gizmos) ----
     //
     // Post-tonemap, pre-perf-overlay. Writing into the swapchain image
@@ -14597,8 +15894,16 @@ void Engine::RenderFrame() {
         const glm::vec3 fwd_v   = C2.Forward();
         const glm::vec3 right_v = C2.Right();
         const glm::vec3 up_v    = C2.Up();
-        const float aspect_ratio = (fc.height > 0)
-                                      ? float(fc.width) / float(fc.height)
+        // OUTPUT extent, not fc.width/fc.height (which carry the
+        // internal render extent under r_render_scale): this pass runs
+        // AFTER the render-scale resolve and rasterizes straight into
+        // the swapchain. Same number whenever the scale is 1.0, and
+        // the same aspect ratio either way -- the scale is uniform --
+        // but the dispatch bounds below genuinely differ, and getting
+        // those from the internal extent would confine the gizmo to
+        // the top-left corner of the presented image.
+        const float aspect_ratio = (output_h > 0)
+                                      ? float(output_w) / float(output_h)
                                       : 1.0f;
         ep.pos_fovtan[0] = static_cast<float>(C2.pos_w.x);
         ep.pos_fovtan[1] = static_cast<float>(C2.pos_w.y);
@@ -14619,7 +15924,7 @@ void Engine::RenderFrame() {
         ep.num_segments = std::min(editor_gizmo_.SegmentCount(),
                                    editor_overlay_segs_buf_capacity_);
         cb->PushConstants(&ep, sizeof(ep));
-        cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+        cb->Dispatch((output_w + 7) / 8, (output_h + 7) / 8, 1);
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel
@@ -14658,14 +15963,19 @@ void Engine::RenderFrame() {
             // than the margin -- unsigned subtraction would underflow
             // to a huge value and produce wild panel coords / sizes.
             // It's just a HUD; no harm in dropping it for a tiny window.
-            if (fc.width <= kPanelMargin || fc.height <= kPanelMargin) {
+            //
+            // OUTPUT extent, not fc.width/fc.height: the HUD is drawn
+            // into the swapchain AFTER the render-scale resolve, so its
+            // corner is the corner of the presented image. Identical
+            // numbers at r_render_scale 1.0.
+            if (output_w <= kPanelMargin || output_h <= kPanelMargin) {
                 panel_w = panel_h = 0;
             } else {
-                if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
-                if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
+                if (panel_w + kPanelMargin > output_w) panel_w = output_w - kPanelMargin;
+                if (panel_h + kPanelMargin > output_h) panel_h = output_h - kPanelMargin;
             }
-            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > fc.width)
-                                  ? 0u : fc.width - panel_w - kPanelMargin;
+            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > output_w)
+                                  ? 0u : output_w - panel_w - kPanelMargin;
             std::uint32_t panel_y = kPanelMargin;
 
             if (panel_w == 0u || panel_h == 0u) {
@@ -15442,8 +16752,17 @@ void Engine::HandleMouseInput() {
                 }
             }
 
-            const int hit_w = accum_w_ > 0 ? accum_w_ : w;
-            const int hit_h = accum_h_ > 0 ? accum_h_ : h;
+            // OUTPUT extent, not the accumulator's. The cursor
+            // position this hit-test is matched against is in window
+            // pixels and the gizmo is rasterized into the swapchain
+            // (after the render-scale resolve), so the screen space the
+            // projection has to agree with is the PRESENTED one. Under
+            // r_render_scale the accumulator is smaller than that, and
+            // using it would put every gizmo handle's hit region at the
+            // wrong place by exactly the scale factor. Identical to the
+            // old expression at scale 1.0.
+            const int hit_w = output_w_ > 0 ? static_cast<int>(output_w_) : w;
+            const int hit_h = output_h_ > 0 ? static_cast<int>(output_h_) : h;
             const float hit_aspect = (hit_h > 0) ? float(hit_w) / float(hit_h) : aspect;
             if (can_hit_gizmo &&
                 editor_gizmo_.HitTest(gizmo_origin, gizmo_size,
@@ -15568,7 +16887,17 @@ void Engine::Tick(double dt) {
     if (!pending_swap_screenshot_path_.empty() && device_ != nullptr) {
         std::uint32_t sw = 0, sh = 0;
         pt::rhi::Device::SwapFormat fmt = pt::rhi::Device::SwapFormat::Other;
-        std::vector<std::uint8_t> raw(std::size_t(accum_w_) * accum_h_ * 4u);
+        // Sized from the OUTPUT extent, not accum_w_/accum_h_. Under
+        // r_render_scale the accumulator is the INTERNAL extent, which
+        // is smaller than the swapchain -- and ReadbackSwapchain's
+        // pre-flight extent check rejects an undersized destination by
+        // returning false forever, so the poll below would spin out its
+        // whole 5-second budget and report "never consumed by Submit"
+        // for what is really a buffer that was allocated too small.
+        // output_w_/output_h_ equal accum_w_/accum_h_ at scale 1.0.
+        const std::size_t swap_bytes =
+            std::size_t(output_w_) * std::size_t(output_h_) * 4u;
+        std::vector<std::uint8_t> raw(swap_bytes);
         const bool ready = device_->ReadbackSwapchain(raw.data(), raw.size(),
                                                       &sw, &sh, &fmt);
         if (ready && sw > 0 && sh > 0) {
@@ -15849,6 +17178,11 @@ void Engine::Tick(double dt) {
             st.backend      = pt::rhi::BackendName(current_backend_);
             st.width        = w;
             st.height       = h;
+            // r_render_scale: the extent the path tracer actually ran
+            // at this frame, which the HUD prints next to the window
+            // extent when the two differ. Zero until the first frame.
+            st.render_width  = static_cast<int>(render_w_);
+            st.render_height = static_cast<int>(render_h_);
             st.gpu_bytes    = device_ ? device_->CurrentAllocatedBytes() : 0;
             if (auto* sv = Cn.FindCVar("r_spp"))         st.spp         = sv->GetInt();
             if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
@@ -16121,13 +17455,44 @@ void Engine::Run() {
             // bitwise-identical PNGs across svgf_atrous / optix_hdr /
             // optix_hdr_aov -- defeating the whole point of a
             // (backend, denoiser, scene) matrix.
-            const auto kind = denoiser_active_
+            //
+            // DLSS takes precedence over both. Two reasons, and the
+            // first one is a correctness bug rather than a preference:
+            //
+            //  1. `denoiser_active_` no longer implies a denoiser RAN.
+            //     It means "the G-buffer machinery is alive", and DLSS
+            //     turns it on even with r_denoiser off -- in which case
+            //     post_denoise_hdr was allocated but never written, and
+            //     capturing it would produce an undefined image while
+            //     reporting success.
+            //  2. Even with a denoiser on, post_denoise_hdr is the
+            //     RENDER-extent image DLSS consumed. Capturing it would
+            //     make every DLSS mode produce a differently-sized PNG
+            //     of the thing DLSS was given rather than the thing DLSS
+            //     produced -- i.e. it could not see the feature at all.
+            //
+            // dlss_output_hdr is RGBA16F at the display extent, the same
+            // format/space as post_denoise_hdr, so the host-side tonemap
+            // below is unchanged.
+            const bool capture_dlss =
+                (dlss_active_ && dlss_output_tex_id_ != 0 &&
+                 dlss_output_w_ > 0 && dlss_output_h_ > 0);
+            const auto kind = (capture_dlss || denoiser_active_)
                 ? pt::engine::CaptureSourceKind::DenoiseColor
                 : pt::engine::CaptureSourceKind::Accum;
-            const std::uint64_t tex_id = denoiser_active_
-                ? post_denoise_hdr_tex_id_
-                : accum_texture_id_;
-            const int bytes_per_pixel = denoiser_active_ ? 8 : 16;  // half / float
+            const std::uint64_t tex_id = capture_dlss
+                ? dlss_output_tex_id_
+                : (denoiser_active_ ? post_denoise_hdr_tex_id_
+                                    : accum_texture_id_);
+            const int bytes_per_pixel =
+                (capture_dlss || denoiser_active_) ? 8 : 16;  // half / float
+            // The staging allocation must cover the SOURCE texture, and
+            // on the DLSS path that is the display extent, not accum_*
+            // (which follows the internal render extent).
+            const std::uint32_t cap_w =
+                capture_dlss ? dlss_output_w_ : static_cast<std::uint32_t>(accum_w_);
+            const std::uint32_t cap_h =
+                capture_dlss ? dlss_output_h_ : static_cast<std::uint32_t>(accum_h_);
 
             // Drain in-flight work so the readback sees the last frame's
             // submitted writes, not an in-progress dispatch.
@@ -16147,7 +17512,7 @@ void Engine::Run() {
                 smoke_test_failed_ = true;
             } else {
                 std::vector<std::uint8_t> raw(
-                    std::size_t(accum_w_) * accum_h_ * bytes_per_pixel);
+                    std::size_t(cap_w) * cap_h * bytes_per_pixel);
                 std::uint32_t rb_w = 0, rb_h = 0;
                 if (!device_->ReadbackTexture(pt::rhi::TextureHandle{tex_id},
                                               raw.data(), raw.size(),
@@ -16156,7 +17521,7 @@ void Engine::Run() {
                     LOG_ERROR("smoke-capture: ReadbackTexture failed "
                               "(tex_id={}, {}x{}). Failing the smoke "
                               "test (exit code 2).",
-                              tex_id, accum_w_, accum_h_);
+                              tex_id, cap_w, cap_h);
                     smoke_test_failed_ = true;
                 } else {
                     // Resolve the live exposure scalar so the host-side
@@ -16211,7 +17576,9 @@ void Engine::Run() {
                         LOG_INFO("smoke-capture: wrote {} ({}x{}, "
                                  "source={}, exposure={:.3f})",
                                  png_path.string(), rb_w, rb_h,
-                                 denoiser_active_ ? "denoise_color" : "accum_hdr",
+                                 capture_dlss     ? "dlss_output_hdr"
+                                 : denoiser_active_ ? "denoise_color"
+                                                    : "accum_hdr",
                                  exposure);
                     }
                 }
@@ -16356,7 +17723,7 @@ void Engine::RegisterCommands() {
         "Load a saved camera state from a slot (1..9, default 1). "
         "Use cam_reset for slot 0 (engineering default). Loading "
         "fires the active denoiser's history-reset flag so the "
-        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
+        "temporal denoise pipeline (SVGF/NRD/OptiX-temporal) "
         "doesn't blend pre-teleport content forward.",
         [this, parse_cam_state, parse_slot](auto args, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_load: no camera"); return; }
@@ -17003,6 +18370,50 @@ void Engine::RegisterCommands() {
         });
     // --- end Wave 9 scene save/load ---------------------------------------
 
+    // --- Render-scale / jitter diagnostics (DLSS prerequisites) -----------
+    // The console mirror of Engine::RenderWidth() / OutputWidth() /
+    // FrameJitterX() / JitterActive(). Exists so the decoupling can be
+    // CONFIRMED rather than assumed: "is the path tracer actually
+    // running at a smaller extent, and what sub-pixel offset does the
+    // engine claim the last frame used" is precisely the question a
+    // DLSS bring-up asks first, and reading it out of a live session
+    // beats inferring it from image softness.
+    C.RegisterCommand("render_info",
+        "Print the internal render extent, the presentation extent, the "
+        "effective r_render_scale, and the deterministic sub-pixel camera "
+        "jitter offset applied to the last frame. Jitter is reported in "
+        "pixels of the INTERNAL extent, each axis in [-0.5, 0.5]; it reads "
+        "'inactive' when r_camera_jitter is off, which means there is no "
+        "single frame offset (the path tracer draws an independent random "
+        "one per ray), NOT that the offset is zero.",
+        [this](auto /*args*/, pt::console::Output& out) {
+            if (render_w_ == 0u || output_w_ == 0u) {
+                out.PrintLine("render_info: no frame rendered yet");
+                return;
+            }
+            const float sx = float(render_w_) / float(output_w_);
+            const float sy = float(render_h_) / float(output_h_);
+            out.FormatLine("internal {}x{}  presented {}x{}  scale {:.4f} x {:.4f}"
+                           "  ({} pixels vs {})",
+                           render_w_, render_h_, output_w_, output_h_, sx, sy,
+                           std::uint64_t(render_w_) * render_h_,
+                           std::uint64_t(output_w_) * output_h_);
+            out.FormatLine("resolve: {}",
+                           (render_w_ == output_w_ && render_h_ == output_h_)
+                               ? "none (path tracer writes the swapchain directly)"
+                               : (upscale_pipeline_id_ != 0
+                                      ? "bilinear upscale (placeholder for DLSS)"
+                                      : "UNAVAILABLE -- no `upscale` kernel"));
+            if (camera_jitter_active_) {
+                out.FormatLine("jitter: active  Halton(2,3)  offset ({:+.5f}, {:+.5f}) px",
+                               frame_jitter_x_, frame_jitter_y_);
+            } else {
+                out.PrintLine("jitter: inactive (r_camera_jitter 0) -- per-ray random "
+                              "sub-pixel sampling, no reportable frame offset");
+            }
+        });
+    // --- end render-scale / jitter diagnostics ----------------------------
+
     if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <name> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to disk. Output format is selected by r_capture_format (png|ppm); the matching extension is auto-appended to <name>, overriding any extension you typed. ACES-tonemapped for HDR inputs (accum / denoise_color / bloom_mip0); the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap.",
         [this](auto args, pt::console::Output& out) {
@@ -17068,7 +18479,14 @@ void Engine::RegisterCommands() {
                 // enough to satisfy the pre-flight extent check inside
                 // ReadbackSwapchain; the real memcpy happens on Tick's
                 // poll into a properly-sized buffer.
-                std::vector<std::uint8_t> dummy(std::size_t(accum_w_) * accum_h_ * 4u);
+                // OUTPUT extent, like the deferred poll in Tick: the
+                // accumulator is the INTERNAL extent under
+                // r_render_scale, and an undersized buffer fails
+                // ReadbackSwapchain's pre-flight extent check, which
+                // would leave the latched request permanently
+                // unsatisfiable.
+                std::vector<std::uint8_t> dummy(
+                    std::size_t(output_w_) * std::size_t(output_h_) * 4u);
                 (void)device_->ReadbackSwapchain(dummy.data(), dummy.size(),
                                                  &sw, &sh, &fmt);
                 // Latch the resolved path + format. The deferred writer
@@ -17818,7 +19236,7 @@ void Engine::RegisterCommands() {
         constexpr auto kAny      = pt::console::CVAR_VALUE_ANY;
         constexpr auto kWinLinux = pt::console::CVAR_VALUE_WIN |
                                    pt::console::CVAR_VALUE_LINUX;
-        v->allowed_values        = {"none", "software", "vulkan"};
+        v->allowed_values        = {"none", "vulkan"};
         v->allowed_value_flags   = {
             kAny,       // none
             kAny,       // software
@@ -17826,8 +19244,7 @@ void Engine::RegisterCommands() {
         };
         v->on_change = [this](const pt::console::CVar& cv) {
             BackendType t = BackendType::None;
-            if      (cv.value == "software") t = BackendType::Software;
-            else if (cv.value == "vulkan")   t = BackendType::Vulkan;
+            if (cv.value == "vulkan") t = BackendType::Vulkan;
             RequestBackendSwitch(t);
         };
     }
@@ -18511,19 +19928,31 @@ void Engine::RegisterCommands() {
             // 0.05 floor was capping the dimming and burning out skies.
             // Locked-exposure presets (dslr_iso*, linear) keep min == max
             // since they're not running auto-exposure.
+            // exp_max is the DARK-ADAPTATION CEILING, and since #338 phase 2
+            // it is anchored rather than picked. Human 2000 is the exposure
+            // at which a V = 6 star -- the naked-eye limit -- lands on the
+            // display's ~2/255 visibility threshold (derivation in the
+            // r_exposure_max docstring). The animal presets scale that by
+            // their measured dim-light advantage over humans, so each one
+            // states "this eye sees N magnitudes deeper" rather than
+            // carrying an independently invented number.
             static const Preset presets[] = {
-                // Human eye: comfortable adaptation range, ~1s adapt time.
-                {"human",        1e-6f,  4.0f,  0.18f, 0.20f, true,  1.5f},
-                // Cats: rod-rich retina, ~6x dim-light sensitivity.
-                {"cat",          1e-6f, 12.0f,  0.18f, 0.30f, true,  1.5f},
-                // Owls: nocturnal extreme, ~100x rod density of humans.
-                {"owl",          1e-6f, 30.0f,  0.18f, 0.35f, true,  1.5f},
+                // Human eye: dark-adapts to the naked-eye limit, V = 6.
+                {"human",        1e-6f,  2000.0f,  0.18f, 0.20f, true,  1.5f},
+                // Cats: rod-rich retina, ~6x dim-light sensitivity -- about
+                // two magnitudes deeper than a human, so V ~ 8.
+                {"cat",          1e-6f, 12000.0f,  0.18f, 0.30f, true,  1.5f},
+                // Owls: nocturnal extreme, ~100x rod density of humans --
+                // about five magnitudes deeper, V ~ 11.
+                {"owl",          1e-6f, 200000.0f, 0.18f, 0.35f, true,  1.5f},
                 // DSLR locked at ISO 100: no auto, fixed exposure.
                 {"dslr_iso100",  1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
                 // DSLR locked at ISO 6400: 64x more gain.
                 {"dslr_iso6400", 8.0f,   8.0f,  0.18f, 0.0f,  false, 8.0f},
-                // Smartphone: auto, modest range.
-                {"phone",        1e-6f,  6.0f,  0.18f, 0.25f, true,  1.5f},
+                // Smartphone: auto, modest range. Night mode stacks frames
+                // rather than opening up, so it lands short of a
+                // dark-adapted eye but far past the old 6.0.
+                {"phone",        1e-6f,  3000.0f, 0.18f, 0.25f, true,  1.5f},
                 // Linear: bypass exposure entirely (debug).
                 {"linear",       1.0f,   1.0f,  0.18f, 0.0f,  false, 1.0f},
             };
@@ -18675,6 +20104,13 @@ void Engine::RegisterCommands() {
                 float val = cv.GetFloat();
                 device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
                                      &val, sizeof(float), 0);
+                // Keep the DLSS 1x1 R32F view of the same scalar in step.
+                // AutoExposure.slang is what mirrors it in auto mode, and it
+                // does not run in manual mode, so the host owns it here.
+                if (exposure_texture_id_ != 0) {
+                    device_->WriteTexture(pt::rhi::TextureHandle{exposure_texture_id_},
+                                          &val, sizeof(float));
+                }
             }
         };
     }
@@ -18690,6 +20126,12 @@ void Engine::RegisterCommands() {
                 val = ev->GetFloat();
             device_->WriteBuffer(pt::rhi::BufferHandle{exposure_state_id_},
                                  &val, sizeof(float), 0);
+            // Same reason as the r_exposure handler: from here on nothing
+            // else will update the DLSS exposure image.
+            if (exposure_texture_id_ != 0) {
+                device_->WriteTexture(pt::rhi::TextureHandle{exposure_texture_id_},
+                                      &val, sizeof(float));
+            }
         };
     }
     if (auto* v = C.FindCVar("r_sky_use_astronomical")) {
@@ -18916,7 +20358,11 @@ void Engine::RegisterCommands() {
     };
     set_slider("r_spp",             1.0f,   32.0f,  1.0f);
     set_slider("r_max_bounces",     1.0f,   16.0f,  1.0f);
-    set_slider("r_exposure",        0.1f,    5.0f,  0.05f);
+    // Range reaches a night exposure since #338 phase 2 (a dark-adapted
+    // scene needs ~2000, not ~1.5). A linear slider over 0.1..2000 is
+    // coarse at the daylight end; a log-scale control is the real fix
+    // and is UI work, but an unreachable range is worse than a coarse one.
+    set_slider("r_exposure",        0.1f, 2000.0f,  0.05f);
     set_slider("r_env_intensity",   0.0f,    5.0f,  0.05f);
     set_slider("r_sun_elevation", -90.0f,   90.0f,  0.5f);
     set_slider("r_sun_azimuth",     0.0f,  360.0f,  1.0f);
@@ -21408,8 +22854,17 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             gizmo_size = 1.5f;
         }
     }
-    const float aspect = (accum_h_ > 0)
-                           ? float(accum_w_) / float(accum_h_)
+    // Screen extent every projection / hit-test / drag in this function
+    // works in. It is the PRESENTED extent, not the accumulator's:
+    // the cursor coordinates below come from the window and the gizmo
+    // is rasterized into the swapchain after the render-scale resolve,
+    // so the internal render extent -- which under r_render_scale is
+    // smaller -- is the wrong space to project into. Equal to
+    // accum_w_/accum_h_ (the previous expression) at scale 1.0.
+    const int   screen_w = static_cast<int>(output_w_);
+    const int   screen_h = static_cast<int>(output_h_);
+    const float aspect = (screen_h > 0)
+                           ? float(screen_w) / float(screen_h)
                            : 1.0f;
     // The render-frame camera every projection / hit-test / drag below
     // works against (#255).
@@ -21429,7 +22884,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
     if (!mouse_look) {
         hovered = editor_gizmo_.HitTest(origin, gizmo_size,
                                         cam_r, aspect,
-                                        accum_w_, accum_h_,
+                                        screen_w, screen_h,
                                         mx, my, /*radius_px=*/10.0f);
     }
 
@@ -21530,7 +22985,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 PushSceneSnapshot();
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         cam_r, aspect,
-                                        accum_w_, accum_h_,
+                                        screen_w, screen_h,
                                         mx, my);
             }
         } else if (lmb_down && prev_lmb_down_ && editor_gizmo_.IsDragging()) {
@@ -21546,7 +23001,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // axis lives in world space (not in the prim's local
                 // frame), matching user expectation.
                 const float angle = editor_gizmo_.UpdateRotateDrag(
-                    cam_r, aspect, accum_w_, accum_h_, mx, my);
+                    cam_r, aspect, screen_w, screen_h, mx, my);
                 // Sub-half-degree threshold cuts Execute() churn when
                 // the mouse is roughly still.
                 constexpr float kAngleEps = 1.0e-3f;
@@ -21585,7 +23040,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             } else if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Scale) {
                 const glm::vec3 new_pos =
                     editor_gizmo_.UpdateDrag(cam_r, aspect,
-                                             accum_w_, accum_h_, mx, my);
+                                             screen_w, screen_h, mx, my);
                 const glm::vec3 delta = new_pos - editor_drag_pre_pos_;
                 const glm::vec3 ax = [&]() {
                     switch (editor_gizmo_.DragAxis()) {
@@ -21633,7 +23088,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // undo machinery route uniformly.
                 const glm::vec3 new_pos =
                     editor_gizmo_.UpdateDrag(cam_r, aspect,
-                                             accum_w_, accum_h_, mx, my);
+                                             screen_w, screen_h, mx, my);
                 // Skip the dispatch if the delta is sub-millimetre; cuts
                 // the ~60 Hz Execute() churn when the mouse is still.
                 if (glm::distance(new_pos, origin) > 1e-4f) {
@@ -25195,9 +26650,8 @@ bool Engine::OceanGpuAvailable() const {
     // The GPU ocean compute pre-pass only ever ran on the now-retired
     // Metal backend; no live backend registers a real pipeline today, so
     // in practice this returns false via the id==0 test above until a
-    // Vulkan ocean pipeline lands. The software guard remains so that if
-    // one does, Software still correctly falls back to the CPU solver.
-    if (current_backend_ == BackendType::Software) return false;
+    // Vulkan ocean pipeline lands. The software fallback guard that used to
+    // sit here went with the software backend itself.
     auto& C = pt::console::Console::Get();
     if (auto* v = C.FindCVar("r_ocean_gpu")) {
         if (v->GetInt() == 0) return false;

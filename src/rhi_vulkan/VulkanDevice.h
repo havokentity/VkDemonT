@@ -17,8 +17,15 @@
 #include <vector>
 
 namespace pt::rhi::vk { class VulkanNrdDenoiser; }
+// NOT build-flag-gated, unlike the three denoisers below: the upscaler
+// type exists on every build so the member and the four Device overrides
+// need no #if. Only its NGX call bodies compile out.
+namespace pt::rhi::vk { class VulkanNgxUpscaler; }
 #if defined(PT_ENABLE_OPTIX)
 namespace pt::rhi::vk { class VulkanOptixDenoiser; }
+#endif
+#if defined(PT_ENABLE_NRD)
+namespace pt::rhi::vk { class VulkanNrdLibDenoiser; }
 #endif
 
 struct GLFWwindow;
@@ -90,7 +97,12 @@ private:
     // avoid reading past the end (pbr_atlas at slot 16 already sat right
     // at the old [16] boundary). Keep in sync with kSlotToTexBinding[] /
     // kNumTexSlots in VulkanDevice.cpp.
-    TextureHandle  bound_tex_[20] {};
+    //
+    // Slot 19 (exposure_tex -> vk::binding 48) bumps it to [21]. NGX
+    // wants the pre-tonemap exposure multiplier as a 1x1 R32F IMAGE and
+    // the engine only had it as a storage-buffer scalar; AutoExposure.slang
+    // now mirrors the scalar into that image. kNumTexSlots is 20.
+    TextureHandle  bound_tex_[21] {};
     // 14 buffer slots:
     //   0..7   original engine layout (mesh_positions / mesh_indices,
     //          primitives, marginal / conditional CDFs, exposure_state,
@@ -239,7 +251,22 @@ public:
     // pipeline is even ready). After lazy init, the cached `ready_`
     // flag short-circuits this check.
     bool SupportsDenoise() const override;
+    // True only on a PT_ENABLE_NRD build whose NRD instance hasn't
+    // already failed. See rhi/Device.h for the caller contract.
+    bool SupportsNrdLibrary() const override;
     void Denoise(const DenoiseDesc& d) override;
+
+    // ---- Temporal upscaler (DLSS SR / DLAA via NGX) ---------------------
+    // See rhi/Device.h for the caller contract and rhi/Upscaler.h for the
+    // seam. All four route to ngx_upscaler_, which is lazily created on
+    // the first call and latches its own failure.
+    bool SupportsUpscaler() const override;
+    bool QueryUpscalerSettings(UpscalerMode mode,
+                               std::uint32_t display_width,
+                               std::uint32_t display_height,
+                               UpscalerSettings& out) override;
+    bool Upscale(const UpscaleDesc& d) override;
+    void ReleaseUpscalerFeature() override;
 
     // Predictive pipeline JIT prewarming (see Device::EnsurePipelineWarmed).
     // On Vulkan, the constructor already launches an async worker that
@@ -269,6 +296,15 @@ public:
     VkDevice         RawDevice()     const { return device_; }
     VkPhysicalDevice RawPhysicalDevice() const { return phys_device_; }
     VkQueue          RawGraphicsQueue() const { return graphics_queue_; }
+    // Added for the NGX upscaler: NGX's init and its device-extension
+    // query both take the VkInstance, and its resource descriptors carry
+    // the VkFormat alongside the view (see NVSDK_NGX_ImageViewInfo_VK).
+    VkInstance       RawInstance()   const { return instance_; }
+    // The frame's in-flight command buffer, or VK_NULL_HANDLE outside a
+    // recording window. The NGX upscaler records into the engine's own
+    // command buffer (like the SVGF/NRD denoisers, unlike OptiX's
+    // private-cb + timeline-semaphore arrangement), so it needs this.
+    VkCommandBuffer  CurrentRawCommandBuffer() const;
     std::uint32_t    GraphicsQueueFamily() const { return graphics_qfi_; }
     VkPipeline       LookupPipeline(PipelineHandle h);
     VkPipelineLayout LookupPipelineLayout(PipelineHandle h);
@@ -632,6 +668,36 @@ private:
     // DestroyDevice() before any VkPipeline / VkDescriptorPool teardown.
     std::unique_ptr<VulkanNrdDenoiser> denoiser_;
 
+    // DLSS Super Resolution / DLAA on NGX (src/rhi/Upscaler.h seam).
+    // Same lazy-alloc + latched-failure lifecycle as the denoisers, and
+    // the same reason for being a pointer: VulkanNgxUpscaler.h pulls in
+    // the NGX headers, which have no business in every TU that includes
+    // VulkanDevice.h. Unlike the denoisers this member exists on EVERY
+    // build -- VulkanNgxUpscaler compiles to a stub that reports itself
+    // unavailable when PT_ENABLE_DLSS is off, so no #if is needed here
+    // or at any call site.
+    std::unique_ptr<VulkanNgxUpscaler> ngx_upscaler_;
+    // Latched once the upscaler's Init() has failed. Read by
+    // SupportsUpscaler() so the engine gets one answer that folds "not
+    // compiled in", "no NVIDIA driver", "GPU too old" and "DLL missing"
+    // together -- exactly what nrd_lib_failed_ does for NRD.
+    bool ngx_upscaler_failed_ = false;
+
+#if defined(PT_ENABLE_NRD)
+    // NVIDIA RayTracingDenoiser library instance (issue #50). Sibling to
+    // denoiser_ / optix_denoiser_, gated by build-time PT_ENABLE_NRD.
+    // Allocated lazily by Denoise() on the first DenoiseDesc::Kind::Nrd
+    // frame. When its Init() fails the object is KEPT (not reset) so the
+    // failure latches and SupportsNrdLibrary() can report it -- rebuilding
+    // and re-failing every frame would just flood the log.
+    std::unique_ptr<VulkanNrdLibDenoiser> nrd_lib_denoiser_;
+    // Latched once NRD's instance / pipeline creation has failed at
+    // runtime. Written by Denoise(), read by SupportsNrdLibrary(), which
+    // is where "not compiled in" and "compiled in but broken" are folded
+    // into the single answer the engine consumes.
+    bool nrd_lib_failed_ = false;
+#endif
+
 #if defined(PT_ENABLE_OPTIX)
     // OptiX denoiser. Sibling to denoiser_ above, gated by build-time
     // PT_ENABLE_OPTIX. Allocated lazily by Denoise() on the first call
@@ -808,6 +874,10 @@ public:
     VkImageView         LookupImageView(TextureHandle h);
     VkImage             LookupImage(TextureHandle h);
     VkExtent2D          LookupImageExtent(TextureHandle h);
+    // VK_FORMAT_UNDEFINED when the handle is unknown. NGX's
+    // NVSDK_NGX_ImageViewInfo_VK carries the format explicitly rather
+    // than deriving it from the view, so the upscaler needs this.
+    VkFormat            LookupImageFormat(TextureHandle h);
     VkBuffer            LookupBuffer(BufferHandle h);
     VkAccelerationStructureKHR LookupAccel(AccelStructHandle h);
     // Hand out the next descriptor set in this frame's ring and

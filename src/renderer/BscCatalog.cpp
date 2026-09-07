@@ -106,50 +106,71 @@ std::vector<Star> LoadBsc5(const std::string& path, std::string* err) {
     return stars;
 }
 
-// Magnitude -> linear flux. Vega (mag 0) is 1.0; dimmer stars fall
-// off by 2.512^(-mag). We multiply by an overall gain so naked-eye
-// stars punch through ACES tonemapping at typical exposure.
+// Apparent magnitude -> V-band irradiance at the observer, in W/m^2.
 //
-// 4.0 picked so naked-eye limit (vmag=6) lands at ~0.06 per-texel,
-// which after exposure*1.5 and ACES tonemap reads as ~50/255 --
-// visibly speckled against a deep night sky. Bright stars saturate
-// ACES regardless, so this scale doesn't blow them out further.
-float MagnitudeToFlux(float vmag) {
-    constexpr float kVegaFlux  = 1.0f;
-    constexpr float kFluxScale = 4.0f;
-    constexpr float kPogson    = 2.51188643f; // 10^(0.4)
-    return kVegaFlux * std::pow(kPogson, -vmag) * kFluxScale;
+// Two cited pieces and no free parameters:
+//   Pogson, N. R. (1856), MNRAS 17, 12 -- one magnitude step is a factor
+//     10^0.4 = 2.51188643 in flux, by definition.
+//   Zero point -- a V = 0 source (Vega) delivers 3.19e-9 W/m^2 over the V
+//     band. Bessell, Castelli & Plez (1998), A&A 333, 231: f_lambda =
+//     3.63e-11 W/m^2/nm at 545 nm, times the V band's 88 nm FWHM. The
+//     independent 3640 Jy route gives 3.21e-9, agreeing to within 1%.
+//
+// RADIOMETRIC because the engine is: kPtSolarIrradiance is 1360.8 W/m^2
+// (Kopp & Lean 2011) and skies are carried in W/m^2/sr. Quoting stars in
+// lux would be wrong by the luminous-efficacy factor (~700 for a Vega-like
+// spectrum), which is a bigger error than the one it would be fixing.
+//
+// The gain that used to sit on the end of this expression (kFluxScale =
+// 4.0, "picked so the naked-eye limit reads as ~50/255") is gone. It was
+// never a photometric quantity: it existed to paper over RasteriseJ2000Map
+// below, which splatted a Gaussian at PEAK amplitude instead of conserving
+// energy, so a star's total flux came out proportional to flux * sigma^2
+// and had to be re-tuned by hand whenever sigma or the map resolution
+// moved. With the splat normalised, the correct scale is simply the real
+// one -- and it works because the engine's sky is already in real units
+// (kPtSolarIrradiance = 1360.8 W/m^2, skies in W/m^2/sr). Both ends of the
+// range then come out on their own: against a true ~2.9e-7 W/m^2/sr
+// moonless night sky Vega is ~1200x the background, and against a ~15
+// W/m^2/sr noon zenith the identical star is ~2e-5 of it -- invisible,
+// exactly as in life.
+float MagnitudeToIrradianceWm2(float vmag) {
+    constexpr float kVegaZeroPointWm2 = 3.19e-9f;  // Bessell et al. 1998
+    constexpr float kPogson           = 2.51188643f;
+    return kVegaZeroPointWm2 * std::pow(kPogson, -vmag);
 }
 
-// Angular Gaussian sigma (radians) per star. Most stars get a
-// sub-arcmin sigma so they read as crisp single-texel points;
-// only the very brightest get any visible halo. Earlier values
-// (~6-20 arcmin for bright stars) made Sirius / Vega look like
-// small moons -- which is way bigger than what you see by eye
-// or in a long-exposure photo. The full moon is 30 arcmin
-// across; the human eye's optical PSF for a star is 1-2 arcmin.
+// Angular sigma of the point-spread function, radians.
 //
-// 1 arcmin = 2.909e-4 rad. Texel pitch at 4096x2048 is ~5.3 arcmin
-// (1.53e-3 rad), so anything below ~1 texel sigma is sub-pixel
-// and reads as a hot point. Per-texel peak brightness comes from
-// the magnitude-driven flux, which is independent of sigma --
-// shrinking sigma here doesn't dim the dim stars.
-// Sigma must be >= the texel pitch (~5.3 arcmin / 1.54e-3 rad at
-// 4Kx2K) for sub-texel-positioned stars to reliably write their
-// peak flux into at least one texel; below ~half-texel-pitch the
-// Gaussian's mass falls between texels and dim stars lose 90%+
-// of their amplitude. Brighter tiers get a wider halo on top.
+// Independent of magnitude, which is the correction: a star is a point
+// source, so how far it spreads on the sky is a property of the OPTICS,
+// not of its brightness. The previous tiered values (1.4e-3 for the
+// brightest tier down to 0.75e-3) made a bright star carry
+// (1.4/0.75)^2 = 3.5x more total energy than its magnitude specified,
+// on top of already being brighter for the right reason -- the magnitude
+// scale was being applied twice, once honestly and once by accident.
 //
-// Tuned for 8192x4096 (~2.6 arcmin/texel). Earlier 4Kx2K
-// values were ~2x too wide at the bumped resolution and made
-// stars read as soft Gaussian smudges. These keep dim stars
-// at ~half-texel sigma (crisp 1-px points) and only let
-// brightest stars bloom across 2-3 texels for a visible halo.
-float SplatAngularRadiusRad(float vmag) {
-    if (vmag < -1.0f) return 1.4e-3f;  // ~4.8 arcmin -- Sirius/Canopus halo
-    if (vmag <  1.0f) return 1.0e-3f;  // ~3.4 arcmin -- top stars, gentle bloom
-    if (vmag <  3.0f) return 0.75e-3f; // ~2.6 arcmin -- 1 texel sharp
-    return                  0.75e-3f;  // ~2.6 arcmin -- 1 texel sharp
+// 1.5 arcmin is the human eye's optical PSF for a point source (the
+// figure the old implementation comment already quoted as "1-2 arcmin"
+// before tiering away from it). Bright stars still read as bigger on
+// screen, because with a normalised PSF their wings clear the display
+// threshold further out -- which is the actual physical mechanism, and
+// is why bright stars look bigger in a photograph too.
+//
+// `sampling_floor_rad` widens sigma when the consumer's sampling grid is
+// coarser than the optical PSF: the map bake passes its texel pitch, the
+// planet path passes the on-screen pixel angle. Because the PSF is
+// normalised, widening it lowers the peak by exactly the area ratio and
+// leaves total energy untouched -- it anti-aliases without changing
+// brightness. (Space Graphics Toolkit reaches the same place empirically
+// with `scale = saturate(size/sizeMin); colour *= scale*scale`; this is
+// that identity, derived rather than tuned.)
+float PsfSigmaRad(float sampling_floor_rad) {
+    constexpr float kEyeOpticalPsfRad = 4.36e-4f;  // 1.5 arcmin
+    const float floor_rad = (std::isfinite(sampling_floor_rad) &&
+                             sampling_floor_rad > 0.0f)
+                          ? sampling_floor_rad : 0.0f;
+    return std::max(kEyeOpticalPsfRad, floor_rad);
 }
 
 void BvToLinearSrgbTint(float bv, float out_rgb[3]) {
@@ -204,7 +225,7 @@ void BvToLinearSrgbTint(float bv, float out_rgb[3]) {
     double b =  0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
     r = std::max(r, 0.0); g = std::max(g, 0.0); b = std::max(b, 0.0);
     // Normalise to unit Rec.709 luminance so the tint carries hue only --
-    // MagnitudeToFlux owns brightness, and a caller multiplying the two
+    // MagnitudeToIrradianceWm2 owns brightness, and a caller multiplying the two
     // must get back exactly the magnitude it asked for.
     const double lum = std::max(0.2126 * r + 0.7152 * g + 0.0722 * b, 1e-6);
     out_rgb[0] = float(r / lum);
@@ -236,9 +257,20 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
     const double dphi   = (2.0 * kPi) / double(W);  // RA per u-step (rad)
     const double dtheta = kPi / double(H);          // colatitude per v-step (rad)
 
+    // One PSF for every star: the splat width is an optical property, not
+    // a per-star one (see PsfSigmaRad). Floored at 0.75 texel so a star
+    // landing between texel centres is still resolved by the discrete
+    // grid; the normalisation below keeps its energy exact either way.
+    const float r_ang  = PsfSigmaRad(0.75f * float(dtheta));
+    const float r_ang2 = r_ang * r_ang;
+    constexpr int K    = 4;     // truncate Gaussian past 4 sigma
+
     for (std::size_t i = 0; i < stars.size(); ++i) {
         const Star& s = stars[i];
-        const float flux = MagnitudeToFlux(s.vmag);
+        // Total V-band irradiance this star delivers, in W/m^2. Every
+        // texel it touches shares exactly this much between them -- that
+        // is the contract the normalisation below enforces.
+        const double E_wm2 = double(MagnitudeToIrradianceWm2(s.vmag));
 
         // Star direction in J2000: same convention as the shader looks
         // up later (atan2(j.y, j.x) -> RA, asin(j.z) -> dec).
@@ -257,9 +289,6 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
         const float fy = v * float(H);
 
         const auto [r_tint, g_tint, b_tint] = color_for_index(std::uint32_t(i));
-        const float r_ang  = SplatAngularRadiusRad(s.vmag);
-        const float r_ang2 = r_ang * r_ang;
-        const int   K      = 4;     // truncate Gaussian past 4-sigma
 
         // Splat extent in texel space. dec direction is uniform; ra
         // direction widens by 1/cos(dec) so a star near a pole still
@@ -268,9 +297,25 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
         // pole exactly (the entire row is "within range" angularly,
         // and we'd visit W texels per star).
         const float half_v = float(K) * r_ang / float(dtheta);
-        const double cos_dec_safe = std::max(std::cos(dec), 0.05);   // ~3 deg from pole
+        // Longitude half-extent widens by 1/cos(dec) because equirectangular
+        // columns converge toward the poles.
+        //
+        // There used to be a `max(cos(dec), 0.05)` floor here, nominally "~3
+        // deg from pole". It TRUNCATED the sweep: above |dec| 87.13 deg the
+        // visited span was narrower than the star's true 4-sigma footprint.
+        // Energy stayed exact -- the normalisation below divides by whatever
+        // was actually visited -- but the PEAK inflated, because the same
+        // energy was packed into fewer texels. Measured against a full sweep:
+        // 1.16x at Polaris, 6.27x at dec 89.9 on the production 8192x4096 map.
+        //
+        // The floor was also redundant. half_u is already bounded by W/2
+        // below, which is the CORRECT bound: a star close enough to the pole
+        // genuinely spans every longitude, and W/2 sweeps exactly that once
+        // and no more. Removing the floor makes the near-pole case correct
+        // and leaves the worst case unchanged.
+        const double cos_dec = std::max(std::cos(dec), 1e-9);  // 1e-9 guards 1/0 only
         const float half_u = std::min(
-            float(K) * r_ang / (float(dphi) * float(cos_dec_safe)),
+            float(K) * r_ang / (float(dphi) * float(cos_dec)),
             float(W) * 0.5f);
 
         const int iy0 = std::max(0, int(std::floor(fy - half_v)));
@@ -278,41 +323,72 @@ void RasteriseJ2000Map(const std::vector<Star>& stars,
         const int ix0 = int(std::floor(fx - half_u));
         const int ix1 = int(std::ceil (fx + half_u));
 
-        for (int y = iy0; y <= iy1; ++y) {
-            // texel-center direction in J2000 for this row of texels
-            const double theta_t = (double(y) + 0.5) * dtheta;     // colatitude
-            const double sint    = std::sin(theta_t);
-            const double cost    = std::cos(theta_t);              // = sin(dec_t)
-            for (int xRaw = ix0; xRaw <= ix1; ++xRaw) {
-                int x = xRaw;
-                while (x < 0)         x += int(W);
-                while (x >= int(W))   x -= int(W);
-                // u = ra/(2π); the rasteriser maps RA=0 -> u=0, so the
-                // texel-center azimuth is phi_t = u*2π *without* a -pi
-                // recentre. (An earlier draft subtracted pi here, which
-                // pointed every texel exactly opposite its star and made
-                // the whole map zero.)
-                const double phi_t  = (double(x) + 0.5) * dphi;
-                const double tx = sint * std::cos(phi_t);
-                const double ty = sint * std::sin(phi_t);
-                const double tz = cost;
-                // Angular distance via dot product. cos(angle) = s . t.
-                // For small angles, angle^2 ≈ 2 * (1 - cos(angle)).
-                double dotv = sx * tx + sy * ty + sz * tz;
-                if (dotv > 1.0) dotv = 1.0;
-                if (dotv < -1.0) dotv = -1.0;
-                const double ang2 = 2.0 * (1.0 - dotv);
-                if (ang2 > double(r_ang2) * double(K * K)) continue;
-                const float gauss = std::exp(-float(ang2) / r_ang2);
-                if (gauss < 1e-4f) continue;
-                const float intensity = flux * gauss;
-                std::size_t off = (std::size_t(y) * W + std::size_t(x)) * 4;
-                out[off + 0] += intensity * r_tint;
-                out[off + 1] += intensity * g_tint;
-                out[off + 2] += intensity * b_tint;
-                out[off + 3]  = 1.0f;
+        // Walk the footprint once per pass. Traversing twice beats
+        // buffering it: the bake runs once at startup, and the footprint
+        // is a few hundred texels even in the worst case (near a pole,
+        // where 1/cos(dec) stretches the row span).
+        auto for_each_texel = [&](auto&& fn) {
+            for (int y = iy0; y <= iy1; ++y) {
+                // texel-center direction in J2000 for this row of texels
+                const double theta_t = (double(y) + 0.5) * dtheta;     // colatitude
+                const double sint    = std::sin(theta_t);
+                const double cost    = std::cos(theta_t);              // = sin(dec_t)
+                // True solid angle of a texel in this row. The sin(theta)
+                // is why the poles do not accumulate spurious energy: an
+                // equirectangular texel there covers almost no sky.
+                const double omega   = dphi * dtheta * sint;
+                for (int xRaw = ix0; xRaw <= ix1; ++xRaw) {
+                    int x = xRaw;
+                    while (x < 0)         x += int(W);
+                    while (x >= int(W))   x -= int(W);
+                    // u = ra/(2pi); the rasteriser maps RA=0 -> u=0, so the
+                    // texel-center azimuth is phi_t = u*2pi *without* a -pi
+                    // recentre. (An earlier draft subtracted pi here, which
+                    // pointed every texel exactly opposite its star and made
+                    // the whole map zero.)
+                    const double phi_t  = (double(x) + 0.5) * dphi;
+                    const double tx = sint * std::cos(phi_t);
+                    const double ty = sint * std::sin(phi_t);
+                    const double tz = cost;
+                    // Angular distance via dot product. cos(angle) = s . t.
+                    // For small angles, angle^2 ~= 2 * (1 - cos(angle)).
+                    const double dotv = std::clamp(sx * tx + sy * ty + sz * tz,
+                                                   -1.0, 1.0);
+                    const double ang2 = 2.0 * (1.0 - dotv);
+                    if (ang2 > double(r_ang2) * double(K * K)) continue;
+                    const double w = std::exp(-ang2 / double(r_ang2));
+                    if (w < 1e-4) continue;
+                    fn(x, y, w, omega);
+                }
             }
-        }
+        };
+
+        // Pass 1: integrate the un-normalised Gaussian over the texels it
+        // actually lands on, each weighted by its true solid angle.
+        double wsum_omega = 0.0;
+        for_each_texel([&](int, int, double w, double omega) {
+            wsum_omega += w * omega;
+        });
+        // A star whose entire footprint fell outside the map (or below the
+        // weight cutoff) has nowhere to put its energy. Dropping it is the
+        // only choice that does not silently inflate a neighbour.
+        if (!(wsum_omega > 0.0)) continue;
+
+        // Pass 2: write radiance in W/m^2/sr such that, summed over the
+        // footprint with solid-angle weights, the star delivers exactly
+        // E_wm2. Normalising against the DISCRETE sum rather than the
+        // analytic pi*sigma^2 is what makes this exact no matter how
+        // sigma compares to the texel pitch, where the Gaussian is
+        // truncated, or how hard the equirectangular grid is distorting.
+        const double norm = E_wm2 / wsum_omega;
+        for_each_texel([&](int x, int y, double w, double) {
+            const double L = norm * w;
+            std::size_t off = (std::size_t(y) * W + std::size_t(x)) * 4;
+            out[off + 0] += float(L * double(r_tint));
+            out[off + 1] += float(L * double(g_tint));
+            out[off + 2] += float(L * double(b_tint));
+            out[off + 3]  = 1.0f;
+        });
     }
 }
 

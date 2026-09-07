@@ -1,10 +1,46 @@
 # NVIDIA driver bug report: GPU hang (TDR / `VK_ERROR_DEVICE_LOST`) on the first dispatch of a large fully-inlined SPIR-V compute kernel
 
-Status: **ready to file** (owner action). Venue: the NVIDIA Developer Program
-bug portal (developer.nvidia.com, "Report a Bug" under the developer account),
-with the Vulkan section of the NVIDIA developer forums as the fallback. Once
-filed, record the bug ID in `HANDOFF.md` under "Native-Vulkan bringup" -- that
-is the acceptance item for `docs/NEXTGEN_PLAN.md` step 0.
+Status: **READY TO FILE** — the hold is discharged (2026-09-07, second update).
+
+> **RETEST DONE. The hang is real, is NOT ours, and the report is now stronger
+> than the original draft.**
+>
+> Earlier today GPU-assisted validation found a genuine out-of-bounds read in
+> our own shader (`mesh_uvs`, binding 35, ~3 KB past a 16-byte placeholder),
+> which was a live alternative explanation for this hang: an OOB read is
+> undefined behaviour, and UB is exactly the licence an optimiser needs to emit
+> something pathological. The report was held rather than filed.
+>
+> That bug is fixed (commit `a88f5a9`) and GPU-AV now reports **0 out-of-bounds
+> and 0 validation errors** on a run that completes and renders. The kernel was
+> then rebuilt at `-O2` and retested:
+>
+> | | |
+> |---|---|
+> | `-O2` module size | 8,664,484 bytes (fully inlined) |
+> | Result | **still hangs** |
+> | Time to failure | 254 s (mostly driver pipeline JIT) |
+> | `VK_ERROR_DEVICE_LOST` reports | 28 |
+> | Windows TDR events | **ID 153, `nvlddmkm`, 15:54:11 and 15:54:13** |
+>
+> So the OOB was a real bug worth fixing and was **not** the cause. File it.
+>
+> **Two claims this retest adds, and they are the strongest ones in the
+> report** — make them explicitly when filing:
+>
+> 1. The module is **valid**: it passes `spirv-val --target-env vulkan1.4`
+>    cleanly (both `-O0` and `-O2`, SDK 1.4.341.1, exit 0, no diagnostics).
+> 2. The application is **clean**: the same workload under GPU-assisted
+>    validation reports zero out-of-bounds accesses and zero validation errors
+>    at `-O0`. There is no application-side undefined behaviour left to blame.
+>
+> Together those close the two questions NVIDIA would otherwise ask first, and
+> they were only answerable because the hold was taken seriously rather than
+> the report being fired off this morning.
+>
+> Note when filing: the sizes below quote the original bisection (6.6 MB /
+> 336 KB). Current tree is **8.66 MB (`-O2`) vs 435 KB (`-O0`)** — quote the
+> current pair.
 
 Everything below is taken from the bisection recorded in `HANDOFF.md`
 ("Native-Vulkan bringup status") and `cmake/Slang.cmake` (the `PT_SLANGC_OPT`
@@ -159,8 +195,29 @@ The exact `slangc` command line for either configuration can be printed with
    (434 KB) -- same source, same defines, only the `-O` flag differs.
 2. The `slangc` command lines for both (from the `ninja -t commands` line
    above).
-3. `spirv-val --target-env vulkan1.4` output for both modules (run it before
-   filing so the report states whether both validate).
+3. `spirv-val --target-env vulkan1.4` output for both modules. ALREADY RUN,
+   2026-09-07, SDK 1.4.341.1: **both modules validate cleanly, no
+   diagnostics, exit 0**. State this in the report -- it rules out
+   malformed SPIR-V and puts the fault in the driver's compilation of a
+   valid module.
+
+   Current sizes on the tree as of that run (they have grown since the
+   original bisection, which recorded 6.6 MB / 336 KB -- quote the current
+   pair when filing):
+
+   | Build | `PathTrace.spv` |
+   |---|---|
+   | `-O2` | 8,663,272 bytes (8.66 MB) |
+   | `-O0` | 435,524 bytes (435 KB) |
+
+   The `-O2` module can be produced WITHOUT reconfiguring the build tree --
+   which matters, because a `-O2` build tree hangs the GPU on next run.
+   Take the `-O0` command line from `build.ninja` and change only `-O0` to
+   `-O2` and the `-o` path, e.g. from `build/win-clang-release/src/rhi_vulkan`:
+
+       ../../../../third_party/slang/bin/slangc.exe          ../../../../shaders/PathTrace.slang          -target spirv -entry main -stage compute          -DPT_TARGET_SPIRV -DPT_WATER_ENABLED=1 -DPT_LIGHT_TREE_ENABLED=1          -DPT_PLANET_ENABLED=1 -I ../../shaders -Wno-40100          -O2 -o /some/scratch/PathTrace_O2.spv
+
+   It takes about 52 s.
 4. The hang / no-hang matrix above.
 5. The System event-log entry (event ID 153, source `nvlddmkm`) from a
    failing run, and the engine's stderr from the same run (it contains the

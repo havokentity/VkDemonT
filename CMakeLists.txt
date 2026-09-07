@@ -35,17 +35,19 @@ option(PT_ENABLE_OPTIX
 #
 # When ON, top-level Dependencies.cmake fetches NRD v4.17.3 via FetchContent
 # and the Vulkan backend compiles VulkanNrdLibDenoiser.cpp + links libNRD.
-# When OFF (default), neither the fetch nor the link happens -- the engine
-# still compiles + runs, the `r_denoiser nrd` cvar value keeps aliasing the
-# in-house SVGF chain (its long-standing behaviour). Default OFF because:
+# When OFF, neither the fetch nor the link happens -- the engine still
+# compiles + runs, the `r_denoiser nrd` cvar value keeps aliasing the
+# in-house SVGF chain (its long-standing behaviour).
+#
+# This defaulted OFF while the integration was a stub. The two reasons were:
 #   1. NRD's CMake spawns a custom_target that invokes its `ShaderMake` /
-#      `dxc-spirv` toolchain to compile HLSL -> SPIR-V at configure time.
-#      That's a non-trivial transitive-dep chain that platform packagers
-#      may not have set up; opt-in keeps the default `cmake --preset
-#      win-clang-release` configure path identical to before this PR.
-#   2. The integration is staged -- v0.3.30 lands the scaffolding (CMake
-#      gates + VulkanNrdLibDenoiser stub) so a follow-up PR can land the
-#      actual per-frame Dispatch translation without re-touching CMake.
+#      `dxc-spirv` toolchain to compile HLSL -> SPIR-V. That's a non-trivial
+#      transitive-dep chain (it wants DXC from the Vulkan SDK) that platform
+#      packagers may not have set up.
+#   2. The integration was staged -- v0.3.30 landed only the scaffolding.
+# (1) is still true and is why .github/workflows/build.yml + release.yml
+# verify dxc.exe is present before configuring. (2) stopped being true with
+# the real RELAX_DIFFUSE integration, which is why the default is now ON.
 #
 # Gated on PT_ENABLE_VULKAN_BACKEND in Dependencies.cmake; a user passing
 # -DPT_ENABLE_NRD=ON with the Vulkan backend off gets a single status line
@@ -55,26 +57,47 @@ option(PT_ENABLE_OPTIX
 # PT_ENABLE_NRD directly, so a stale =ON in the cache is harmless: the
 # FetchContent of NRD doesn't run, no target is linked, and the
 # source-side PT_ENABLE_NRD compile-definition stays undefined.
+# Default ON as of the real RELAX_DIFFUSE integration: this engine is
+# NVIDIA-exclusive, NRD is a headline feature rather than an experiment, and
+# a flag nobody turns on is a flag nobody tests. Gated on
+# PT_ENABLE_VULKAN_BACKEND via PT_NRD_ACTIVE (see cmake/Dependencies.cmake),
+# so a Linux / no-Vulkan configure still skips the fetch and links nothing.
+# The RUNTIME cvar (r_denoiser) still defaults to `off`, so the
+# out-of-the-box render stays the native, physically-correct one and the
+# pixel-exact golden matrix keeps a ground-truth reference.
 option(PT_ENABLE_NRD
-    "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" OFF)
+    "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" ON)
+# --- DLSS: Super Resolution / DLAA / Ray Reconstruction --------------------
+# Default ON by owner decision. The integration plan
+# (docs/DLSS_INTEGRATION_PLAN.md section 7) recommended OFF on the grounds that
+# enabling it downloads NVIDIA-RTX-SDK-licensed binaries, so the act of
+# flipping the flag is the act of accepting that licence. The owner's call is
+# that this is a headline feature of an NVIDIA-exclusive engine and a flag
+# nobody turns on is a flag nobody tests -- which is exactly how
+# PT_ENABLE_NRD's OFF default let two hard CMake errors sit in its dependency
+# block, unconfigurable, until 2026-09-07.
+#
+# The honest half of that recommendation is kept: cmake/Dependencies.cmake
+# names the licence and the URL in a message(STATUS) line, so what is being
+# downloaded is stated rather than implied.
+#
+# Gated on PT_ENABLE_VULKAN_BACKEND via PT_DLSS_ACTIVE, matching PT_NRD_ACTIVE,
+# so a Linux / no-Vulkan configure skips the fetch entirely.
+#
+# The RUNTIME cvar r_dlss still defaults to `off`: the out-of-the-box render
+# stays native and physically correct, and the pixel-exact golden matrix keeps
+# a ground-truth reference. Compiled in and one console command away.
+option(PT_ENABLE_DLSS
+    "Build NVIDIA DLSS SR / DLAA / Ray Reconstruction (Vulkan-only; downloads NVIDIA-RTX-SDK-licensed binaries at configure time)" ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 # Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;
 # can also be flipped on locally for any host (cmake/CompilerWarnings.cmake
 # applies the flags project-wide, including doctest test binaries).
 option(PT_ENABLE_SANITIZERS     "Enable -fsanitize=address,undefined (clang/gcc)" OFF)
-# AVX-512 build of Embree adds the 16-wide BVH16 intersector for users
-# on Zen 4+ (Ryzen 7000+), Zen 5 (Ryzen 9000+, the project owner's
-# 9950X3D), Threadripper, Xeon Skylake+, Rocket Lake (i9-11900K), and
-# HEDT chips.  Costs ~25% extra build time.  Default ON: AVX-512 has
-# become the consumer-modern default on AMD since Zen 4 in 2022, and
-# Embree's runtime ISA dispatch lets the binary fall back to AVX2 on
-# any chip that lacks AVX-512 (Zen 3, Intel mainstream consumer since
-# Alder Lake, etc.) -- so one shipped binary covers everyone without
-# breaking anyone.  Local devs who want a faster build (no need for
-# AVX-512 perf on their own machine) can flip this OFF in their cmake
-# invocation.
-option(PT_ENABLE_AVX512_EMBREE  "Enable AVX-512 build of Embree (runtime-dispatched; +~25% build time)" ON)
+# (The PT_EMBREE_AVX512 option that used to live here went with Embree and
+# the software RHI. Nothing in the tree does CPU ray tracing any more, so
+# there is no ISA-dispatch build knob to expose.)
 # Unit tests. Default ON for developer builds. The option exists for
 # anyone wanting to trim configure time on a build that genuinely
 # can't run tests (CI release-staging step, embedded systems, etc.) --

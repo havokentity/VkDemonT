@@ -33,6 +33,27 @@ jobs:
     # specific compilation breakage get caught here -- the regression
     # gate on PRs.
     runs-on: windows-latest
+    env:
+      # DLSS: unconditionally ON.
+      #
+      # This was OFF on PR/push for one commit, on the grounds that no object
+      # file depended on the SDK -- a CI build with it ON compiled byte-identical
+      # objects and only paid a several-hundred-megabyte download. That comment
+      # said to flip it "the moment any target actually links dlss_ngx".
+      #
+      # That moment arrived in the very next merge. src/rhi_vulkan/CMakeLists.txt
+      # now links dlss_ngx and compiles VulkanNgxUpscaler.cpp (647 lines) behind
+      # PT_DLSS_ACTIVE, so leaving it OFF would mean CI never builds the DLSS
+      # integration at all -- exactly the hole that let PT_ENABLE_NRD ship two
+      # hard CMake errors while nobody noticed.
+      #
+      # The supply-chain objection from that commit still stands and is NOT
+      # resolved by this: DLSS remains the only fetch in the tree without a
+      # URL_HASH (cmake/Dependencies.cmake calls that a KNOWN GAP itself), so
+      # every run now pulls a mutable upstream git tag. Pinning that hash is
+      # the outstanding follow-up, and it matters more now that this is ON
+      # everywhere rather than nightly-only.
+      PT_CI_DLSS: 'ON'
     steps:
       - uses: actions/checkout@v4
 
@@ -62,24 +83,70 @@ jobs:
           stripdown: true
 
       - name: Verify toolchain
+        # dxc.exe is checked explicitly because PT_ENABLE_NRD is ON by
+        # default as of the RELAX_DIFFUSE integration, and NRD's build
+        # spawns ShaderMake to compile its HLSL to SPIR-V -- which needs
+        # DirectX Shader Compiler from the Vulkan SDK's Bin/. Nothing in
+        # this repo needed an SDK *binary* before (we only ever used
+        # find_package(Vulkan) for headers + vulkan-1.lib), so the
+        # `stripdown: true` above has never been tested against that
+        # requirement. Failing here with the remedy named beats failing
+        # 200 lines deep inside NRD's configure with "Can't find DXC".
         shell: pwsh
         run: |
           ninja --version
           cmake --version
           echo "VULKAN_SDK = $env:VULKAN_SDK"
+          if (-not $env:VULKAN_SDK) {
+            Write-Host "::error::VULKAN_SDK is not set. The Install Vulkan SDK step is supposed to export it."
+            exit 1
+          }
+          $dxc = Join-Path $env:VULKAN_SDK "Bin\dxc.exe"
+          if (-not (Test-Path $dxc)) {
+            Write-Host "::error::dxc.exe not found at $dxc. NRD's ShaderMake needs it to emit SPIR-V. Remedy: set 'stripdown: false' on the Install Vulkan SDK step, or pin an SDK build that ships Bin/dxc.exe."
+            Get-ChildItem (Join-Path $env:VULKAN_SDK "Bin") -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+            exit 1
+          }
+          & $dxc --version
+
+      - name: Cache Slang toolchain
+        # cmake/SetupBinaries.cmake downloads the Slang release archive into
+        # third_party/slang/ -- the SOURCE tree, not the build tree, and
+        # gitignored. No build-directory cache can ever cover it, so without
+        # this step every single run re-downloads slangc. Keyed on
+        # SetupBinaries.cmake so a PT_SLANG_VERSION bump busts it.
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
 
       - name: Configure
+        # -DPT_ENABLE_DLSS overrides the preset's (absent) value and the
+        # option()'s ON default; command-line -D entries win over preset
+        # cacheVariables. See the PT_CI_DLSS comment at the top of this job.
+        #
+        # NOT cached deliberately. GitHub gives the whole repository a 10 GB
+        # cache budget and release.yml + linux-sanitizers.yml already spend
+        # it on two build trees; adding a third (a Debug tree that now
+        # carries NRD) invites LRU eviction of the caches that matter. A cold
+        # compile test is also the honest signal for a regression gate.
         shell: pwsh
-        run: cmake --preset win-debug
+        run: cmake --preset win-debug -DPT_ENABLE_DLSS=$env:PT_CI_DLSS
 
       - name: Build
         shell: pwsh
         run: cmake --build build/win-debug --parallel
 
       - name: Unit tests (ctest)
-        # See mac-debug job above for rationale. Golden cells are
-        # excluded here and run in their own step so a render failure
-        # produces a downloadable PNG artefact.
+        # -LE "golden|nightly" excludes two label groups:
+        #   golden  -- the golden-image matrix, which cannot run on this
+        #              runner at all (see the block below).
+        #   nightly -- pt_planet_terrain_exhaustive, run in its own step
+        #              on the schedule.
+        # Everything else is a CPU-side doctest binary and runs here.
+        # rhi_accel_vulkan registers on this lane but reports ***Skipped
+        # (SKIP_RETURN_CODE 125): VulkanDevice has no headless path and the
+        # runner has no ICD. That is expected, not a failure.
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure -LE "golden|nightly"
 
@@ -100,61 +167,42 @@ jobs:
         shell: pwsh
         run: ctest --test-dir build/win-debug --output-on-failure --no-tests=error -L nightly
 
-      # Golden-image regression matrix (#45) -- software backend
-      # only. The Windows runner has no usable Vulkan ICD beyond
-      # validation-layer headers, so the vulkan cell would init-fail
-      # the same way the smoke tests would. Software runs via Embree
-      # on the CPU and works on every host.
-      - name: Golden-image regression matrix (software cell)
-        # Pre-clean stale golden_actual/diff PNGs from a cached build
-        # so a render crash can't leave the always-uploaded artifact
-        # populated with a previous run's images. Matches the macOS
-        # job above.
-        id: goldens
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          # Clear stale PNGs but recreate the parent directories:
-          # imgdiff writes via stb_image_write which doesn't auto-mkdir,
-          # and the configure-time `file(MAKE_DIRECTORY)` only fires on
-          # a fresh cmake configure.
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
-              build/win-debug/golden_actual,
-              build/win-debug/golden_diff
-          New-Item -ItemType Directory -Force -Path `
-              build/win-debug/golden_actual,
-              build/win-debug/golden_diff | Out-Null
-          ctest --test-dir build/win-debug --output-on-failure -L golden_software
-          "rc=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          exit 0
-
-      - name: Upload golden-image diff artefacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: goldens-windows
-          path: |
-            build/win-debug/golden_actual/
-            build/win-debug/golden_diff/
-          if-no-files-found: warn
-          retention-days: 14
-
-      - name: Fail job if golden cell failed
-        if: steps.goldens.outputs.rc != '0'
-        shell: pwsh
-        run: |
-          Write-Host "::error::Golden-image cell failed (rc=${{ steps.goldens.outputs.rc }}); see goldens-windows artefact."
-          exit ${{ steps.goldens.outputs.rc }}
+      # Golden-image regression matrix (#45) -- NOT RUN ON THIS RUNNER.
+      #
+      # The matrix used to run its software-backend cells here, because the
+      # software tracer ran on any CPU via Embree. That backend has been
+      # removed: this engine is Windows/Vulkan/NVIDIA-exclusive, and a CPU
+      # tracer that paints its own sky and shares no code with the shaders
+      # could not validate the renderer it was supposedly guarding. Every
+      # golden cell is now a vulkan cell.
+      #
+      # GitHub-hosted windows-latest has no usable Vulkan ICD, so those cells
+      # cannot run here at all -- the same reason the vulkan smoke tests below
+      # are commented out. Running the matrix therefore requires a GPU runner.
+      #
+      # Until a self-hosted RTX runner is attached, the golden matrix is a
+      # LOCAL gate: `ctest -R golden` on a machine with the GPU. That is a real
+      # reduction in CI coverage and is stated here rather than quietly
+      # dropped. The unit tests above still run on every push.
+      #
+      # The `golden_actual/` + `golden_diff/` artefact-upload step and its
+      # companion "fail the job if a cell failed" step were removed with the
+      # matrix. They referenced `steps.goldens.outputs.rc` -- an id no step
+      # has carried since the ctest golden step was deleted -- and the upload
+      # produced an `if-no-files-found: warn` annotation on every single run
+      # for directories that are never created. When a GPU runner lands, the
+      # ctest step, the artefact upload and the failure gate all come back
+      # together; a publisher with nothing to publish is not a head start.
 
       # Backend smoke tests intentionally NOT run on the GH-hosted
-      # windows-latest runner. The runner has no GPU hardware
-      # (no NVIDIA, no AMD, no software Vulkan ICD beyond what we
-      # don't install), so Vulkan init returns
-      # VK_ERROR_INCOMPATIBLE_DRIVER and Software backend would only
-      # exercise the CPU path. GitHub's paid Tesla-T4 GPU runners
-      # ARE Linux/Windows-only but are gated to Team / Enterprise
-      # plans, not available to public open-source repos. See PR #77
-      # for the full investigation.
+      # windows-latest runner. The runner has no GPU hardware and no
+      # Vulkan ICD, so instance/device creation returns
+      # VK_ERROR_INCOMPATIBLE_DRIVER. There is no longer a CPU fallback
+      # to run instead -- the software RHI was deleted along with Embree,
+      # so `vulkan` is the only backend this engine has.
+      # GitHub's paid Tesla-T4 GPU runners ARE Linux/Windows-only but are
+      # gated to Team / Enterprise plans, not available to public
+      # open-source repos. See PR #77 for the full investigation.
       #
       # Run manually on real RTX hardware when validating Vulkan:
       #   .\build\win-debug\src\app\demont.exe --smoke-frames=8 --r-backend=vulkan
@@ -174,6 +222,130 @@ jobs:
   # NOTE: this packages the compile-tested Windows binary; the runner has
   # no NVIDIA GPU, so the nightly is not render-validated. Validate on
   # real RTX hardware before promoting a nightly to a tagged release.
+  # ---------------------------------------------------------------------------
+  # GPU golden matrix -- self-hosted runner on the owner's RTX 5090.
+  #
+  # WHY THIS EXISTS. Every golden cell is a vulkan cell (the software backend
+  # and its Embree dependency were removed), and GitHub-hosted runners have no
+  # usable Vulkan ICD. So from the moment that landed until this job, CI
+  # verified unit tests and NOTHING about what the renderer actually draws --
+  # the 40-cell matrix that catches rendering regressions could not run
+  # anywhere except a developer's machine, by hand.
+  #
+  # WHY pull_request ONLY, and not push. The matrix is a ~7 minute burst of
+  # GPU rendering. The runner host is a workstation, not a build server, and
+  # heavy GPU work landing unannounced while the owner is using the machine
+  # has already crashed it once. Gating on PRs gives the merge gate that was
+  # actually wanted while leaving ordinary work-in-progress pushes alone.
+  #
+  # WHY A SELF-HOSTED RUNNER RATHER THAN A SEPARATE LOCAL CI. Keeping it inside
+  # GitHub Actions preserves PR status checks, so this can block a merge. A
+  # bespoke local script cannot. It also means the NRD source build and the
+  # Slang toolchain stay warm on disk between runs instead of being refetched.
+  #
+  # WHY PIXEL-EXACT GOLDENS ARE VIABLE HERE AT ALL. The matrix is pinned at
+  # MAX_DELTA/MEAN_DELTA/FAIL_PERCENT 0. That is only sustainable because the
+  # hardware is FIXED: the render is bit-identical run-to-run on this GPU
+  # (docs/DETERMINISM_BASELINE.md). On heterogeneous hosted runners a
+  # threshold-0 matrix would be permanently red.
+  #
+  # THE RUNNER IS DELIBERATELY NOT A SERVICE. It is started on demand via
+  # tools/ci/start-runner.ps1 (or the .bat beside it). A PR opened while it is
+  # down gets no GPU check until it comes up -- GitHub queues the job, so it is
+  # deferred rather than lost. That is a conscious trade for not having a boot
+  # service fire renders mid-game.
+  #
+  # DLSS is OFF here for the same reason it is off on the hosted PR lane: no
+  # object file depends on it yet. Revisit when the NGX calls land.
+  # NOTE ON `shell: powershell`: every other job here uses `pwsh`
+  # (PowerShell 7), which GitHub-hosted runners ship. This one runs on a
+  # developer workstation that has Windows PowerShell 5.1 and no pwsh, and
+  # `shell: pwsh` failed with a bare "pwsh: command not found" before the step
+  # produced any other output. Requiring a PowerShell 7 install on the runner
+  # host would be the alternative; not requiring it is cheaper, and every
+  # command in this job is 5.1-compatible.
+  gpu-goldens:
+    name: GPU golden matrix (self-hosted RTX 5090)
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, windows, gpu]
+    # Generous: a cold configure builds NRD from source, and the megakernel
+    # compiles at -O0 (see PT_SLANGC_OPT -- raising it hangs the GPU).
+    timeout-minutes: 90
+    steps:
+      # clean: false is LOAD-BEARING on a self-hosted runner, not a tidiness
+      # preference. actions/checkout defaults to clean: true, which runs
+      # `git clean -ffdx` -- and build/ is gitignored, so that DELETES the
+      # entire build tree including _deps before every run.
+      #
+      # The consequence was every job re-downloading all ~12 FetchContent
+      # dependencies from scratch, and GitHub rate-limiting the burst into
+      # HTTP 504s. Observed failing on glm, civetweb and NRD in consecutive
+      # runs while a plain curl for the same tarballs from the same machine
+      # returned 200 -- the burst was the problem, not connectivity.
+      #
+      # It also silently destroyed the main reason to use a self-hosted
+      # runner: warm caches. The NRD source build and the Slang toolchain are
+      # supposed to persist between runs. With clean: true they never did.
+      #
+      # Tracked files are still reset by checkout, so this does not leave
+      # stale source lying around; it only preserves ignored build output,
+      # which CMake and ninja already handle incrementally.
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+
+      # The runner host has the VS toolchain, the Vulkan SDK and the GPU
+      # driver installed as part of being a development machine. It is
+      # deliberately NOT provisioned by this workflow: reprovisioning a
+      # workstation from CI is how workstations get broken.
+      - name: Configure
+        shell: powershell
+        run: |
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          cmake --preset win-clang-release -DPT_ENABLE_DLSS=OFF
+
+      - name: Build
+        shell: powershell
+        run: |
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          cmake --build build/win-clang-release
+
+      # Clear stale actual/diff PNGs so an always-upload artefact cannot carry
+      # a previous run's images, and recreate the directories -- imgdiff writes
+      # via stb_image_write, which does not mkdir.
+      - name: Golden matrix
+        id: goldens
+        shell: powershell
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+              build/win-clang-release/golden_actual, build/win-clang-release/golden_diff
+          New-Item -ItemType Directory -Force -Path `
+              build/win-clang-release/golden_actual, build/win-clang-release/golden_diff | Out-Null
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          ctest --test-dir build/win-clang-release -R golden --output-on-failure
+
+      # A failing cell is only actionable with the images. Uploaded on failure
+      # only -- on success these are byte-identical to what is already
+      # committed, so uploading them every run would be pure noise.
+      - name: Upload golden diffs
+        if: failure() && steps.goldens.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diffs-gpu
+          path: |
+            build/win-clang-release/golden_actual/
+            build/win-clang-release/golden_diff/
+          if-no-files-found: warn
+
   nightly-release:
     name: Nightly release (scheduled)
     needs: windows
@@ -228,9 +400,27 @@ jobs:
           cache: true
           stripdown: true
 
+      - name: Cache Slang toolchain
+        if: steps.nightly_check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: third_party/slang
+          key: slang-${{ runner.os }}-${{ hashFiles('cmake/SetupBinaries.cmake') }}
+
       - name: Configure (release)
         if: steps.nightly_check.outputs.skip != 'true'
-        run: cmake --preset win-release
+        # DLSS OFF here even though the `windows` compile job above turns it
+        # ON for the nightly. The asymmetry is deliberate: that job only has
+        # to COMPILE, this one PUBLISHES. Shipping DLSS would require two
+        # things this job does not do -- staging PT_DLSS_RUNTIME_DLLS next to
+        # demont.exe (nvngx_dlss.dll / nvngx_dlssd.dll; without them the
+        # feature cannot initialise), and the NVIDIA attribution that the
+        # RTX SDK licence requires of anything publicly redistributing those
+        # binaries. Until both land, an artefact built with DLSS "on" would
+        # be all licence exposure and no functionality. NRD stays ON: it is
+        # a static library, it needs no runtime redistributable, and it is
+        # a real feature of the shipped binary.
+        run: cmake --preset win-release -DPT_ENABLE_DLSS=OFF
 
       - name: Build
         if: steps.nightly_check.outputs.skip != 'true'
