@@ -55,8 +55,16 @@ option(PT_ENABLE_OPTIX
 # PT_ENABLE_NRD directly, so a stale =ON in the cache is harmless: the
 # FetchContent of NRD doesn't run, no target is linked, and the
 # source-side PT_ENABLE_NRD compile-definition stays undefined.
+# Default ON as of the real RELAX_DIFFUSE integration: this engine is
+# NVIDIA-exclusive, NRD is a headline feature rather than an experiment, and
+# a flag nobody turns on is a flag nobody tests. Gated on
+# PT_ENABLE_VULKAN_BACKEND via PT_NRD_ACTIVE (see cmake/Dependencies.cmake),
+# so a Linux / no-Vulkan configure still skips the fetch and links nothing.
+# The RUNTIME cvar (r_denoiser) still defaults to `off`, so the
+# out-of-the-box render stays the native, physically-correct one and the
+# pixel-exact golden matrix keeps a ground-truth reference.
 option(PT_ENABLE_NRD
-    "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" OFF)
+    "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 # Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;
