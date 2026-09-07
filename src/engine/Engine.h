@@ -2050,6 +2050,63 @@ private:
     static constexpr int kUpscaleProbeGraceFrames = 60;
     // --- end render scale --------------------------------------------------
 
+    // --- DLSS Super Resolution / DLAA (docs/DLSS_INTEGRATION_PLAN.md) ------
+    //
+    // The mode that ACTUALLY resolved this frame, after the cvar, the
+    // build flag, the hardware capability check, the HDR-pipeline
+    // requirement and the optimal-settings query have all had their say.
+    // Distinct from the r_dlss cvar string, which is what the user
+    // ASKED for -- the cvar is never rewritten on a fallback, because
+    // silently editing the user's setting hides the fact that it did
+    // not take.
+    pt::rhi::UpscalerMode dlss_mode_   = pt::rhi::UpscalerMode::Off;
+    bool                  dlss_active_ = false;
+    // Cache for the optimal-settings query. NGX is asked once per
+    // (mode, display extent) pair -- on a mode change or a swapchain
+    // resize -- and never per frame: the query is a driver round trip,
+    // and asking every frame would also make it impossible to tell from
+    // a log whether the extent had actually changed.
+    pt::rhi::UpscalerMode     dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+    std::uint32_t             dlss_query_display_w_ = 0;
+    std::uint32_t             dlss_query_display_h_ = 0;
+    pt::rhi::UpscalerSettings dlss_settings_{};
+    // Display-extent linear-HDR target DLSS writes. Allocated only while
+    // DLSS is engaged and freed the moment it is not, same lifecycle as
+    // present_ldr above. RGBA16F because it holds the same quantity
+    // post_denoise_hdr holds -- unbounded linear radiance -- and handing
+    // the tonemap an 8-bit version of it would throw away the range
+    // before the operator that needs it ever ran.
+    std::uint64_t dlss_output_tex_id_ = 0;
+    std::uint32_t dlss_output_w_      = 0;
+    std::uint32_t dlss_output_h_      = 0;
+    // Engaged/disengaged edge latch for the one-line state log, and a
+    // one-shot latch for the "DLSS owns r_render_scale" explanation so
+    // a user who keeps typing r_render_scale is told why it is inert --
+    // the same courtesy r_svgf_atrous_passes already extends when
+    // r_denoiser makes it inert.
+    bool dlss_engaged_logged_       = false;
+    bool dlss_owns_scale_logged_    = false;
+    // One log line per distinct fallback reason, so a build without the
+    // SDK, an unsupported GPU and a failed query are distinguishable in
+    // the log but none of them repeats per frame.
+    bool dlss_fallback_logged_      = false;
+    // What the "optimal settings" line last reported. The query is
+    // resolved TWICE per frame (window extent before BeginFrame, real
+    // swapchain extent after), and on a host where those two disagree
+    // permanently -- DPI scaling, or a surface whose caps clamp the
+    // swapchain -- the cache would miss on both calls and print the line
+    // every frame. Logging on a change of ANSWER rather than on a cache
+    // refill makes the line immune to that: it is a state-transition
+    // log, like every other one in this file.
+    pt::rhi::UpscalerMode dlss_logged_mode_      = pt::rhi::UpscalerMode::Off;
+    std::uint32_t         dlss_logged_display_w_ = 0;
+    std::uint32_t         dlss_logged_display_h_ = 0;
+    std::uint32_t         dlss_logged_render_w_  = 0;
+    std::uint32_t         dlss_logged_render_h_  = 0;
+    bool dlss_hdr_conflict_logged_  = false;
+    bool dlss_rr_pending_logged_    = false;
+    // --- end DLSS ----------------------------------------------------------
+
     // Physical lens flare (Hullin paraxial). LensSystem + traced
     // ghost matrices live for the engine's lifetime; per-frame we
     // compute screen-UV scales from the current viewport via
@@ -2375,6 +2432,25 @@ private:
     // at creation time, not per frame. Returns false while the NGX calls are
     // unwired, which is correct: nothing consumes the buffers yet.
     bool DlssRayReconstructionRequested() const;
+    // Ask the backend what render extent `mode` wants for a display of
+    // `display_w` x `display_h`, caching the answer per (mode, extent)
+    // so NGX is asked once per mode change or resize rather than per
+    // frame. Fills dlss_settings_ and returns whether the mode is
+    // usable; a false answer is the "fall back to off" signal and has
+    // already logged the reason.
+    //
+    // Called TWICE per frame by design, and the second call is normally
+    // free (cache hit). Once before BeginFrame against the window
+    // extent, because the denoiser-G-buffer gate is resolved there and
+    // needs to know whether DLSS is on; then again after BeginFrame
+    // against the real swapchain extent, which is the authoritative one
+    // and the only size the NGX feature may be created for. They differ
+    // only on a resize frame, and that is exactly the frame where
+    // trusting the window size would create a feature for the wrong
+    // extent.
+    bool ResolveDlssForDisplay(pt::rhi::UpscalerMode mode,
+                               std::uint32_t display_w,
+                               std::uint32_t display_h);
     // Issue #50 -- does the active backend have a working NVIDIA
     // RayTracingDenoiser? Refreshed from Device::SupportsNrdLibrary()
     // once per frame, because the runtime half of that answer can flip

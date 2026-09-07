@@ -7,6 +7,7 @@
 #include "Resources.h"
 #include "Swapchain.h"
 #include "Types.h"
+#include "Upscaler.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -257,7 +258,16 @@ public:
     // command buffer flow.
     struct DenoiseDesc {
         TextureHandle color_in;       // RGBA16F linear (per-frame, not accumulated)
-        TextureHandle depth_in;       // R32F clip-space depth (z/w in [0,1])
+        // R32F LINEAR CAMERA-SPACE depth -- `h0.t * dot(rd0, fwd)`, i.e.
+        // metres along the view axis, with a large sky sentinel (1.0e10).
+        // This comment used to say "clip-space depth (z/w in [0,1])",
+        // which contradicted the shader and was simply wrong: see
+        // PathTrace.slang's depth_tex declaration ("R32F linear
+        // camera-space depth") and its write site, which have always
+        // written linear view depth. Found while auditing DLSS's depth
+        // input (docs/DLSS_INTEGRATION_PLAN.md SS2.1 caveat B); the
+        // shader is authoritative and this is now corrected to match it.
+        TextureHandle depth_in;
         TextureHandle motion_in;      // RG16F pixel-space (prev - curr)
         // World-space surface normals at primary hit (RGBA16F, .xyz =
         // unit normal, .w unused). Required by the Vulkan SVGF/NRD
@@ -518,6 +528,52 @@ public:
     virtual bool SupportsNrdLibrary() const { return false; }
 
     virtual void Denoise(const DenoiseDesc& /*d*/) {}
+
+    // ---- Temporal upscaler (src/rhi/Upscaler.h, plan SS1.5) -------------
+    //
+    // Three virtuals rather than one, because the engine needs the
+    // ANSWER to "what render extent does this mode want?" strictly
+    // before it allocates anything for the frame, and it needs that
+    // answer without having recorded a command buffer yet.
+    //
+    // The default implementations report "no upscaler" so a backend that
+    // has none (and a build without PT_ENABLE_DLSS) needs no #if at the
+    // call site -- exactly how SupportsNrdLibrary() lets the engine stop
+    // reasoning about build flags.
+
+    // True iff this backend has a live upscaler runtime AND the
+    // hardware/driver reports the feature usable. Folds the build flag,
+    // the runtime init and any latched failure into one answer.
+    //
+    // Contract for callers: when this returns false, do NOT issue
+    // Upscale() -- fall back to the engine's own resolve (or to no
+    // scaling at all) and say so once in the log. Same shape as the
+    // OptiX / NRD unavailability paths.
+    virtual bool SupportsUpscaler() const { return false; }
+
+    // Ask the runtime what render extent `mode` wants for a given
+    // display extent, once per mode change and per swapchain resize.
+    // Returns false when the mode is unavailable on this
+    // hardware/driver/runtime, leaving `out.supported` false and the
+    // extents zero. The caller must treat that as "fall back to Off",
+    // never as a size to clamp.
+    virtual bool QueryUpscalerSettings(UpscalerMode /*mode*/,
+                                       std::uint32_t /*display_width*/,
+                                       std::uint32_t /*display_height*/,
+                                       UpscalerSettings& /*out*/) { return false; }
+
+    // Record the upscale into the frame's in-flight command buffer.
+    // Must be called AFTER whatever produced d.color_in and BEFORE
+    // EndFrame, exactly like Denoise(). Returns false when nothing was
+    // recorded -- the caller must then not present d.output, because
+    // nothing wrote it.
+    virtual bool Upscale(const UpscaleDesc& /*d*/) { return false; }
+
+    // Drop the upscaler's feature instance (freeing its VRAM) while
+    // leaving the runtime initialised. Called when the mode returns to
+    // Off, and on teardown paths that must not leave a feature bound to
+    // a destroyed swapchain.
+    virtual void ReleaseUpscalerFeature() {}
 
     // Predictive pipeline JIT prewarming. Engine signals "I will need
     // pipeline `kernel_name` soon" so the backend can start (or finish)
