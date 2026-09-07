@@ -114,6 +114,20 @@ extern const unsigned long shader_CloudsComposite_spirv_size;
 // in the shared descriptor-set layout, so it needs no layout change.
 extern const unsigned char shader_AccelProbe_spirv_data[];
 extern const unsigned long shader_AccelProbe_spirv_size;
+// ReSTIR DI, Vulkan dispatch (issue #23). The three resampling kernels
+// chained behind PathTrace's WRS candidate generation. RestirFinal
+// traces a shadow ray, so it ships the same rq / norq pair PathTrace
+// does; the other two touch no acceleration structure and need only one
+// blob each. All three ride the shared descriptor-set layout -- see the
+// VULKAN BINDING NOTICE at the top of shaders/RestirTemporal.slang.
+extern const unsigned char shader_RestirTemporal_spirv_data[];
+extern const unsigned long shader_RestirTemporal_spirv_size;
+extern const unsigned char shader_RestirSpatial_spirv_data[];
+extern const unsigned long shader_RestirSpatial_spirv_size;
+extern const unsigned char shader_RestirFinal_spirv_data[];
+extern const unsigned long shader_RestirFinal_spirv_size;
+extern const unsigned char shader_RestirFinal_norq_spirv_data[];
+extern const unsigned long shader_RestirFinal_norq_spirv_size;
 }
 
 namespace pt::rhi::vk {
@@ -233,6 +247,27 @@ constexpr std::uint32_t kSlotToTexBinding[kNumTexSlots] = {
     37, // engine slot 18 -> shader binding 37 (godrays_mask scratch, Wave 9)
     48, // engine slot 19 -> shader binding 48 (exposure_tex, DLSS)
 };
+// --- DO NOT ADD A BINDING NUMBER ABOVE 48 TO THE SHARED LAYOUT -------------
+// Measured on 32.0.16.1656 / RTX 5090 while porting ReSTIR (#23). Adding
+// two STORAGE_BUFFER bindings at 49 and 50 -- nothing else changed, and
+// nothing ever bound them -- made vkDestroyDevice take SIXTEEN SECONDS,
+// on every process, at every frame count from 8 up. The identical pair
+// declared at 40 and 41 costs 157 ms. It is the binding NUMBERS, not the
+// count: 48 is the highest this UPDATE_AFTER_BIND layout tolerates
+// before the driver's teardown falls off a cliff.
+//
+// It is invisible interactively (who times their own quit?) and brutal
+// in the golden matrix, where every cell is one process: it took the
+// suite from ~4 s a cell to ~18 s, a 40-cell run from about three
+// minutes to over six, with the renders themselves unchanged.
+//
+// 40..45 are OceanCascades' reservation (#293) and 46/47/48 are taken,
+// so there is no free number left below the cliff. A kernel that needs
+// another storage buffer should BORROW a binding whose owner it does not
+// itself read -- which is what ReSTIR does with 28 and 30 below, and
+// what StarsComposite already does with images -- rather than open a new
+// one above 48 and pay this at every exit.
+// --- end binding-number ceiling --------------------------------------------
 constexpr std::uint32_t kSlotToBufBinding[24] = {
     0,  // engine slot 0 unused
     3,  // engine slot 1 -> shader binding 3  (mesh_positions)
@@ -263,8 +298,19 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     // Hierarchical light tree (#129): packed-node SSBO consumed by
     // PathTrace.slang's O(log N) NEE picker.
     28, // engine slot 13 -> shader binding 28 (light_tree_nodes)
-    // ReSTIR DI Phase A (#78): per-pixel reservoir SSBO.
-    29, // engine slot 14 -> shader binding 29 (reservoir_curr_buf)
+    // ReSTIR DI Phase A (#78): per-pixel reservoir SSBO. This is
+    // reservoir A -- the one PathTrace's candidate-generation block
+    // writes. The Vulkan dispatch port (#23) needs three reservoirs
+    // bound at once (RestirTemporal reads A and B while writing C) and
+    // BORROWS slots 13 and 15 for B and C on its own three dispatches:
+    // no ReSTIR kernel reads the light tree or the smoke emitters, the
+    // engine rebinds both slots every frame before the PathTrace
+    // dispatch that does read them, and no pass between ReSTIR and that
+    // rebind touches bindings 28 or 30. Borrowing is not stylistic
+    // here -- see the binding-number ceiling above this table for what
+    // opening two new bindings cost.
+    29, // engine slot 14 -> shader binding 29 (reservoir A; ReSTIR also
+        //                  borrows 13 -> 28 for B and 15 -> 30 for C)
     // Fluid Phase 1 (#136): smoke emitter list. Originally targeted
     // engine slot 13 / binding 28 but moved during integration merge
     // because light tree #129 already owns those.
@@ -291,9 +337,11 @@ constexpr std::uint32_t kSlotToBufBinding[24] = {
     46, // engine slot 21 -> shader binding 46 (atmo_ms_lut)
     // Land cover (#300): the surface albedo raster, an equirectangular
     // RGBA8 grid packed one texel per uint. Slot 22 is the LAST entry this
-    // table has; a further buffer needs kSlotToBufBinding, VulkanDevice's
-    // bound_buf_[24], MetalDevice's bound_buf_[24] and SoftwareDevice's
-    // buffers[24] all resized together.
+    // table has; a further buffer needs kSlotToBufBinding and
+    // VulkanDevice's bound_buf_[24] / bound_buf_off_[24] resized
+    // together, plus the STORAGE_BUFFER descriptor-pool count bumped in
+    // lockstep -- and a binding NUMBER at or below 48 (see the ceiling
+    // note above).
     47, // engine slot 22 -> shader binding 47 (land_albedo)
     0,  // engine slot 23 unused
 };
@@ -2005,6 +2053,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     // is retained rather than spent.
     // #280 adds atmo_ms_lut (40). 20 -> 21; the +8 slack still retained.
     // Land cover (#300) adds land_albedo (47). 21 -> 22; slack retained.
+    // ReSTIR DI's Vulkan dispatch (#23) does NOT move this number: its
+    // three reservoirs ride slots 13/14/15, all three of which were
+    // already counted here. This count MUST move in lockstep with the
+    // add_binding(..., STORAGE_BUFFER) calls below -- an undersized pool
+    // does not fail at startup, it fails with VK_ERROR_OUT_OF_POOL_MEMORY
+    // on the first frame that populates every binding.
     psizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,          kTotalSets * 22 + 8 });
     psizes.push_back({ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,          kTotalSets * 1 + 1 });
     // Type list for the MUTABLE_EXT slot(s): storage image (cloud kernels),
@@ -2275,6 +2329,14 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // module is rejected at vkCreateComputePipelines. See
         // kSlotToTexBinding[]'s entry for why the scalar needed an image.
         add_binding(48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+        // 48 is the LAST binding this layout may declare -- adding 49 and
+        // 50 costs 16 s in vkDestroyDevice on this driver. See the
+        // binding-number ceiling above kSlotToBufBinding[].
+        //
+        // ReSTIR DI's Vulkan dispatch (#23) adds nothing here: its three
+        // reservoirs ride bindings 28 / 29 / 30 and all five textures it
+        // touches (denoise_color 6, depth 7, motion 8, normal 16, albedo
+        // 17) were already declared.
 
         // UPDATE_AFTER_BIND for every binding so we can rewrite the
         // shared descriptor set between dispatches in the same cmd
@@ -2552,6 +2614,39 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         build_pipeline("clouds_composite",
                        shader_CloudsComposite_spirv_data,
                        shader_CloudsComposite_spirv_size);
+        // ReSTIR DI, Vulkan dispatch (issue #23). Registering these
+        // three names is what makes `r_restir 1` actually do something:
+        // the whole engine-side chain (reservoir allocation, the 3-pass
+        // dispatch order, the ping-pong, the shadow test) already
+        // existed and was gated behind restir_*_pipeline_id_ != 0, which
+        // no Vulkan build could ever satisfy because the kernels were
+        // never compiled for SPIR-V. Engine::EnsurePipelineHandles
+        // re-resolves every frame, so the ids land as soon as this
+        // worker finishes.
+        //
+        // All three ride the shared pipeline layout. They add no storage
+        // IMAGE bindings (denoise_color 6, depth 7, motion 8, normal 16,
+        // albedo 17 are all already declared) and two storage BUFFER
+        // bindings, 49 and 50, for the reservoir ping-pong -- both added
+        // to the layout above with the matching pool bump.
+        build_pipeline("restir_temporal",
+                       shader_RestirTemporal_spirv_data,
+                       shader_RestirTemporal_spirv_size);
+        build_pipeline("restir_spatial",
+                       shader_RestirSpatial_spirv_data,
+                       shader_RestirSpatial_spirv_size);
+        // Same rq / norq choice as pathtrace above: the default blob
+        // declares RayQueryKHR for the survivor's shadow ray and would
+        // be (correctly) rejected on a driver without VK_KHR_ray_query.
+        if (rt_supported_) {
+            build_pipeline("restir_final",
+                           shader_RestirFinal_spirv_data,
+                           shader_RestirFinal_spirv_size);
+        } else {
+            build_pipeline("restir_final",
+                           shader_RestirFinal_norq_spirv_data,
+                           shader_RestirFinal_norq_spirv_size);
+        }
         // Acceleration-structure probe (issue #254 P0 / #251). Only
         // built when the driver actually has ray query -- the SPIR-V
         // module declares the RayQueryKHR capability, so

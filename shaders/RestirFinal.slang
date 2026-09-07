@@ -44,18 +44,43 @@
 // straightforward follow-up but adds a chunk of duplicated code that
 // only matters for fractal-heavy scenes.
 
-// vk::image_format: depth_tex R32F, normal_tex / albedo_tex /
-// denoise_color all RGBA16F. See PathTrace.slang for the NVIDIA
-// Format=Unknown rationale.
-[[vk::binding(0, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
-[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
-[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
-[[vk::binding(3, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> denoise_color;
-[[vk::binding(4, 0)]]   StructuredBuffer<float4>  reservoir_in;
-[[vk::binding(5, 0)]]   StructuredBuffer<float4>  light_prims;
-[[vk::binding(6, 0)]]   StructuredBuffer<float4>  primitives;
+// VULKAN BINDING NOTICE (issue #23) -- see RestirTemporal.slang's copy
+// for the full rationale. Short version: these are positions in
+// VulkanDevice.cpp's ONE shared descriptor-set layout, not the
+// declaration-order slots Slang's (now-removed) Metal backend used.
+//
+//   binding 6  <- engine tex slot 2   denoise_color  (read + write)
+//   binding 7  <- engine tex slot 3   depth_tex
+//   binding 16 <- engine tex slot 8   normal_tex
+//   binding 17 <- engine tex slot 9   albedo_tex
+//   binding 5  <- engine buf slot 3   primitives
+//   binding 27 <- engine buf slot 12  light_prims
+//   binding 29 <- engine buf slot 14  reservoir A (spatial's output)
+//   binding 2  <- engine accel slot 2 scene_tlas
+//
+// Binding 2 is the shared layout's ONE polymorphic slot (MUTABLE_EXT
+// where the extension is available, a typed AS otherwise). Declaring
+// it as an acceleration structure here is the same declaration
+// PathTrace.slang makes, so there is no type collision -- see the
+// binding-2 note in VulkanDevice.cpp before repurposing it.
+//
+// vk::image_format is MANDATORY on every storage image, and doubly so
+// on denoise_color, which this kernel WRITES: a storage image left at
+// Format=Unknown silently no-ops its OpImageWrite on this NVIDIA
+// driver, i.e. ReSTIR would dispatch, cost time, and change nothing.
+// depth_tex R32F; normal_tex / albedo_tex / denoise_color RGBA16F.
+[[vk::binding(6, 0),  vk::image_format("rgba16f")]] RWTexture2D<float4> denoise_color;
+[[vk::binding(7, 0),  vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(16, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
+[[vk::binding(17, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> albedo_tex;
+[[vk::binding(29, 0)]]  StructuredBuffer<float4>  reservoir_in;
+[[vk::binding(27, 0)]]  StructuredBuffer<float4>  light_prims;
+[[vk::binding(5, 0)]]   StructuredBuffer<float4>  primitives;
 #if !defined(PT_TARGET_SPIRV) || !defined(PT_SPIRV_NO_RAYQUERY)
-[[vk::binding(7, 0)]] RaytracingAccelerationStructure scene_tlas;
+// Same rq / norq split PathTrace.slang carries: the norq variant never
+// declares RayQueryKHR, so it loads on drivers without VK_KHR_ray_query
+// (the shadow trace then falls back to the analytic-prim scan alone).
+[[vk::binding(2, 0)]] RaytracingAccelerationStructure scene_tlas;
 #endif
 
 import RestirReservoir;
