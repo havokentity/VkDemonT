@@ -114,6 +114,19 @@ if ($Reconfigure -or -not (Test-Path (Join-Path $RunnerDir '.runner'))) {
 }
 
 # ---- run --------------------------------------------------------------------
+# GitHub Actions stamps every log line in UTC (the trailing Z), both in the
+# web UI and in this runner's console output, and that is not configurable --
+# there is no runner or workflow setting that localises it. Printing the offset
+# here beats doing the arithmetic in your head at 2am while reading a job log.
+$now = Get-Date
+$utc = $now.ToUniversalTime()
+$off = [System.TimeZoneInfo]::Local.GetUtcOffset($now)
+$sign = if ($off.Ticks -ge 0) { '+' } else { '-' }
+Write-Host ""
+Write-Host ("Timestamps: GitHub logs are UTC. Local {0} = {1}Z  (UTC{2}{3:00}:{4:00}, {5})" -f `
+            $now.ToString('HH:mm'), $utc.ToString('HH:mm'), $sign,
+            [Math]::Abs($off.Hours), [Math]::Abs($off.Minutes),
+            [System.TimeZoneInfo]::Local.Id) -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Starting runner '$RunnerName'. Ctrl+C to stop." -ForegroundColor Green
 Write-Host "Queued PR jobs will start picking up now." -ForegroundColor Green

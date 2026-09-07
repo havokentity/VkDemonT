@@ -3478,7 +3478,18 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
         if(_backend STREQUAL "metal")
             return()
         endif()
-        if(FALSE)
+        # Skip a vulkan pair on a host that has no Vulkan backend compiled in,
+        # mirroring the identical guard in pt_add_golden_cell. This function
+        # has its OWN registration path and does not go through that macro, so
+        # the check has to be repeated here.
+        #
+        # This slot previously held `if(_backend STREQUAL "software" AND NOT
+        # WIN32)`. When the software RHI was removed it was neutered to
+        # `if(FALSE)` rather than re-pointed, which left the vulkan pairs
+        # registering unconditionally -- so the Linux sanitizer lane, which
+        # configures with PT_ENABLE_VULKAN_BACKEND=OFF, registered six cells
+        # whose renderer does not exist and failed all six.
+        if(_backend STREQUAL "vulkan" AND NOT PT_ENABLE_VULKAN_BACKEND)
             return()
         endif()
         set(_cell worldframe_${_name}__${_backend})
@@ -3556,7 +3567,13 @@ if(TARGET pt_render_one_frame AND TARGET imgdiff)
     # the switch under test. The committed-golden comparison is still
     # made -- by golden_cornell_csg__vulkan__off_diff, which is the
     # cell that owns it.
-    if(WIN32)
+    # WIN32 *and* a Vulkan backend: this cell is registered by hand rather than
+    # through pt_add_golden_cell, so it does not inherit that macro's
+    # backend-availability guard and needs its own. Without it the Linux
+    # sanitizer lane (PT_ENABLE_VULKAN_BACKEND=OFF) registered a vulkan cell
+    # whose renderer is not compiled in -- the same defect the worldframe
+    # function had, from the same software-RHI removal.
+    if(WIN32 AND PT_ENABLE_VULKAN_BACKEND)
         set(_rb_png ${CMAKE_BINARY_DIR}/golden_actual/cornell_csg__vulkan__off__rebaseoff.png)
         set(_rb_wd  ${CMAKE_BINARY_DIR}/golden_workdir/golden_cornell_csg__vulkan__off__rebaseoff)
         file(MAKE_DIRECTORY ${_rb_wd})
