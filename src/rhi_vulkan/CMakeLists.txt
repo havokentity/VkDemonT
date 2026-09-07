@@ -3,6 +3,14 @@
 add_library(pt_rhi_vulkan STATIC
     VulkanDevice.cpp
     VulkanDenoiser.cpp
+    # DLSS Super Resolution / DLAA on NGX. Compiled UNCONDITIONALLY,
+    # unlike the NRD and OptiX wrappers below: VulkanDevice holds a
+    # unique_ptr<VulkanNgxUpscaler> on every build and calls it from four
+    # non-#if'd overrides, so the TU has to exist even when the SDK
+    # doesn't. Without PT_ENABLE_DLSS every NGX call body compiles out
+    # and the class reports Available() == false forever -- which is
+    # exactly the "graceful degradation" contract r_dlss documents.
+    VulkanNgxUpscaler.cpp
 )
 
 target_include_directories(pt_rhi_vulkan PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -38,6 +46,28 @@ if(PT_NRD_ACTIVE)
     target_sources(pt_rhi_vulkan PRIVATE VulkanNrdLibDenoiser.cpp)
     target_link_libraries(pt_rhi_vulkan PRIVATE NRD)
     target_compile_definitions(pt_rhi_vulkan PUBLIC PT_ENABLE_NRD=1)
+endif()
+
+# ---- DLSS Super Resolution / DLAA (NVIDIA NGX, Vulkan) -------------------
+# Gated by PT_DLSS_ACTIVE, which the top-level Dependencies.cmake sets
+# once the SDK has been fetched, the import library exists, and the
+# Vulkan backend is on. VulkanNgxUpscaler.cpp is in the source list
+# unconditionally (see the comment there); this block is only about the
+# include path, the import library, and the PT_ENABLE_DLSS define that
+# turns the NGX call bodies on.
+#
+# PUBLIC on the define rather than PRIVATE, matching PT_ENABLE_NRD: the
+# engine reads it too, to decide whether "r_dlss requested on a build
+# without DLSS" is the fallback reason it should name in the log.
+#
+# nvsdk_ngx_d.lib is a static import library for the DYNAMIC CRT, so it
+# pairs with this project's clang-cl /MD build. It resolves the
+# NVSDK_NGX_* symbols against _nvngx.dll, which the NVIDIA DRIVER
+# provides -- the nvngx_dlss.dll copied beside demont.exe below is the
+# feature snippet the driver then loads, not this library's own DLL.
+if(PT_DLSS_ACTIVE)
+    target_link_libraries(pt_rhi_vulkan PRIVATE dlss_ngx)
+    target_compile_definitions(pt_rhi_vulkan PUBLIC PT_ENABLE_DLSS=1)
 endif()
 
 # ---- OptiX denoiser (NVIDIA only) -----------------------------------------

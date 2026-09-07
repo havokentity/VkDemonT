@@ -2741,6 +2741,91 @@ bool Engine::DlssRayReconstructionRequested() const {
     return rr->GetInt() != 0;
 }
 
+// See the declaration in Engine.h for why this is called twice a frame.
+bool Engine::ResolveDlssForDisplay(pt::rhi::UpscalerMode mode,
+                                   std::uint32_t display_w,
+                                   std::uint32_t display_h) {
+    if (mode == pt::rhi::UpscalerMode::Off) return false;
+    if (device_ == nullptr)                 return false;
+    if (display_w == 0 || display_h == 0)   return false;
+
+    const bool query_stale = (dlss_query_mode_      != mode)      ||
+                             (dlss_query_display_w_ != display_w) ||
+                             (dlss_query_display_h_ != display_h);
+    if (query_stale) {
+        pt::rhi::UpscalerSettings s{};
+        const bool ok =
+            device_->QueryUpscalerSettings(mode, display_w, display_h, s);
+        dlss_settings_        = ok ? s : pt::rhi::UpscalerSettings{};
+        dlss_query_mode_      = mode;
+        dlss_query_display_w_ = display_w;
+        dlss_query_display_h_ = display_h;
+
+        std::string mode_str = "off";
+        if (auto* v = pt::console::Console::Get().FindCVar("r_dlss")) {
+            mode_str = v->value;
+        }
+        if (ok) {
+            // Log on a change of ANSWER, not on a cache refill -- see
+            // dlss_logged_* in Engine.h for why the distinction matters.
+            const bool answer_changed =
+                (dlss_logged_mode_      != mode)             ||
+                (dlss_logged_display_w_ != display_w)        ||
+                (dlss_logged_display_h_ != display_h)        ||
+                (dlss_logged_render_w_  != s.render_width)   ||
+                (dlss_logged_render_h_  != s.render_height);
+            if (answer_changed) {
+                dlss_logged_mode_      = mode;
+                dlss_logged_display_w_ = display_w;
+                dlss_logged_display_h_ = display_h;
+                dlss_logged_render_w_  = s.render_width;
+                dlss_logged_render_h_  = s.render_height;
+                // THE line that answers "what render extent did DLSS
+                // actually pick?" -- the number that has to be
+                // reviewable, printed where a bug report can find it,
+                // and derived from the query rather than from any ratio
+                // in this source tree.
+                LOG_INFO("engine: DLSS optimal settings for r_dlss={} at "
+                         "display {}x{} -> render {}x{} (ratio {:.4f}, {:.1f}% "
+                         "of display pixels); runtime's dynamic range "
+                         "{}x{}..{}x{}, unused -- this engine renders at a "
+                         "fixed per-mode extent",
+                         mode_str, display_w, display_h,
+                         s.render_width, s.render_height,
+                         float(s.render_width) / float(display_w),
+                         100.0f * float(s.render_width) * float(s.render_height)
+                             / (float(display_w) * float(display_h)),
+                         s.min_width, s.min_height, s.max_width, s.max_height);
+            }
+            // Re-arm the degradation line on ANY success, not just a
+            // changed answer: a later genuine failure still deserves to
+            // be said out loud.
+            dlss_fallback_logged_ = false;
+        } else if (!dlss_fallback_logged_) {
+            // THE degradation line: one line, naming the mode and the
+            // extent that was asked about. The backend has already
+            // logged which specific check said no (build without
+            // PT_ENABLE_DLSS / missing nvngx_dlss.dll / driver too old /
+            // GPU unsupported / mode not implemented), so this does not
+            // repeat that -- it says what the engine is going to do
+            // about it.
+            LOG_WARN("engine: r_dlss={} is unavailable on this build / GPU / "
+                     "driver at display {}x{} -- falling back to off. "
+                     "r_render_scale returns to being the user's knob. See the "
+                     "preceding `DLSS:` line for which check failed.",
+                     mode_str, display_w, display_h);
+            dlss_fallback_logged_ = true;
+        }
+    }
+    // A supported answer still has to carry a usable extent. Belt and
+    // braces against a runtime that reports success with a zero size:
+    // the alternative is a zero-sized render, which the plan explicitly
+    // forbids degrading into.
+    return dlss_settings_.supported &&
+           dlss_settings_.render_width  > 0 &&
+           dlss_settings_.render_height > 0;
+}
+
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }
 
 Engine* Engine::Instance() { return g_instance; }
@@ -3865,6 +3950,11 @@ void Engine::TearDownDevice() {
         // Render-scale internal present target (r_render_scale). Only
         // ever allocated on a scaled frame, so this is usually a no-op.
         if (present_ldr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+        // DLSS display-extent HDR target, and the NGX feature that
+        // writes it. The feature must go before the device does: it
+        // holds driver-side GPU resources keyed to this VkDevice.
+        if (dlss_output_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+        device_->ReleaseUpscalerFeature();
         if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
@@ -3983,6 +4073,20 @@ void Engine::TearDownDevice() {
     specular_albedo_tex_id_       = 0;
     roughness_tex_id_             = 0;
     specular_hit_distance_tex_id_ = 0;
+    // DLSS. The extent fields go to 0 too so the next engaged frame
+    // reallocates rather than trusting a size that belonged to a
+    // destroyed device, and the query cache is cleared so the new device
+    // is asked afresh (a backend switch can change the answer).
+    dlss_output_tex_id_   = 0;
+    dlss_output_w_        = 0;
+    dlss_output_h_        = 0;
+    dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+    dlss_query_display_w_ = 0;
+    dlss_query_display_h_ = 0;
+    dlss_settings_        = pt::rhi::UpscalerSettings{};
+    dlss_mode_            = pt::rhi::UpscalerMode::Off;
+    dlss_active_          = false;
+    dlss_engaged_logged_  = false;
     tonemap_pipeline_id_     = 0;
     stars_composite_pipeline_id_ = 0;
     aurora_composite_pipeline_id_ = 0;
@@ -8043,6 +8147,121 @@ void Engine::RenderFrame() {
 
     auto& C = pt::console::Console::Get();
 
+    // --- DLSS Super Resolution / DLAA -------------------------------------
+    //
+    // Resolved HERE, before the denoiser state and long before the
+    // render-scale block, because it decides two things that everything
+    // downstream depends on: whether the denoiser G-buffers get
+    // allocated at all, and what the internal render extent IS.
+    //
+    // The ladder of things that can say no, in the order they are asked
+    // (each one falls back to `off` with ONE log line, never a crash and
+    // never a zero-sized render):
+    //   1. the cvar itself is `off`, or names something unparseable
+    //   2. r_hdr_pipeline is 0 -- DLSS consumes linear HDR
+    //   3. the backend has no upscaler: build without PT_ENABLE_DLSS, no
+    //      NVIDIA driver, a GPU without the feature, or a missing
+    //      nvngx_dlss.dll. Device::QueryUpscalerSettings folds all four
+    //      into one answer, exactly as SupportsNrdLibrary() does for NRD.
+    //   4. the optimal-settings query fails, or returns a zero extent
+    //      (how the runtime signals a mode it does not implement)
+    //
+    // The r_dlss cvar is NOT rewritten on a fallback. The user asked for
+    // a mode; the engine says why it could not have it and runs without
+    // it. Silently editing the setting would hide the failure and make
+    // the next `r_dlss` read look like the user never asked.
+    {
+        std::string dlss_str = "off";
+        if (auto* v = C.FindCVar("r_dlss")) dlss_str = v->value;
+        pt::rhi::UpscalerMode want_dlss = pt::rhi::UpscalerMode::Off;
+        if      (dlss_str == "dlaa")              want_dlss = pt::rhi::UpscalerMode::Dlaa;
+        else if (dlss_str == "quality")           want_dlss = pt::rhi::UpscalerMode::Quality;
+        else if (dlss_str == "balanced")          want_dlss = pt::rhi::UpscalerMode::Balanced;
+        else if (dlss_str == "performance")       want_dlss = pt::rhi::UpscalerMode::Performance;
+        else if (dlss_str == "ultra_performance") want_dlss = pt::rhi::UpscalerMode::UltraPerformance;
+        // Anything else (including "off" and any typo the console's
+        // allowed_values would have rejected) stays Off.
+
+        // DLSS consumes linear HDR. With r_hdr_pipeline 0 the path
+        // tracer has ALREADY tonemapped into denoise_color, so handing
+        // that to a feature created with the IsHDR flag would feed it
+        // display-referred colour while telling it the values are
+        // radiance. Refuse rather than produce a quietly wrong image.
+        bool hdr_pipeline_on = true;
+        if (auto* v = C.FindCVar("r_hdr_pipeline")) hdr_pipeline_on = v->GetBool();
+        if (want_dlss != pt::rhi::UpscalerMode::Off && !hdr_pipeline_on) {
+            if (!dlss_hdr_conflict_logged_) {
+                LOG_WARN("engine: r_dlss={} requested with r_hdr_pipeline 0 -- "
+                         "DLSS consumes linear HDR radiance and the path tracer "
+                         "has already tonemapped at that setting. Running "
+                         "without DLSS; set r_hdr_pipeline 1 to use it.",
+                         dlss_str);
+                dlss_hdr_conflict_logged_ = true;
+            }
+            want_dlss = pt::rhi::UpscalerMode::Off;
+        } else if (hdr_pipeline_on) {
+            dlss_hdr_conflict_logged_ = false;
+        }
+
+        // The DLSS path finishes through Denoise(Kind::FinalizeOnly)
+        // (bloom composite + tonemap + sRGB + swapchain write) because
+        // Tonemap.slang produces a black swapchain on Vulkan. So DLSS
+        // needs the denoiser pipelines built, the same way the
+        // bloom-without-denoiser path does. On Vulkan those build on an
+        // async worker, so this is also the natural "not yet" gate for
+        // the first few frames -- no log, because it resolves itself.
+        if (want_dlss != pt::rhi::UpscalerMode::Off &&
+            (device_ == nullptr || !device_->SupportsDenoise())) {
+            want_dlss = pt::rhi::UpscalerMode::Off;
+        }
+
+        // Provisional resolve against the WINDOW extent. The swapchain
+        // does not exist yet this frame (BeginFrame is further down),
+        // but the denoiser-G-buffer gate immediately below has to know
+        // whether DLSS is on, and the window size is what the swapchain
+        // will be built from. The render-scale block re-resolves against
+        // the real swapchain extent once BeginFrame has returned; the
+        // two agree on every frame except a resize, and on that frame
+        // the second call is the one that counts.
+        pt::rhi::UpscalerMode resolved_dlss = pt::rhi::UpscalerMode::Off;
+        if (want_dlss != pt::rhi::UpscalerMode::Off && device_ != nullptr) {
+            const std::uint32_t disp_w =
+                (window_ != nullptr) ? static_cast<std::uint32_t>(window_->Width())  : 0u;
+            const std::uint32_t disp_h =
+                (window_ != nullptr) ? static_cast<std::uint32_t>(window_->Height()) : 0u;
+            if (ResolveDlssForDisplay(want_dlss, disp_w, disp_h)) {
+                resolved_dlss = want_dlss;
+            }
+        }
+
+        if (resolved_dlss == pt::rhi::UpscalerMode::Off) {
+            // Reset the query cache so a later retry (window resize,
+            // driver update, or the denoiser pipelines finishing their
+            // async build) re-asks rather than reusing a stale "no".
+            dlss_query_mode_      = pt::rhi::UpscalerMode::Off;
+            dlss_query_display_w_ = 0;
+            dlss_query_display_h_ = 0;
+        }
+        dlss_mode_   = resolved_dlss;
+        dlss_active_ = (resolved_dlss != pt::rhi::UpscalerMode::Off);
+
+        // Ray Reconstruction: the cvar exists and its G-buffers are
+        // allocated off it, but the NGX RR feature belongs to a separate
+        // workstream. Say so once rather than letting a user conclude
+        // r_dlss_rr 1 is doing something.
+        if (dlss_active_ && DlssRayReconstructionRequested() &&
+            !dlss_rr_pending_logged_) {
+            LOG_INFO("engine: r_dlss_rr is set. The specular guidance "
+                     "G-buffers are being allocated and written, but the NGX "
+                     "Ray Reconstruction feature is not wired yet -- this "
+                     "frame runs Super Resolution and whatever r_denoiser "
+                     "selects still does the denoising.");
+            dlss_rr_pending_logged_ = true;
+        }
+        if (!dlss_active_) dlss_rr_pending_logged_ = false;
+    }
+    // --- end DLSS ----------------------------------------------------------
+
     // P10/P12 denoiser state. Resolved before BeginFrame so we know
     // whether to allocate the G-buffer textures this frame. The cvar
     // value chooses the kind (off / svgf / nrd / optix_*); per-backend
@@ -8079,7 +8298,23 @@ void Engine::RenderFrame() {
         // SupportsDenoise flips true.
         want_kind = DenoiserKind::Off;
     }
-    const bool want_denoiser = (want_kind != DenoiserKind::Off);
+    // `denoiser_active_` is the engine's name for "the G-buffer
+    // machinery is alive", not for "a denoiser is running" -- it gates
+    // denoise_color / depth / motion / normal / albedo / cloud_trans
+    // allocation, the celestial-composite seam, the ReSTIR dispatch and
+    // the SIGMA shadow buffer. DLSS needs exactly that machinery
+    // (colour + depth + motion at the render extent) whether or not a
+    // denoiser is selected, so it turns the flag on the same way
+    // docs/DLSS_INTEGRATION_PLAN.md SS5.1 prescribes for Ray
+    // Reconstruction: keep denoiser_active_ true, and let the KIND
+    // decide whether a denoising dispatch actually happens.
+    //
+    // The consequence to be aware of: with `r_dlss quality` and
+    // `r_denoiser off`, denoiser_active_ is true and denoiser_kind_ is
+    // Off. Every site that means "should I run the denoiser?" must
+    // therefore test the kind, not the flag. There is exactly one such
+    // site (the device_->Denoise dispatch block) and it is marked.
+    const bool want_denoiser = (want_kind != DenoiserKind::Off) || dlss_active_;
     // NRD library availability (issue #50). Folded into one bool the
     // rest of the frame reads: false on a build without PT_ENABLE_NRD,
     // and false once the backend's NRD instance has failed at runtime.
@@ -8271,6 +8506,68 @@ void Engine::RenderFrame() {
         static_cast<std::uint32_t>(float(output_w) * render_scale + 0.5f));
     std::uint32_t render_h = std::max<std::uint32_t>(1u,
         static_cast<std::uint32_t>(float(output_h) * render_scale + 0.5f));
+    // --- DLSS OWNS THE EXTENT --------------------------------------------
+    //
+    // When DLSS is engaged the relationship above inverts: the extent is
+    // not derived from a ratio, it is the extent NGX's optimal-settings
+    // query returned, and the RATIO is derived from it for reporting.
+    // Doing it the other way round -- round(display * published_ratio) --
+    // is the specific bug docs/DLSS_INTEGRATION_PLAN.md SS3.1 item 2
+    // forbids: the NGX feature is created for the queried size, and a
+    // mismatch between the size DLSS was created for and the size it is
+    // fed is an error, not a rounding nuisance.
+    //
+    // The ratio is then written BACK into r_render_scale so the console,
+    // the perf overlay and config.cfg all report what is actually
+    // happening rather than a stale user value. Writes the user makes to
+    // r_render_scale while DLSS is on are latched into the cvar and
+    // overwritten here -- the docstring says so, and the one-shot log
+    // below says so again the first time it matters.
+    //
+    // Re-resolve against the REAL swapchain extent first. The pre-
+    // BeginFrame pass used the window size; they agree on every frame
+    // but a resize, and on a resize frame this is what stops the NGX
+    // feature being created for the old size.
+    if (dlss_active_ && !ResolveDlssForDisplay(dlss_mode_, output_w, output_h)) {
+        dlss_active_ = false;
+        dlss_mode_   = pt::rhi::UpscalerMode::Off;
+    }
+    if (dlss_active_ && dlss_settings_.supported) {
+        render_w = dlss_settings_.render_width;
+        render_h = dlss_settings_.render_height;
+        const float queried_ratio = (output_w > 0)
+                                        ? float(render_w) / float(output_w)
+                                        : 1.0f;
+        if (auto* v = pt::console::Console::Get().FindCVar("r_render_scale")) {
+            // Format to 6 places: the ratio is a quotient of two integer
+            // pixel counts (e.g. 1707/2560 = 0.666797), and rounding it
+            // for display would make the reported number disagree with
+            // the extents printed beside it.
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%.6f",
+                          static_cast<double>(queried_ratio));
+            const std::string want = buf;
+            if (v->value != want) {
+                if (!dlss_owns_scale_logged_) {
+                    LOG_INFO("engine: DLSS owns r_render_scale while r_dlss is "
+                             "not off -- overwriting {} with the queried ratio "
+                             "{} ({}x{} render for {}x{} display). Writes to "
+                             "r_render_scale are latched but inert until DLSS "
+                             "is off again.",
+                             v->value, want, render_w, render_h,
+                             output_w, output_h);
+                    dlss_owns_scale_logged_ = true;
+                }
+                v->value = want;
+            }
+            render_scale = queried_ratio;
+        }
+    } else {
+        // Back under the user's control; re-arm the explanation so a
+        // later re-engage says it again rather than staying silent for
+        // the rest of the session.
+        dlss_owns_scale_logged_ = false;
+    }
     // Compare EXTENTS, not the scale factor: a scale of 0.999 on a
     // 512-wide window rounds back to 512, and that frame must take the
     // untouched direct-to-swapchain path rather than pay for a 1:1
@@ -8278,7 +8575,16 @@ void Engine::RenderFrame() {
     // bit-identical to the pre-render-scale engine -- the branch is
     // never entered.
     bool render_scaled = (render_w != output_w) || (render_h != output_h);
-    if (render_scaled && upscale_pipeline_id_ == 0) {
+    // The pin-back below must not fire on the DLSS path. DLSS does not
+    // use the bilinear resolve kernel at all -- it writes a display-
+    // extent HDR target and the tonemap finalize takes that straight to
+    // the swapchain -- so a missing `upscale` kernel is not a reason to
+    // change the extent. And changing it would be actively harmful:
+    // render_w/h here are the extent the NGX feature was CREATED for,
+    // and silently pinning them to the display extent would feed the
+    // feature a size it was not built for, which is the one failure mode
+    // SS3.1 calls an error rather than a nuisance.
+    if (render_scaled && !dlss_active_ && upscale_pipeline_id_ == 0) {
         // No resolve kernel available: the internal target would be
         // rendered and then never copied anywhere, leaving the
         // presented swapchain as whatever the last frame left in it.
@@ -8317,9 +8623,14 @@ void Engine::RenderFrame() {
     if (render_scaled != render_scale_engaged_) {
         if (render_scaled) {
             LOG_INFO("engine: render scale engaged -- internal {}x{}, "
-                     "presented {}x{} (scale {:.3f}); resolve = bilinear "
-                     "upscale (placeholder for DLSS)",
-                     render_w, render_h, output_w, output_h, render_scale);
+                     "presented {}x{} (scale {:.3f}); resolve = {}",
+                     render_w, render_h, output_w, output_h, render_scale,
+                     // Naming the resolve matters: with DLSS engaged the
+                     // bilinear kernel does not run at all, and a line
+                     // claiming it does would send anyone comparing
+                     // sharpness to the wrong pass.
+                     dlss_active_ ? "DLSS (see the DLSS lines below)"
+                                  : "bilinear upscale (placeholder for DLSS)");
         } else {
             LOG_INFO("engine: render scale disengaged -- rendering natively "
                      "at {}x{}", output_w, output_h);
@@ -8368,12 +8679,82 @@ void Engine::RenderFrame() {
         present_ldr_tex_id_ = 0;
         present_ldr_w_ = present_ldr_h_ = 0;
     }
+    // --- DLSS display-extent HDR target -----------------------------------
+    //
+    // What DLSS writes: linear HDR at the PRESENTATION extent, which the
+    // tonemap finalize then reads. This is the texture
+    // docs/DLSS_INTEGRATION_PLAN.md SS2.1 lists as MISSING
+    // ("pInOutput -- linear HDR at display res"); post_denoise_hdr could
+    // not serve because it is allocated at the internal extent along
+    // with every other G-buffer.
+    //
+    // Allocated only while DLSS is engaged and freed the moment it is
+    // not, so a default configuration pays no VRAM for it (RGBA16F at
+    // 3840x2160 is 63 MB).
+    if (dlss_active_ &&
+        (dlss_output_tex_id_ == 0 ||
+         dlss_output_w_ != output_w || dlss_output_h_ != output_h)) {
+        if (dlss_output_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+            dlss_output_tex_id_ = 0;
+        }
+        auto dh = device_->CreateTexture({
+            .width = output_w, .height = output_h,
+            .format = pt::rhi::TextureFormat::RGBA16F,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "dlss_output_hdr",
+        });
+        dlss_output_tex_id_ = dh.id;
+        dlss_output_w_      = output_w;
+        dlss_output_h_      = output_h;
+        if (dlss_output_tex_id_ == 0) {
+            LOG_ERROR("engine: dlss_output_hdr allocation failed at {}x{} -- "
+                      "disengaging DLSS for this frame", output_w, output_h);
+            dlss_active_   = false;
+            dlss_output_w_ = dlss_output_h_ = 0;
+        }
+    } else if (!dlss_active_ && dlss_output_tex_id_ != 0) {
+        device_->DestroyTexture(pt::rhi::TextureHandle{dlss_output_tex_id_});
+        dlss_output_tex_id_ = 0;
+        dlss_output_w_ = dlss_output_h_ = 0;
+        // The feature itself holds far more VRAM than this texture does
+        // (DLSS's internal history pyramid). Give it back too rather
+        // than leaving a feature alive for a mode nobody selected.
+        device_->ReleaseUpscalerFeature();
+    }
+    if (dlss_active_ != dlss_engaged_logged_) {
+        if (dlss_active_) {
+            LOG_INFO("engine: DLSS engaged -- internal {}x{}, presented {}x{}; "
+                     "path tracer + denoiser chain run at the internal extent, "
+                     "DLSS reconstructs to the presentation extent, and the "
+                     "bloom + tonemap finalize runs on the reconstructed image",
+                     render_w, render_h, output_w, output_h);
+        } else {
+            LOG_INFO("engine: DLSS disengaged");
+        }
+        dlss_engaged_logged_ = dlss_active_;
+    }
+    // --- end DLSS display-extent HDR target --------------------------------
+
     // The handle every "write the final image here" site binds. On an
     // unscaled frame this IS fc.swapchain_image, so those sites are
     // byte-identical to what they were before render scaling existed.
     const pt::rhi::TextureHandle present_target =
         render_scaled ? pt::rhi::TextureHandle{present_ldr_tex_id_}
                       : fc.swapchain_image;
+    // Set true by the DLSS block further down once the NGX evaluate has
+    // actually recorded AND the tonemap finalize has written the
+    // swapchain from its display-extent output. Read by the bilinear
+    // resolve near the end of the frame, which must then NOT run --
+    // magnifying present_ldr over a swapchain DLSS already wrote would
+    // replace the reconstructed image with the soft one.
+    //
+    // It is deliberately a "did it happen" flag rather than "is DLSS on":
+    // when the evaluate fails (a resize race, a driver hiccup) the frame
+    // falls back to exactly the bilinear path it would have taken with
+    // r_dlss off, instead of presenting whatever the swapchain happened
+    // to contain.
+    bool dlss_wrote_swapchain = false;
     // --- end render scale ---------------------------------------------------
 
     auto& cam = *camera_;
@@ -10632,6 +11013,36 @@ void Engine::RenderFrame() {
     // the value written from `fwd` earlier: bit-identical.
     bool want_camera_jitter = false;
     if (auto* v = C.FindCVar("r_camera_jitter")) want_camera_jitter = v->GetBool();
+    // DLSS REQUIRES this, so it turns it on regardless of the cvar.
+    //
+    // This is not a convenience: the shear is what makes the jitter
+    // offset the engine REPORTS to DLSS true. With the cvar off, the
+    // path tracer draws an independent random sub-pixel offset per ray
+    // and there is no single frame offset to report -- FrameJitterX/Y()
+    // correctly return 0, and DLSS fed a constant zero jitter while the
+    // frames underneath it move randomly reconstructs a smeared image
+    // and cannot be debugged into working. It is also what fixes the two
+    // sampling breaks docs/DLSS_INTEGRATION_PLAN.md SS4.2 lists: every
+    // spp sample shares the offset (so the frame stays a point sample as
+    // r_spp rises), and the depth/motion G-buffer pass is jittered
+    // identically to the colour (so the guides describe the surface the
+    // colour sample actually hit).
+    //
+    // Forcing it here rather than writing the cvar keeps the user's
+    // setting intact: turn r_dlss off and r_camera_jitter means what it
+    // did before.
+    if (dlss_active_ && !want_camera_jitter) {
+        want_camera_jitter = true;
+        static bool s_logged_forced_jitter = false;
+        if (!s_logged_forced_jitter) {
+            LOG_INFO("engine: DLSS requires a reportable per-frame sub-pixel "
+                     "offset, so the deterministic camera jitter is forced on "
+                     "while r_dlss is not off (r_camera_jitter itself is left "
+                     "at the user's value). Halton(2,3), period "
+                     "r_camera_jitter_period.");
+            s_logged_forced_jitter = true;
+        }
+    }
     camera_jitter_active_ = want_camera_jitter;
     if (want_camera_jitter) {
         const float jx = push.halton_jitter[0];
@@ -13968,8 +14379,14 @@ void Engine::RenderFrame() {
         // engine cb can't safely interleave a StarsComposite dispatch
         // between OptiX's input copy and its deferred finalize. OptiX +
         // StarsComposite is its own follow-up if a user needs it.
+        // DLSS takes over the whole "render extent -> presentation
+        // extent" hand-off, so it replaces the dual-Denoise sequence
+        // rather than composing with it -- see the block below for the
+        // ordering it uses instead. Excluded here so the two cannot both
+        // claim the finalize and write the swapchain twice.
         const bool vulkan_dual_denoise =
-            (!backend_is_metal && denoiser_active_ &&
+            (!backend_is_metal && denoiser_active_ && !dlss_active_ &&
+             denoiser_kind_ != DenoiserKind::Off &&
              engine_composite_active && !kind_is_optix &&
              device_->SupportsDenoise() &&
              post_denoise_hdr_tex_id_ != 0);
@@ -13989,7 +14406,15 @@ void Engine::RenderFrame() {
         // above was just unused setup work. The downstream branches
         // (use_vulkan_bloom_finalize on Vulkan, use_engine_tonemap on
         // Metal) still write the swapchain from denoise_color.
-        if (denoiser_active_) {
+        //
+        // NOTE the `denoiser_kind_ != Off` term. denoiser_active_ now
+        // means "the G-buffer machinery is alive", and DLSS turns it on
+        // even with r_denoiser off (see the want_denoiser comment). This
+        // is the one site that has to ask the narrower question, because
+        // dd.kind defaults to Kind::Svgf -- without the term, `r_dlss
+        // quality` + `r_denoiser off` would silently run the SVGF chain.
+        if (denoiser_active_ && denoiser_kind_ != DenoiserKind::Off &&
+            !dlss_active_) {
             PT_ZONE_SCOPED_N("Device::Denoise");
             if (vulkan_dual_denoise) {
                 // Step 1: SVGF chain that stops before the internal
@@ -14032,6 +14457,165 @@ void Engine::RenderFrame() {
                 device_->Denoise(dd);
             }
         }
+
+        // ---- DLSS Super Resolution / DLAA sequence ----------------------
+        //
+        // THE PASS ORDERING, and why it is this and not the dual-Denoise
+        // sequence it replaces (docs/DLSS_INTEGRATION_PLAN.md SS5.2):
+        //
+        //   at the RENDER extent
+        //     PathTrace (jittered colour AND jittered G-buffers, because
+        //       the jitter is a camera-basis shear -- see the
+        //       want_camera_jitter block)
+        //     -> denoiser chain, if r_denoiser selects one, stopping
+        //        BEFORE its finalize so the result stays linear HDR
+        //     -> celestial composite
+        //     -> `dlss_src`: noisy-or-denoised linear HDR
+        //   the boundary
+        //     -> DLSS evaluate: dlss_src + depth + motion + this frame's
+        //        jitter  ->  dlss_output_hdr at the DISPLAY extent
+        //   at the DISPLAY extent
+        //     -> bloom composite + tonemap + sRGB OETF -> swapchain,
+        //        via Denoise(Kind::FinalizeOnly), which derives its
+        //        dispatch extent from color_in and therefore runs at the
+        //        display extent with no further plumbing
+        //
+        // WHERE THIS DEVIATES FROM THE PLAN, deliberately and with the
+        // cost stated: SS5.2 wants the celestial composite AFTER the
+        // upscale, because stars are sub-pixel point sources with an
+        // energy-conserving PSF and a neural reconstructor at render
+        // resolution will smear them. That is correct and it is not done
+        // here. StarsComposite reads depth_tex and indexes it with the
+        // same tid it uses for its output target, so compositing at the
+        // display extent requires a DISPLAY-EXTENT DEPTH BUFFER, which
+        // the engine does not have and which is not a change to this
+        // pass -- it is a change to what the path tracer produces. The
+        // honest consequence: with r_dlss on and celestials composited,
+        // stars go through the reconstructor. That is a quality
+        // regression on night scenes specifically, it is why this frame
+        // graph is not finished, and it is the first thing to fix after
+        // the SR path is proven.
+        //
+        // The bloom pyramid is built at the render extent from
+        // denoise_color and composited onto the display-extent image.
+        // That one is fine rather than a compromise: DenoiseFinalize's
+        // sampleBloom maps (tid + 0.5) * bloom_dim / dim, i.e. by
+        // fraction of the frame, so a pyramid built at any extent lands
+        // correctly on a target of any other extent -- and bloom is a
+        // low-frequency signal, which is exactly what survives that.
+        if (dlss_active_ && dlss_output_tex_id_ != 0 &&
+            denoise_color_tex_id_ != 0 && depth_tex_id_ != 0 &&
+            motion_tex_id_ != 0) {
+            PT_ZONE_SCOPED_N("Device::Upscale(DLSS)");
+
+            // Step 1 -- produce linear HDR at the render extent.
+            //
+            // With a denoiser selected, run its chain but stop before
+            // the finalize (final_output = 0), leaving the denoised
+            // result in post_denoise_hdr. With r_denoiser off, DLSS
+            // consumes the path tracer's raw per-frame radiance
+            // directly, which is what denoise_color already holds.
+            std::uint64_t dlss_src_id = denoise_color_tex_id_;
+            if (denoiser_kind_ != DenoiserKind::Off &&
+                post_denoise_hdr_tex_id_ != 0 && !kind_is_optix) {
+                const bool step1_is_nrd =
+                    (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_);
+                dd.kind = step1_is_nrd
+                              ? pt::rhi::Device::DenoiseDesc::Kind::Nrd
+                              : pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                dd.color_in     = pt::rhi::TextureHandle{denoise_color_tex_id_};
+                dd.output       = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
+                dd.final_output = pt::rhi::TextureHandle{0};
+                device_->Denoise(dd);
+                dlss_src_id = post_denoise_hdr_tex_id_;
+            }
+
+            // Step 2 -- celestial composite, at the render extent. See
+            // the deviation note above. No-ops when the composite is not
+            // active, in which case PathTrace rendered celestials inline
+            // and there is nothing to add back.
+            composite_stars_to(dlss_src_id);
+
+            // Step 3 -- the reconstruction itself.
+            pt::rhi::UpscaleDesc ud{};
+            ud.color_in  = pt::rhi::TextureHandle{dlss_src_id};
+            ud.depth_in  = pt::rhi::TextureHandle{depth_tex_id_};
+            ud.motion_in = pt::rhi::TextureHandle{motion_tex_id_};
+            ud.output    = pt::rhi::TextureHandle{dlss_output_tex_id_};
+            ud.render_width   = render_w;
+            ud.render_height  = render_h;
+            ud.display_width  = output_w;
+            ud.display_height = output_h;
+            // FrameJitterX/Y(), not last_jitter_x_/y_. The two differ:
+            // last_jitter_* is the raw Halton value the denoiser has
+            // consumed since long before any of this existed, while
+            // frame_jitter_* is the offset that was ACTUALLY applied to
+            // the camera basis -- zero if the shear did not run. DLSS
+            // must be told what the frame was really sampled at, so it
+            // gets the second one. (They are equal on every DLSS frame,
+            // because DLSS forces the shear on; using the honest field
+            // is what keeps them equal if that ever changes.)
+            ud.jitter_x = FrameJitterX();
+            ud.jitter_y = FrameJitterY();
+            // Pixel-space motion needs no rescale (plan SS2.1 caveat C).
+            ud.mv_scale_x = 1.0f;
+            ud.mv_scale_y = 1.0f;
+            ud.reset_history = !prev_frame_valid_;
+            ud.hdr           = dd_hdr_pipeline;
+            // Auto-exposure: let DLSS meter the HDR input itself. The
+            // engine's exposure_state is a POST-tonemap scalar in a
+            // storage buffer, not the 1x1 R32F pre-exposure texture NGX
+            // wants, and this renderer's radiance spans many decades.
+            // Plan SS2.1 caveat E stages the alternative; step (1) there
+            // is exactly this.
+            ud.auto_exposure = true;
+            ud.pre_exposure  = 1.0f;
+            // 0 = "unknown", which is the documented value for this
+            // optional field. The engine has no single frame-delta
+            // member to hand over (the perf overlay derives its numbers
+            // from GPU timestamps and a separate CPU clock), and
+            // inventing one from the wrong clock would be worse than
+            // saying nothing: the runtime uses it to reason about how
+            // far the scene moved between samples.
+            ud.frame_time_delta_ms = 0.0f;
+            ud.mode = dlss_mode_;
+            // The RR seam, populated but not acted on by the SR path --
+            // a separate workstream owns the NGX RR feature. Filling
+            // these in costs nothing and means that workstream changes
+            // the backend, not this call site.
+            ud.ray_reconstruction       = DlssRayReconstructionRequested();
+            ud.albedo_in                = pt::rhi::TextureHandle{albedo_tex_id_};
+            ud.specular_albedo_in       = pt::rhi::TextureHandle{specular_albedo_tex_id_};
+            ud.normal_in                = pt::rhi::TextureHandle{normal_tex_id_};
+            ud.roughness_in             = pt::rhi::TextureHandle{roughness_tex_id_};
+            ud.specular_hit_distance_in = pt::rhi::TextureHandle{specular_hit_distance_tex_id_};
+            ud.world_to_view = glm::value_ptr(view);
+            ud.view_to_clip  = glm::value_ptr(proj);
+
+            const bool upscaled = device_->Upscale(ud);
+
+            // Step 4 -- bloom + tonemap + sRGB + swapchain.
+            //
+            // On success this runs at the DISPLAY extent over DLSS's
+            // output and writes the swapchain directly, and the bilinear
+            // resolve later in the frame is suppressed.
+            //
+            // On failure it runs at the RENDER extent over the same
+            // image the upscaler was going to read, writing
+            // present_target -- i.e. the frame degrades into exactly the
+            // bilinear render-scale path, which the resolve at the end
+            // of the frame then completes. A dropped upscale therefore
+            // costs sharpness for one frame rather than presenting an
+            // unwritten swapchain.
+            dd.kind         = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
+            dd.color_in     = upscaled
+                                  ? pt::rhi::TextureHandle{dlss_output_tex_id_}
+                                  : pt::rhi::TextureHandle{dlss_src_id};
+            dd.final_output = upscaled ? fc.swapchain_image : present_target;
+            device_->Denoise(dd);
+            dlss_wrote_swapchain = upscaled;
+        }
+        // ---- end DLSS sequence ------------------------------------------
 
         // Vulkan bloom-without-denoiser: build the bloom pyramid from
         // PathTrace's denoise_color, then call Denoise(FinalizeOnly)
@@ -15122,7 +15706,14 @@ void Engine::RenderFrame() {
     // internal/output split, output_w / output_h for anything past the
     // boundary, and the rule that a pass which derives a pixel
     // footprint must say which extent it means.
-    if (render_scaled && upscale_pipeline_id_ != 0 &&
+    //
+    // DLSS suppresses this pass -- but via `dlss_wrote_swapchain`, which
+    // is "the evaluate actually ran AND the finalize wrote the swap",
+    // not "r_dlss is on". A frame where the NGX evaluate was skipped
+    // (resize race, transient driver failure) has written present_ldr
+    // instead, and must still get magnified here or the presented image
+    // is whatever was left in the swapchain.
+    if (render_scaled && !dlss_wrote_swapchain && upscale_pipeline_id_ != 0 &&
         present_ldr_tex_id_ != 0) {
         // RAW on present_ldr: the pass that wrote it (path tracer /
         // denoiser finalize / tonemap) is a compute write and this is
@@ -16776,13 +17367,44 @@ void Engine::Run() {
             // bitwise-identical PNGs across svgf_atrous / optix_hdr /
             // optix_hdr_aov -- defeating the whole point of a
             // (backend, denoiser, scene) matrix.
-            const auto kind = denoiser_active_
+            //
+            // DLSS takes precedence over both. Two reasons, and the
+            // first one is a correctness bug rather than a preference:
+            //
+            //  1. `denoiser_active_` no longer implies a denoiser RAN.
+            //     It means "the G-buffer machinery is alive", and DLSS
+            //     turns it on even with r_denoiser off -- in which case
+            //     post_denoise_hdr was allocated but never written, and
+            //     capturing it would produce an undefined image while
+            //     reporting success.
+            //  2. Even with a denoiser on, post_denoise_hdr is the
+            //     RENDER-extent image DLSS consumed. Capturing it would
+            //     make every DLSS mode produce a differently-sized PNG
+            //     of the thing DLSS was given rather than the thing DLSS
+            //     produced -- i.e. it could not see the feature at all.
+            //
+            // dlss_output_hdr is RGBA16F at the display extent, the same
+            // format/space as post_denoise_hdr, so the host-side tonemap
+            // below is unchanged.
+            const bool capture_dlss =
+                (dlss_active_ && dlss_output_tex_id_ != 0 &&
+                 dlss_output_w_ > 0 && dlss_output_h_ > 0);
+            const auto kind = (capture_dlss || denoiser_active_)
                 ? pt::engine::CaptureSourceKind::DenoiseColor
                 : pt::engine::CaptureSourceKind::Accum;
-            const std::uint64_t tex_id = denoiser_active_
-                ? post_denoise_hdr_tex_id_
-                : accum_texture_id_;
-            const int bytes_per_pixel = denoiser_active_ ? 8 : 16;  // half / float
+            const std::uint64_t tex_id = capture_dlss
+                ? dlss_output_tex_id_
+                : (denoiser_active_ ? post_denoise_hdr_tex_id_
+                                    : accum_texture_id_);
+            const int bytes_per_pixel =
+                (capture_dlss || denoiser_active_) ? 8 : 16;  // half / float
+            // The staging allocation must cover the SOURCE texture, and
+            // on the DLSS path that is the display extent, not accum_*
+            // (which follows the internal render extent).
+            const std::uint32_t cap_w =
+                capture_dlss ? dlss_output_w_ : static_cast<std::uint32_t>(accum_w_);
+            const std::uint32_t cap_h =
+                capture_dlss ? dlss_output_h_ : static_cast<std::uint32_t>(accum_h_);
 
             // Drain in-flight work so the readback sees the last frame's
             // submitted writes, not an in-progress dispatch.
@@ -16802,7 +17424,7 @@ void Engine::Run() {
                 smoke_test_failed_ = true;
             } else {
                 std::vector<std::uint8_t> raw(
-                    std::size_t(accum_w_) * accum_h_ * bytes_per_pixel);
+                    std::size_t(cap_w) * cap_h * bytes_per_pixel);
                 std::uint32_t rb_w = 0, rb_h = 0;
                 if (!device_->ReadbackTexture(pt::rhi::TextureHandle{tex_id},
                                               raw.data(), raw.size(),
@@ -16811,7 +17433,7 @@ void Engine::Run() {
                     LOG_ERROR("smoke-capture: ReadbackTexture failed "
                               "(tex_id={}, {}x{}). Failing the smoke "
                               "test (exit code 2).",
-                              tex_id, accum_w_, accum_h_);
+                              tex_id, cap_w, cap_h);
                     smoke_test_failed_ = true;
                 } else {
                     // Resolve the live exposure scalar so the host-side
@@ -16866,7 +17488,9 @@ void Engine::Run() {
                         LOG_INFO("smoke-capture: wrote {} ({}x{}, "
                                  "source={}, exposure={:.3f})",
                                  png_path.string(), rb_w, rb_h,
-                                 denoiser_active_ ? "denoise_color" : "accum_hdr",
+                                 capture_dlss     ? "dlss_output_hdr"
+                                 : denoiser_active_ ? "denoise_color"
+                                                    : "accum_hdr",
                                  exposure);
                     }
                 }

@@ -7,6 +7,7 @@
 
 #include "VulkanDevice.h"
 #include "VulkanDenoiser.h"
+#include "VulkanNgxUpscaler.h"
 #if defined(PT_ENABLE_OPTIX)
 #include "VulkanOptixDenoiser.h"
 #endif
@@ -876,6 +877,32 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     std::vector<const char*> exts(glfw_exts, glfw_exts + glfw_ext_n);
     if (kEnableValidation) {
         exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    // --- NGX / DLSS instance extensions ---------------------------------
+    // NGX needs these enabled at vkCreateInstance time, which is why this
+    // is here and not anywhere near VulkanNgxUpscaler's construction.
+    // The list is ASKED FOR, not hardcoded: NVIDIA has changed it across
+    // SDK versions and a hardcoded copy would rot silently (DLSS would
+    // initialise and then fail at feature-create with an opaque code).
+    //
+    // Best-effort by construction: an empty list on a machine with no
+    // NVIDIA driver is the expected answer, and DLSS then reports itself
+    // unavailable later. Instance creation must never fail because an
+    // optional upscaler could not enumerate itself.
+    //
+    // The strings are owned by ngx_instance_exts and must outlive the
+    // vkCreateInstance call below -- hence the vector at this scope
+    // rather than inside a helper.
+    const std::vector<std::string> ngx_instance_exts =
+        VulkanNgxUpscaler::RequiredInstanceExtensions();
+    for (const auto& e : ngx_instance_exts) {
+        const bool already = std::any_of(exts.begin(), exts.end(),
+            [&](const char* c) { return e == c; });
+        if (!already) exts.push_back(e.c_str());
+    }
+    if (!ngx_instance_exts.empty()) {
+        LOG_INFO("DLSS: requesting {} NGX instance extension(s) at "
+                 "vkCreateInstance", ngx_instance_exts.size());
     }
 
     std::vector<const char*> layers;
@@ -1775,6 +1802,47 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
              enable_rt_pipeline, enable_pipeline_library, enable_rt_maint1, enable_ser_ext,
              enable_pos_fetch, enable_sucf, use_mutable_binding2);
 
+    // --- NGX / DLSS device extensions ------------------------------------
+    // Same story as the instance side, one step later: NGX names the
+    // device extensions it needs (VK_NVX_binary_import,
+    // VK_NVX_image_view_handle, push descriptors and friends, depending
+    // on SDK version) and they must be enabled here, at vkCreateDevice.
+    // Asked for rather than hardcoded, for the same reason.
+    //
+    // Filtered against what the physical device actually exposes:
+    // vkCreateDevice FAILS OUTRIGHT on an unsupported extension name, so
+    // an unfiltered list would turn "DLSS is unavailable on this GPU"
+    // into "the engine does not start". Anything filtered out is logged
+    // -- DLSS will fail its own capability check afterwards and fall
+    // back to off, but the reason should be visible here rather than
+    // inferred from a later opaque NGX result.
+    //
+    // Strings live in ngx_device_exts for the duration of the call.
+    const std::vector<std::string> ngx_device_exts =
+        VulkanNgxUpscaler::RequiredDeviceExtensions(instance_, phys_device_);
+    std::uint32_t ngx_dext_added   = 0;
+    std::uint32_t ngx_dext_dropped = 0;
+    for (const auto& e : ngx_device_exts) {
+        if (!phys_exts.Has(e.c_str())) {
+            LOG_WARN("DLSS: NGX asked for device extension `{}` which this "
+                     "physical device does not expose -- skipping it; DLSS "
+                     "will report itself unavailable", e);
+            ++ngx_dext_dropped;
+            continue;
+        }
+        const bool already = std::any_of(dexts.begin(), dexts.end(),
+            [&](const char* c) { return e == c; });
+        if (!already) { dexts.push_back(e.c_str()); ++ngx_dext_added; }
+    }
+    if (!ngx_device_exts.empty()) {
+        LOG_INFO("DLSS: requesting {} NGX device extension(s) at "
+                 "vkCreateDevice ({} already enabled, {} unsupported)",
+                 ngx_dext_added,
+                 static_cast<std::uint32_t>(ngx_device_exts.size())
+                     - ngx_dext_added - ngx_dext_dropped,
+                 ngx_dext_dropped);
+    }
+
     VkDeviceCreateInfo dci{};
     dci.sType                   = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext                   = &f2;
@@ -2566,6 +2634,13 @@ void VulkanDevice::DestroyDevice() {
         // raw VK objects via its own dtor; destroying it here does
         // both in the right order while device_ is still live.
         denoiser_.reset();
+        // The NGX upscaler holds a feature handle whose GPU resources
+        // are owned by the driver's DLSS snippet, plus NGX's own
+        // parameter blocks. Its dtor releases the feature and calls
+        // NVSDK_NGX_VULKAN_Shutdown1(device_), so it MUST run while the
+        // VkDevice is still live -- shutting NGX down after
+        // vkDestroyDevice would hand the runtime a dead handle.
+        ngx_upscaler_.reset();
 #if defined(PT_ENABLE_NRD)
         // Same rationale for the NRD library denoiser: it owns raw
         // VkImage / VkDeviceMemory / VkImageView / VkPipeline /
@@ -2971,6 +3046,18 @@ VkExtent2D VulkanDevice::LookupImageExtent(TextureHandle h) {
     return (it == images_.end()) ? VkExtent2D{0, 0} : it->second.extent;
 }
 
+VkCommandBuffer VulkanDevice::CurrentRawCommandBuffer() const {
+    return (wrapped_cb_ != nullptr) ? wrapped_cb_->Raw() : VK_NULL_HANDLE;
+}
+
+VkFormat VulkanDevice::LookupImageFormat(TextureHandle h) {
+    if (h.id == kSwapchainTextureId) return swap_format_;
+    if (h.id == 0) return VK_FORMAT_UNDEFINED;
+    std::lock_guard lock(resource_mutex_);
+    auto it = images_.find(h.id);
+    return (it == images_.end()) ? VK_FORMAT_UNDEFINED : it->second.format;
+}
+
 VkBuffer VulkanDevice::LookupBuffer(BufferHandle h) {
     if (h.id == 0) return VK_NULL_HANDLE;
     std::lock_guard lock(resource_mutex_);
@@ -3290,7 +3377,19 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& d) {
     // TRANSFER_SRC : the SVGF basic-mode vkCmdCopyImage out of the
     //                history texture into post_denoise_hdr; also
     //                lets ReadbackTexture work on any storage image.
+    // SAMPLED_BIT  : required by NGX/DLSS, which builds its own
+    //                descriptors over the views the engine hands it and
+    //                SAMPLES the input images (colour / depth / motion)
+    //                rather than reading them as storage. A DLSS input
+    //                image without this bit is a validation error at
+    //                feature-evaluate time, not at creation, so it
+    //                surfaces as a mid-frame failure rather than a
+    //                startup one. Costs nothing here: every format this
+    //                switch can produce supports SAMPLED as a
+    //                core-required optimal-tiling feature, and no other
+    //                path is affected by an extra usage bit.
     ici.usage        = VK_IMAGE_USAGE_STORAGE_BIT
+                     | VK_IMAGE_USAGE_SAMPLED_BIT
                      | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     ici.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
@@ -5257,6 +5356,69 @@ bool VulkanDevice::SupportsNrdLibrary() const {
 #endif
 }
 
+// ---- Temporal upscaler (DLSS SR / DLAA via NGX) -------------------------
+//
+// All four route through ngx_upscaler_, created lazily on the first
+// call. The creation is NOT done in the constructor on purpose: NGX
+// initialisation loads a ~59 MB DLL and talks to the driver, and paying
+// that on every launch of a build where the user never sets r_dlss would
+// be a startup-time regression for a feature they are not using.
+
+bool VulkanDevice::SupportsUpscaler() const {
+    // Const-correct lazy init is not worth a mutable member here: the
+    // engine calls Upscale() (non-const) on the same frame it first
+    // consults this, and reporting "not yet" for one frame simply keeps
+    // r_dlss off for that frame. What this must never do is report true
+    // before the capability check has actually run.
+    if (device_ == VK_NULL_HANDLE)  return false;
+    if (ngx_upscaler_failed_)       return false;
+    if (ngx_upscaler_ == nullptr)   return false;
+    return ngx_upscaler_->Available();
+}
+
+bool VulkanDevice::QueryUpscalerSettings(UpscalerMode  mode,
+                                         std::uint32_t display_width,
+                                         std::uint32_t display_height,
+                                         UpscalerSettings& out) {
+    out = UpscalerSettings{};
+    if (device_ == VK_NULL_HANDLE) return false;
+    if (ngx_upscaler_failed_)      return false;
+    if (ngx_upscaler_ == nullptr) {
+        ngx_upscaler_ = std::make_unique<VulkanNgxUpscaler>(this);
+    }
+    // Init() latches its own failure and logs the reason once, so a
+    // second call after a failure is free and silent.
+    if (!ngx_upscaler_->Init()) {
+        ngx_upscaler_failed_ = true;
+        return false;
+    }
+    return ngx_upscaler_->QueryOptimalSettings(mode, display_width,
+                                               display_height, out);
+}
+
+bool VulkanDevice::Upscale(const UpscaleDesc& d) {
+    PT_ZONE_SCOPED_N("VulkanDevice::Upscale");
+    if (device_ == VK_NULL_HANDLE) return false;
+    if (ngx_upscaler_failed_)      return false;
+    if (wrapped_cb_ == nullptr || wrapped_cb_->Raw() == VK_NULL_HANDLE) {
+        // No command buffer this frame (loading frame, or the path
+        // tracer was skipped) -- same silent no-op Denoise() takes.
+        return false;
+    }
+    if (ngx_upscaler_ == nullptr) {
+        ngx_upscaler_ = std::make_unique<VulkanNgxUpscaler>(this);
+    }
+    if (!ngx_upscaler_->Init()) {
+        ngx_upscaler_failed_ = true;
+        return false;
+    }
+    return ngx_upscaler_->Evaluate(d);
+}
+
+void VulkanDevice::ReleaseUpscalerFeature() {
+    if (ngx_upscaler_ != nullptr) ngx_upscaler_->ReleaseFeature();
+}
+
 void VulkanDevice::Denoise(const DenoiseDesc& d) {
     PT_ZONE_SCOPED_N("VulkanDevice::Denoise");
     if (device_ == VK_NULL_HANDLE) return;
@@ -5290,11 +5452,17 @@ void VulkanDevice::Denoise(const DenoiseDesc& d) {
         const int k = static_cast<int>(d.kind);
         const std::uint32_t bit = (k >= 0 && k < 32) ? (1u << k) : 0u;
         if (bit != 0u && (s_logged_kinds_mask & bit) == 0u) {
+            // The legend must match DenoiseDesc::Kind's DECLARATION
+            // ORDER, and it had drifted: it still listed MetalFX at 5
+            // and SvgfMetalFx at 6, which were removed with the Metal
+            // backend, so every number after 4 was off by two. That
+            // turned this diagnostic into a source of wrong conclusions
+            // -- a FinalizeOnly dispatch read as "MetalFX", on a build
+            // that has no Metal. Re-derived from the enum.
             LOG_INFO("VulkanDevice::Denoise: dispatching kind={} "
                      "(0=Svgf, 1=OptixHdr, 2=OptixHdrAov, "
                      "3=OptixTemporalHdr, 4=OptixTemporalHdrAov, "
-                     "5=MetalFX, 6=SvgfMetalFx, 7=FinalizeOnly, "
-                     "8=SvgfNoFinalize, 9=Nrd), "
+                     "5=FinalizeOnly, 6=SvgfNoFinalize, 7=Nrd), "
                      "color={} out={} normal={} depth={} motion={}",
                      k, d.color_in.id, d.output.id, d.normal_in.id, d.depth_in.id, d.motion_in.id);
             s_logged_kinds_mask |= bit;

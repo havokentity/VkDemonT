@@ -54,3 +54,31 @@ target_link_libraries(demont PRIVATE
 )
 
 pt_set_compiler_options(demont)
+
+# --- DLSS runtime snippets beside the executable ---------------------------
+# NGX loads nvngx_dlss.dll (Super Resolution) and nvngx_dlssd.dll (Ray
+# Reconstruction) at runtime, and its DEFAULT search location is the
+# application directory. Without this copy NVSDK_NGX_VULKAN_Init fails
+# with an out-of-date/not-found result that reads like a driver problem
+# and is not one -- so the copy is part of the build, not a documented
+# manual step.
+#
+# copy_if_different rather than an unconditional copy: nvngx_dlss.dll is
+# 59 MB and nvngx_dlssd.dll is 41 MB, and re-copying 100 MB on every
+# incremental link would be the slowest part of a one-line rebuild.
+#
+# nvngx_dlssg.dll (Frame Generation) is deliberately absent -- it is out
+# of scope, and shipping an unused licensed binary invites questions.
+# See cmake/Dependencies.cmake's DLSS block for the licence note.
+#
+# nvngx_dlssd.dll is copied even though Ray Reconstruction is not wired
+# up yet: it is what the RR workstream will need present, and having the
+# copy already correct means that workstream touches shaders and the
+# upscaler seam rather than the build.
+if(PT_DLSS_ACTIVE AND PT_DLSS_RUNTIME_DLLS)
+    add_custom_command(TARGET demont POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${PT_DLSS_RUNTIME_DLLS} $<TARGET_FILE_DIR:demont>
+        COMMENT "Copying DLSS runtime DLLs next to demont.exe"
+        VERBATIM)
+endif()
