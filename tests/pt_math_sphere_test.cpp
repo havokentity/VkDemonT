@@ -46,6 +46,15 @@
 // the GPU holds the shader to.  If a future compiler learns a new
 // reassociation that breaks the scheme, this test goes red.
 //
+// It is a contract about THE ACCUMULATOR, though, not about every line
+// in the file.  The historic small-sphere expression has no compensation
+// scheme to fold and exists in the shader exactly once, so holding the
+// mirror's two transcriptions of it to fast math measured the host
+// vectoriser rather than the shader -- 25 red assertions in Release on
+// clang-cl, none of them about PathTraceMath.slang.  Those two bodies
+// are pinned to source order instead; the note on PT_SOURCE_ORDER_PUSH
+// below derives the scope.
+//
 // Deterministic: every input is a literal or derived from literals.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
@@ -84,6 +93,56 @@ namespace {
 #  define PT_MIRROR __declspec(noinline)
 #else
 #  define PT_MIRROR __attribute__((noinline))
+#endif
+
+// ... and the two HISTORIC bodies must additionally be compiled in
+// SOURCE ORDER.
+//
+// noinline closed the inlining hole #275 found; it does not close
+// reassociation.  `intersectSphere`'s fall-through and
+// `intersectSphereNaive` are two transcriptions of one expression, and
+// under fast math the compiler is free to associate each of them however
+// it likes -- independently, because they are now two separate
+// functions.  Measured here on clang-cl 21 with /fp:fast, both bodies
+// SLP-vectorised and neither kept the written order:
+//
+//   intersectSphereNaive   h = (b*b + rad*rad) - dot(oc, oc)
+//   intersectSphere        h = (rad*rad - dot(oc, oc)) + b*b
+//
+// Two different roundings of a subtraction that has already lost most of
+// its significance, so the two disagree by a few ULPs almost everywhere
+// below the gate -- and at rad 0.3, alt 1 mm the disagreement lands
+// astride `t0 > t_min`, one body returning the near root at 1.0e-3 and
+// the other the far root at 6.0e-1.  25 assertions, none of them about
+// the shader.
+//
+// This is NOT the fast-math contract the header describes.  That
+// contract protects the ACCUMULATOR, whose scheme a reassociating
+// compiler could fold to zero, and it still applies in full to
+// ptFixedAdd / ptPowerOfPoint / ptDotExact and the two kernels above --
+// which is where every fast-math claim in this file lives.  The historic
+// expression has no such scheme to fold: it is a plain formula, and it
+// exists in the shader exactly ONCE.  Whatever association Slang picks
+// for it is the association every golden was baked with, and the host
+// cannot observe that choice, let alone reproduce it.  What the host CAN
+// pin -- and what "unchanged" has to mean here -- is that the two
+// transcriptions are the same operations in the same order.  So pin the
+// order and let the comparison say that, instead of measuring the
+// x86 SLP vectoriser twice and calling the difference a defect.
+//
+// A compiler with no branch here simply does not get the pin, and the
+// bit-identity case goes red rather than quietly passing -- the right way
+// round for a test whose whole job is to notice drift.
+#if defined(__clang__) || defined(_MSC_VER)
+#  define PT_SOURCE_ORDER_PUSH _Pragma("float_control(precise, on, push)")
+#  define PT_SOURCE_ORDER_POP  _Pragma("float_control(pop)")
+#elif defined(__GNUC__)
+#  define PT_SOURCE_ORDER_PUSH _Pragma("GCC push_options") \
+                               _Pragma("GCC optimize(\"no-fast-math\")")
+#  define PT_SOURCE_ORDER_POP  _Pragma("GCC pop_options")
+#else
+#  define PT_SOURCE_ORDER_PUSH
+#  define PT_SOURCE_ORDER_POP
 #endif
 
 // --- shader mirror: shaders/PathTraceMath.slang ---------------------------
@@ -241,6 +300,11 @@ PT_MIRROR bool ptIntersectSphereScaled(F3 oc, F3 rd, float rad, int ext_exp,
     return t > t_min;
 }
 
+// Source order from here to the end of intersectSphereNaive: the gate and
+// the historic expression only.  The accumulated kernels above are
+// deliberately outside it and keep full fast math.
+PT_SOURCE_ORDER_PUSH
+
 PT_MIRROR bool intersectSphere(F3 ro, F3 rd, F3 c, float rad, float t_min,
                                float& t) {
     F3 oc{ro.x - c.x, ro.y - c.y, ro.z - c.z};
@@ -276,6 +340,8 @@ PT_MIRROR bool intersectSphereNaive(F3 ro, F3 rd, F3 c, float rad, float& t) {
     t = (t0 > 1e-3f) ? t0 : t1;
     return t > 1e-3f;
 }
+
+PT_SOURCE_ORDER_POP
 // --- end shader mirror ----------------------------------------------------
 
 // Reference solve in double.  |oc|^2 needs 46 bits and double carries 53,
@@ -643,6 +709,18 @@ TEST_CASE("small spheres take the historic path unchanged") {
     // all of them metres across -- keep byte-identical arithmetic and
     // every golden stays put.  Assert that directly: below the threshold
     // the new function and the pre-#254 one agree bit for bit.
+    //
+    // WHAT THAT SENTENCE CAN AND CANNOT MEAN ON THE HOST.
+    // Both bodies are pinned to source order, so agreeing bit for bit is
+    // exactly the claim "same operations, same order" -- change an
+    // operation or a grouping in either transcription and this goes red.
+    // It is NOT a claim that Slang emits the same instructions for the
+    // fall-through as it did for the pre-#254 standalone function; the
+    // shader carries one copy of that expression, its association is the
+    // compiler's to pick, and no host binary can observe the choice.
+    // That half is pinned as TEXT, by the `floatk=dot(oc,oc)-rad*rad` and
+    // `floatt0=-b-h,t1=-b+h` finds in "shader mirror is still faithful",
+    // and confirmed by the goldens themselves.
     for (float rad : {0.3f, 1.0f, 12.5f, 500.0f, 8192.0f, kPtStableSphereRadius}) {
         for (double alt : {0.001, 0.25, 3.0, 400.0}) {
             for (double tilt : {0.0, 17.0, 61.0, 88.5}) {
