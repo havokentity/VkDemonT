@@ -66,6 +66,14 @@ extern const unsigned char shader_BloomDown_spirv_data[];
 extern const unsigned long shader_BloomDown_spirv_size;
 extern const unsigned char shader_BloomUp_spirv_data[];
 extern const unsigned long shader_BloomUp_spirv_size;
+// Render-scale resolve (r_render_scale). Bilinear magnify from the
+// engine's internal-extent LDR target (engine texture slot 1 ->
+// binding 1) to the swapchain (slot 0 -> binding 0). Two storage-image
+// bindings, both already in the shared layout, so it rides the same
+// VkPipelineLayout as everything else. Only dispatched when the
+// internal extent differs from the swapchain extent; DLSS replaces it.
+extern const unsigned char shader_Upscale_spirv_data[];
+extern const unsigned long shader_Upscale_spirv_size;
 // Tonemap (composite bloom + apply exposure*ACES*sRGB, plus lens
 // flare). Compiled to SPIR-V; the host-side TonePush has 48 bytes of
 // padding inserted so the ghost array lands at the kPushSplitOffset
@@ -2395,6 +2403,16 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
         // identically to the Metal path.
         build_pipeline("bloom_down",  shader_BloomDown_spirv_data,    shader_BloomDown_spirv_size);
         build_pipeline("bloom_up",    shader_BloomUp_spirv_data,      shader_BloomUp_spirv_size);
+        // Render-scale resolve (r_render_scale). Same shared-layout
+        // story as the bloom pair: two storage images at bindings 0
+        // and 1 and a 16-byte push. The engine only dispatches it on
+        // frames where the internal render extent differs from the
+        // swapchain extent, so at the default scale of 1.0 this
+        // pipeline is built and never used -- registration is a
+        // one-time cost that lets Engine::EnsurePipelineHandles treat
+        // "upscale unavailable" as "render scaling unavailable"
+        // rather than as a black screen.
+        build_pipeline("upscale",     shader_Upscale_spirv_data,      shader_Upscale_spirv_size);
         // Tonemap pipeline. Engine.cpp's post-denoise tonemap chain
         // dispatches this when tonemap_pipeline_id_ != 0 AND
         // use_engine_tonemap is true. On Vulkan that's currently NEVER:

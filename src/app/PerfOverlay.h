@@ -34,8 +34,17 @@ struct PerfStats {
     double      frame_ms_min = 0.0;
     double      frame_ms_max = 0.0;
     const char* backend      = "";       // "metal" / "vulkan" / "software" / "none"
-    int         width        = 0;
+    int         width        = 0;       // presentation (window) extent
     int         height       = 0;
+    // Internal render extent (r_render_scale). Equal to width/height at
+    // the default scale of 1.0; smaller when the path tracer is running
+    // sub-resolution and a resolve pass magnifies onto the swapchain.
+    // Reported separately because a HUD that shows only the window size
+    // while the renderer is quietly running at half of it is a lie the
+    // operator will spend an afternoon chasing. 0 means "not known yet"
+    // (no frame rendered) and the overlay falls back to width/height.
+    int         render_width  = 0;
+    int         render_height = 0;
     std::size_t gpu_bytes    = 0;
     int         spp          = 1;
     int         max_bounces  = 8;

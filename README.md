@@ -147,6 +147,9 @@ echo "csg_dump"           | nc localhost 27961
 |---|---|
 | `r_backend` | `none` / `software` / `vulkan` (default `vulkan`) |
 | `r_denoiser` | `off` / `svgf_basic` / `svgf_atrous` / `nrd` / `optix_hdr` / `optix_hdr_aov` / `optix_temporal_hdr` / `optix_temporal_hdr_aov`. `nrd` aliases the à-trous chain until the NRD library is wired; the `optix_*` variants require a build with OptiX detected. `list_cvars r_denoiser` prints the full matrix; A/B with `toggle r_denoiser` |
+| `r_render_scale` | internal render resolution as a fraction of the window (default `1.0`, clamped to `[0.25, 1.0]`). Below 1.0 the path tracer, its accumulator and every denoiser G-buffer run at the smaller extent and a resolve pass magnifies onto the swapchain. The resolve is a plain bilinear upscale — a placeholder for DLSS, not a quality feature, so expect softness. At `1.0` the renderer is byte-identical to having no render scaling at all |
+| `r_camera_jitter` | deterministic Halton(2,3) sub-pixel camera jitter, one offset per frame shared by every ray (default `0` = off, per-ray random sampling as before). Exists so a temporal upscaler can be told the exact offset a frame was rendered with; `r_camera_jitter_period` sets the cycle length (default 16). Turning it on without a temporal reconstruction consuming it makes single frames aliased |
+| `render_info` | print the internal vs presented extent, the effective render scale, and the sub-pixel jitter offset the last frame used |
 | `r_spp` | samples per pixel per dispatch (1..32). Higher = cleaner motion at proportional GPU cost. |
 | `r_max_bounces` | path-tracer bounce cap (default 8) |
 | `csg_*` | live CSG editing — `csg_box`, `csg_sphere`, `csg_op subtract …`, `csg_set_root`, `csg_dump`, … |
