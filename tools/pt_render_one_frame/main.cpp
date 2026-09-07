@@ -205,9 +205,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
     {
         static constexpr std::string_view kDenoiserAllowed[] = {
             "off",
-            "metalfx",
             "svgf_basic", "svgf_atrous",
-            "svgf_basic_metalfx", "svgf_atrous_metalfx",
             "nrd",
             "optix_hdr", "optix_hdr_aov",
             "optix_temporal_hdr", "optix_temporal_hdr_aov",
@@ -220,7 +218,7 @@ bool ParseArgs(int argc, char** argv, Args& a) {
             std::fprintf(stderr,
                 "pt_render_one_frame: --denoiser '%s' is not a recognised "
                 "r_denoiser value. Supported: off, metalfx, svgf_basic, "
-                "svgf_atrous, svgf_basic_metalfx, svgf_atrous_metalfx, "
+                "svgf_atrous, "
                 "nrd, optix_hdr, optix_hdr_aov, optix_temporal_hdr, "
                 "optix_temporal_hdr_aov.\n",
                 a.denoiser.c_str());

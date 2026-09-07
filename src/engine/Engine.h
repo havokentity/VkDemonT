@@ -2357,13 +2357,24 @@ private:
     //   OptixTemporalHdrAov  = OptixTemporalHdr + albedo + normal guide
     //                          layers. The strongest OptiX variant --
     //                          temporal smoothing AND AOV edge fidelity.
+    // MetalFX / SvgfBasicMetalFx / SvgfAtrousMetalFx were removed with the
+    // macOS backend: MTLFXTemporalDenoisedScaler is an Apple API and no live
+    // backend could ever select them. Their one lasting consequence is
+    // recorded at want_specular_guidance_gbuffers -- the specular G-buffer
+    // trio was gated on those kinds, which made it dead code on Vulkan.
     enum class DenoiserKind : std::uint8_t {
-        Off, MetalFX, SvgfBasic, SvgfAtrous, Nrd,
-        SvgfBasicMetalFx, SvgfAtrousMetalFx,
+        Off, SvgfBasic, SvgfAtrous, Nrd,
         OptixHdr, OptixHdrAov,
         OptixTemporalHdr, OptixTemporalHdrAov,
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
+    // True when the user has asked for DLSS Ray Reconstruction: r_dlss is not
+    // `off` AND r_dlss_rr is set. Reads the cvars rather than a resolved state
+    // because the specular guidance G-buffers it gates must be allocated
+    // BEFORE the NGX feature is created -- DLSS-RR is handed its guide buffers
+    // at creation time, not per frame. Returns false while the NGX calls are
+    // unwired, which is correct: nothing consumes the buffers yet.
+    bool DlssRayReconstructionRequested() const;
     // Issue #50 -- does the active backend have a working NVIDIA
     // RayTracingDenoiser? Refreshed from Device::SupportsNrdLibrary()
     // once per frame, because the runtime half of that answer can flip

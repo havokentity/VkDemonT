@@ -754,14 +754,15 @@ namespace cvar {
             "denoise twice and lose detail the second pass cannot recover. "
             "When this is on the engine forces the denoiser chain off and "
             "logs the reason once -- it is not a silent override.\n"
-            "Requires r_dlss != off (RR is a mode of the same feature, not an "
-            "independent one) and needs guide buffers the engine does not "
-            "yet produce on this path: specular albedo, roughness and "
-            "specular hit distance are allocated only behind a "
-            "MetalFX-family denoiser gate that no live backend selects, so "
-            "they are currently dead. Until that is fixed this cvar reports "
-            "unavailable and falls back to plain Super Resolution rather "
-            "than feeding RR buffers full of zeros.",
+            "Requires r_dlss != off -- RR is a mode of the same feature, not "
+            "an independent one. The specular guidance G-buffers it needs "
+            "(specular albedo, roughness, specular hit distance) are "
+            "allocated off THIS cvar: they used to be gated on the MetalFX "
+            "denoiser kinds, which no live backend selected, which is how "
+            "they came to be allocated, written and read by nobody. Setting "
+            "this is what brings them into existence, and it has to happen "
+            "before the NGX feature is created because DLSS-RR is handed its "
+            "guide buffers at creation time.",
             CVAR_ARCHIVE);
     // --- end DLSS ----------------------------------------------------------
     PT_CVAR(r_render_scale, "1.0",
@@ -1411,7 +1412,7 @@ namespace cvar {
             "1 = write per-pixel sun-NEE visibility to a separate "
             "G-buffer, denoise it with a depth+normal bilateral, "
             "multiply the denoised visibility into the post-denoise "
-            "HDR for sharp sun shadows under SVGF / MetalFX. "
+            "HDR for sharp sun shadows under SVGF / NRD. "
             "0 = legacy fold-into-radiance behaviour where the active "
             "radiance denoiser smudges sun shadow boundaries. "
             "No effect when r_denoiser = off.",
@@ -1624,7 +1625,7 @@ namespace cvar {
             "Larger jumps (e.g. user typed a coordinate in console, or "
             "moved through a sphere whose inside is black) clear the "
             "current denoiser's history -- consumed by SVGF/NRD's "
-            "temporal accumulation path, MetalFX's history-state "
+            "temporal accumulation path, the denoiser's history-state "
             "reset, AND the OptiX temporal denoisers' "
             "prev_output / internal-guide-layer ping-pong -- instead "
             "of bleeding stale pre-jump color into post-jump frames. "
@@ -2729,6 +2730,17 @@ Engine::Engine() {
                              "performance", "ultra_performance"};
     }
 }
+// See the declaration in Engine.h for why this reads cvars rather than a
+// resolved denoiser state.
+bool Engine::DlssRayReconstructionRequested() const {
+    auto& C = pt::console::Console::Get();
+    const auto* mode = C.FindCVar("r_dlss");
+    const auto* rr   = C.FindCVar("r_dlss_rr");
+    if (!mode || !rr) return false;
+    if (mode->value == "off") return false;   // RR is a mode of DLSS, not independent
+    return rr->GetInt() != 0;
+}
+
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }
 
 Engine* Engine::Instance() { return g_instance; }
@@ -7078,7 +7090,7 @@ void Engine::RegisterCameraBookmarkCommands() {
         "bookmark saved with cam_save_named. Use cam_list_bookmarks "
         "to see available names. Fires the active denoiser's "
         "history-reset flag so the temporal denoise pipeline "
-        "(SVGF/NRD/MetalFX/OptiX-temporal) doesn't blend pre-teleport "
+        "(SVGF/NRD/OptiX-temporal) doesn't blend pre-teleport "
         "content forward.",
         [this, parse_cam_state](auto args, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_load_named: no camera"); return; }
@@ -7099,7 +7111,7 @@ void Engine::RegisterCameraBookmarkCommands() {
                                name, it->second);
                 return;
             }
-            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/MetalFX/OptiX-temporal)
+            prev_frame_valid_ = false;  // active denoiser reset_history (SVGF/NRD/OptiX-temporal)
             out.FormatLine("cam_load_named: '{}' = {}", name, it->second);
         });
 
@@ -8044,14 +8056,15 @@ void Engine::RenderFrame() {
         const auto& s = v->value;
         if (current_backend_ == BackendType::Vulkan) {
             // The *_metalfx variants chained MetalFX as a finalizer on the
-            // retired Mac backend. Here they silently degrade to the
-            // corresponding plain SVGF mode so a demont.cfg / preset value
-            // carried over from macOS still works -- it just loses the
-            // (now-removed) MetalFX finalizer, matching the cvar help text.
+            // The svgf_*_metalfx aliases and `metalfx` itself are GONE, not
+            // silently degraded. They used to map down to the plain SVGF
+            // modes so a demont.cfg carried over from macOS still worked;
+            // that grace period ended with the MetalFX kinds themselves.
+            // An old cfg naming one now falls through to the unknown-value
+            // path and says so, which is better than quietly running a
+            // different denoiser than the one that was asked for.
             if      (s == "svgf_basic")            want_kind = DenoiserKind::SvgfBasic;
             else if (s == "svgf_atrous")           want_kind = DenoiserKind::SvgfAtrous;
-            else if (s == "svgf_basic_metalfx")    want_kind = DenoiserKind::SvgfBasic;
-            else if (s == "svgf_atrous_metalfx")   want_kind = DenoiserKind::SvgfAtrous;
             else if (s == "nrd")                   want_kind = DenoiserKind::Nrd;
             else if (s == "optix_hdr")             want_kind = DenoiserKind::OptixHdr;
             else if (s == "optix_hdr_aov")         want_kind = DenoiserKind::OptixHdrAov;
@@ -8120,14 +8133,6 @@ void Engine::RenderFrame() {
         } else if (want_kind == DenoiserKind::SvgfAtrous) {
             LOG_INFO("engine: r_denoiser=svgf_atrous -- temporal + a-trous "
                      "edge-aware filter");
-        } else if (want_kind == DenoiserKind::SvgfBasicMetalFx) {
-            LOG_INFO("engine: r_denoiser=svgf_basic_metalfx -- SVGF (temporal only) "
-                     "-> MetalFX TemporalDenoisedScaler chain");
-        } else if (want_kind == DenoiserKind::SvgfAtrousMetalFx) {
-            LOG_INFO("engine: r_denoiser=svgf_atrous_metalfx -- SVGF (temporal + a-trous) "
-                     "-> MetalFX TemporalDenoisedScaler chain");
-        } else if (want_kind == DenoiserKind::MetalFX) {
-            LOG_INFO("engine: r_denoiser=metalfx -- MetalFX TemporalDenoisedScaler active");
         } else if (want_kind == DenoiserKind::OptixHdr) {
             LOG_INFO("engine: r_denoiser=optix_hdr -- NVIDIA OptiX denoiser (HDR model) "
                      "via CUDA-Vulkan interop active");
@@ -8152,10 +8157,7 @@ void Engine::RenderFrame() {
             // the write gates -- keyed on texture-id != 0 -- kept the
             // path tracer writing G-buffers nothing reads) until the
             // denoiser was toggled fully off.
-            const bool new_kind_wants_specular =
-                (want_kind == DenoiserKind::MetalFX          ||
-                 want_kind == DenoiserKind::SvgfBasicMetalFx ||
-                 want_kind == DenoiserKind::SvgfAtrousMetalFx);
+            const bool new_kind_wants_specular = DlssRayReconstructionRequested();
             if (!new_kind_wants_specular) {
                 if (specular_albedo_tex_id_       != 0) device_->DestroyTexture(pt::rhi::TextureHandle{specular_albedo_tex_id_});
                 if (roughness_tex_id_             != 0) device_->DestroyTexture(pt::rhi::TextureHandle{roughness_tex_id_});
@@ -8488,9 +8490,6 @@ void Engine::RenderFrame() {
     const bool want_normal_gbuffer =
         (denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
-         denoiser_kind_ == DenoiserKind::MetalFX             ||
          denoiser_kind_ == DenoiserKind::Nrd                 ||
          denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov);
@@ -8509,12 +8508,9 @@ void Engine::RenderFrame() {
     const bool want_albedo_gbuffer =
         (denoiser_kind_ == DenoiserKind::OptixHdrAov         ||
          denoiser_kind_ == DenoiserKind::OptixTemporalHdrAov ||
-         denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx   ||
          // SVGF / NRD albedo demod (#119): the in-house chain reads
-         // albedo at the demod-divide site too, not just the MetalFX
-         // family. SvgfBasic / SvgfAtrous / Nrd join the gbuffer set.
+         // albedo at the demod-divide site too. SvgfBasic / SvgfAtrous /
+         // Nrd are the gbuffer set now that the MetalFX kinds are gone.
          denoiser_kind_ == DenoiserKind::SvgfBasic           ||
          denoiser_kind_ == DenoiserKind::SvgfAtrous          ||
          denoiser_kind_ == DenoiserKind::Nrd);
@@ -8526,13 +8522,23 @@ void Engine::RenderFrame() {
     // 8x8 specular halos the user reported. Gated on MetalFX-family
     // kinds only -- SVGF / NRD / OptiX paths don't accept these
     // (separate issue for SVGF wiring; see #118's "Out of scope"
-    // section). All three travel together: they all feed the same
-    // MTLFXTemporalDenoisedScalerDescriptor so partial allocation
-    // would just stall on a half-bound scaler.
-    const bool want_specular_guidance_gbuffers =
-        (denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
+    // section). All three travel together -- a consumer that gets a
+    // partial set is worse off than one that gets none.
+    //
+    // THIS GATE USED TO TEST THE MetalFX KINDS, and that is precisely how the
+    // trio became dead code: MTLFXTemporalDenoisedScaler is an Apple API, no
+    // live backend could ever select those kinds, so the textures were never
+    // allocated, the write gates (keyed on texture-id != 0) never fired, and
+    // the shader paths that fill them never ran. The allocation, the push
+    // flags, the binds and the shader writes all still existed and were all
+    // unreachable. docs/DLSS_INTEGRATION_PLAN.md section 2.3 found it while
+    // listing what blocks Ray Reconstruction -- which needs exactly these
+    // three -- and the MetalFX removal is what frees them.
+    //
+    // Gated on RR INTENT rather than on a resolved denoiser kind, because
+    // allocation has to happen before the NGX feature is created: DLSS-RR is
+    // handed its guide buffers at creation time, not per-frame.
+    const bool want_specular_guidance_gbuffers = DlssRayReconstructionRequested();
     // Bloom-without-denoiser path: when the user has r_bloom on but
     // no denoiser, the engine still needs `denoise_color` (as the
     // path tracer's linear-HDR output the bloom pyramid samples) and
@@ -8832,7 +8838,7 @@ void Engine::RenderFrame() {
                 });
                 albedo_tex_id_ = albedo_h.id;
                 LOG_INFO("engine: allocated denoise_albedo G-buffer ({}x{} RGBA16F) "
-                         "(consumers: OptiX AOV, MetalFX, SVGF demod)", fc.width, fc.height);
+                         "(consumers: OptiX AOV, SVGF/NRD demod)", fc.width, fc.height);
             } else {
                 albedo_tex_id_ = 0;
             }
@@ -8875,7 +8881,7 @@ void Engine::RenderFrame() {
                     .debug_name = "denoise_specular_hit_distance",
                 });
                 specular_hit_distance_tex_id_ = spec_hit_dist_h.id;
-                LOG_INFO("engine: allocated MetalFX specular guidance G-buffers ({}x{}) "
+                LOG_INFO("engine: allocated specular guidance G-buffers ({}x{}) "
                          "[specular_albedo RGBA16F + roughness R32F + specular_hit_distance R32F]",
                          fc.width, fc.height);
             } else {
@@ -10512,22 +10518,10 @@ void Engine::RenderFrame() {
     // chain on MetalFX-family kinds. Must run BEFORE the PushConstants
     // emit below (line 6837) so PathTrace.slang sees push.restir_enabled
     // == 0 and falls into the legacy NEE branch.
-    const bool kind_is_metalfx_family =
-        (denoiser_kind_ == DenoiserKind::MetalFX             ||
-         denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx    ||
-         denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx);
-    if (kind_is_metalfx_family && restir_dispatch_active) {
-        static bool s_restir_force_off_logged = false;
-        if (!s_restir_force_off_logged) {
-            LOG_INFO("engine: ReSTIR force-disabled for MetalFX-family kind "
-                     "(issue #164) -- MetalFX's TAA neighborhood clamp "
-                     "rejects ReSTIR's 1-survivor spike pattern, leaving "
-                     "analytic lights invisible. Falling back to PathTrace's "
-                     "per-spp legacy NEE for many-light variance.");
-            s_restir_force_off_logged = true;
-        }
-        restir_dispatch_active = false;
-    }
+    // ReSTIR was force-disabled here for the MetalFX-family kinds (#164):
+    // MetalFX's TAA neighbourhood clamp rejected ReSTIR's 1-survivor spike
+    // pattern. Those kinds are gone with the macOS backend, so the override
+    // is gone with them -- no live denoiser needs ReSTIR suppressed.
     push.restir_enabled = restir_dispatch_active ? 1u : 0u;
     // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
     // evaluates to 0 (so the user-visible "nothing happens" mismatch
@@ -10539,12 +10533,9 @@ void Engine::RenderFrame() {
         static bool s_restir_gate_failure_logged = false;
         // Skip this generic gate-failure log when the MetalFX-family
         // gate above already explained the disengagement (issue #164):
-        // the dedicated "ReSTIR force-disabled for MetalFX-family kind"
-        // log is the user-actionable message, and emitting the generic
-        // "denoiser_active=true, pipes=truetruetrue, ..." right after
-        // it would be redundant noise.
+        // (The MetalFX-family suppression this used to exclude is gone
+        // with those kinds; the generic message is now the only one.)
         if (restir_user_on && !restir_dispatch_active &&
-            !kind_is_metalfx_family &&
             !s_restir_gate_failure_logged) {
             LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
                      "(denoiser_active={}, pipes_t/s/f={}{}{}, "
@@ -13485,11 +13476,9 @@ void Engine::RenderFrame() {
         dd.reset_history = !prev_frame_valid_;
         // Map the engine's denoiser kind to the RHI quality tier. Nrd
         // and the various Atrous variants all run the full a-trous
-        // chain; only SvgfBasic / SvgfBasicMetalFx skip the spatial
-        // filter. MetalFX ignores the quality field entirely.
+        // chain; only SvgfBasic skips the spatial filter.
         const bool quality_is_basic =
-            (denoiser_kind_ == DenoiserKind::SvgfBasic ||
-             denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx);
+            (denoiser_kind_ == DenoiserKind::SvgfBasic);
         dd.quality = quality_is_basic
                          ? pt::rhi::Device::DenoiseDesc::Quality::Basic
                          : pt::rhi::Device::DenoiseDesc::Quality::Atrous;
@@ -13558,11 +13547,6 @@ void Engine::RenderFrame() {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixTemporalHdrAov;
         } else if (denoiser_kind_ == DenoiserKind::OptixHdrAov) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::OptixHdrAov;
-        } else if (denoiser_kind_ == DenoiserKind::MetalFX) {
-            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::MetalFX;
-        } else if (denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx ||
-                   denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx) {
-            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfMetalFx;
         } else if (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_) {
             // Issue #50. `nrd` is no longer an alias for svgf_atrous:
             // it routes to the real NVIDIA RayTracingDenoiser when the
@@ -17027,7 +17011,7 @@ void Engine::RegisterCommands() {
         "Load a saved camera state from a slot (1..9, default 1). "
         "Use cam_reset for slot 0 (engineering default). Loading "
         "fires the active denoiser's history-reset flag so the "
-        "temporal denoise pipeline (SVGF/NRD/MetalFX/OptiX-temporal) "
+        "temporal denoise pipeline (SVGF/NRD/OptiX-temporal) "
         "doesn't blend pre-teleport content forward.",
         [this, parse_cam_state, parse_slot](auto args, pt::console::Output& out) {
             if (!camera_) { out.PrintLine("cam_load: no camera"); return; }

@@ -425,16 +425,6 @@ public:
             OptixHdrAov,
             OptixTemporalHdr,
             OptixTemporalHdrAov,
-            MetalFX,
-            // SVGF followed by MetalFX TemporalDenoisedScaler as a
-            // finalizer. Metal only. SVGF kills path-tracing noise;
-            // MetalFX then ML-TAAs the result (cleaner edges than the
-            // in-shader edge-aware blend). The backend lazily allocates
-            // an intermediate scratch texture sized to the swapchain
-            // and routes the SVGF output through it before invoking
-            // MetalFX. On Vulkan this falls back to Kind::Svgf (the
-            // base denoiser still runs; the MetalFX chain is dropped).
-            SvgfMetalFx,
             // Skip every temporal / spatial denoising pass and run JUST
             // the swapchain finalize stage (linear HDR -> exposure ->
             // ACES -> sRGB OETF + bloom composite, written into
