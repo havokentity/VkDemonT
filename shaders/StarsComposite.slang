@@ -377,6 +377,20 @@ float3 ptStarMapFootprint(float3 j, float pix_ang) {
 }
 // --- end point-source sampling --------------------------------------------
 
+// HAND-WRITTEN MIRROR of kPtProcStarLegacyScale in PathTraceMath.slang. This
+// kernel imports no modules by design (see the localUp() mirror above), so the
+// value is duplicated rather than shared -- and therefore MUST be changed in
+// both places together. pt_renderer_planets_test.cpp pins the literal in both
+// files by occurrence count so a one-sided edit fails a test rather than
+// silently making the composite's procedural stars disagree with the path
+// tracer's.
+//
+// Full derivation lives with the canonical definition. Short version: it
+// carries the procedural cell-hash starfield from the pre-#338 arbitrary scale
+// (where the BSC map put Vega at 4.0) onto physical W/m^2/sr, where Vega's peak
+// map radiance is 3.07e-3 -- so 3.07e-3 / 4.0 = 7.68e-4.
+static const float kPtProcStarLegacyScale = 7.68e-4;
+
 float3 starsOnly(float3 rd, float3 sun) {
     float3 up      = localUp(pos_fovtan.xyz);
     float cosTheta = clamp(dot(rd, up), -1.0, 1.0);
@@ -438,7 +452,8 @@ float3 starsOnly(float3 rd, float3 sun) {
             float2 starPos = float2(0.30 + h2 * 0.40,
                                     0.30 + frac(h * 7.91) * 0.40);
             float dist = length(cellF - starPos);
-            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float brightness = (pow(frac(h * 13.7), 4.0) * 4.0 + 0.5)
+                             * kPtProcStarLegacyScale;
             float intensity = brightness * exp(-dist * dist * 100.0);
             float colorMix = frac(h * 5.31);
             float3 hot  = float3(0.85, 0.92, 1.10);

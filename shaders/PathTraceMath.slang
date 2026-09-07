@@ -159,6 +159,38 @@ public static const float kPtNightSkyRadiance = 2.5e-7;   // W/m^2/sr
 // is follow-up work; encoding it here would be baking an observer into a scene.
 public static const float3 kPtNightSkyTint =
     float3(0.4817, 0.9633, 2.8900);        // Rec.709 luma == 1
+
+// Carries the PROCEDURAL cell-hash starfield from the pre-#338 arbitrary scale
+// onto the physical one, by a single documented factor -- the same pattern
+// kPtLegacySkyScale uses for the other painted celestial terms.
+//
+// WHY THIS IS NEEDED. The procedural field's brightness is authored as
+// pow(frac(h*13.7), 4) * 4.0 + 0.5, i.e. [0.5, 4.5] in the units where the old
+// BSC map put Vega at 4.0 (kFluxScale). So it was roughly calibrated: its
+// brightest star was about a magnitude-0 star. #338 moved the catalogue path to
+// real W/m^2/sr and retired kStarVeilK, and the procedural path was left
+// behind -- which is worse than it sounds, because kStarVeilK was exactly what
+// suppressed these stars in daylight. Unscaled, a 4.5-unit procedural star sat
+// against a ~15 W/m^2/sr noon zenith, and starsRadianceRaw() (the mode-4 copy)
+// carries no day fade by design (#333). It is default-reachable: r_sky_mode
+// seeds to `physical`, and r_stars_mode falls back to procedural when
+// BSC5.dat fails to load.
+//
+// THE FACTOR. On the physical scale Vega's peak map radiance is
+//     E_vega / (pi * sigma^2) = 3.19e-9 / (pi * (5.75e-4)^2) = 3.07e-3 W/m^2/sr
+// (sigma being PsfSigmaRad at the 8192x4096 map's texel pitch). The old scale
+// put that same star at 4.0, so
+//     3.07e-3 / 4.0 = 7.68e-4.
+// Multiplying by this leaves the field's authored RELATIVE appearance exactly
+// where it was and moves it onto the units everything else now speaks. It is a
+// conversion, not a retune: no per-star value was re-authored.
+//
+// This is still a PAINTED field -- the hash does not model a magnitude
+// distribution, and a star of a given screen brightness here does not
+// correspond to a catalogued magnitude the way a BSC star does. Retiring it in
+// favour of the catalogue on every path is the real fix; this makes it stop
+// being wrong by four orders of magnitude in the meantime.
+public static const float kPtProcStarLegacyScale = 7.68e-4;
 // --- end night-sky background -----------------------------------------------
 // --- end radiometric anchor -------------------------------------------------
 

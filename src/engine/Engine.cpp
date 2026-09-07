@@ -908,7 +908,7 @@ namespace cvar {
             "guide the SVGF chain uses (G = T*A + (1-T)), then "
             "remodulates on the far side. Sky pixels are passed through "
             "un-denoised on purpose -- they are analytic here. Requires a "
-            "build configured with -DPT_ENABLE_NRD=ON (default OFF) and "
+            "build configured with -DPT_ENABLE_NRD=ON, which is now the DEFAULT, and "
             "the Vulkan backend; without it, or if NRD's instance "
             "creation fails at runtime, `nrd` degrades to the in-house "
             "svgf_atrous chain and says so once in the log. "
@@ -8368,7 +8368,7 @@ void Engine::RenderFrame() {
                 // why, say what runs instead, and don't pretend.
                 LOG_INFO("engine: r_denoiser=nrd requested but the NVIDIA "
                          "RayTracingDenoiser is unavailable on this build "
-                         "(configure with -DPT_ENABLE_NRD=ON, Vulkan backend) "
+                         "(configure with -DPT_ENABLE_NRD=ON and the Vulkan backend; ON by default) "
                          "-- running the in-house SVGF a-trous chain instead. "
                          "Image quality is the svgf_atrous tier, not NRD's.");
             }

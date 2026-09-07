@@ -8,10 +8,11 @@
 #
 # Every golden cell is a vulkan cell and GitHub-hosted runners have no GPU, so
 # the matrix cannot run in CI. The obvious fix -- a self-hosted runner -- is the
-# wrong one for a PUBLIC repository: a self-hosted runner executes workflow
-# steps directly on a real machine, and anyone may fork, edit the workflow, and
-# open a PR that then runs their code on it. GitHub documents that as the reason
-# not to pair the two.
+# wrong one ONCE THIS REPOSITORY GOES PUBLIC, which is the stated intent: a
+# self-hosted runner executes workflow steps directly on a real machine, and
+# anyone may fork, edit the workflow, and open a PR that then runs their code on
+# it. GitHub documents that as the reason not to pair the two. The runner was
+# retired in anticipation rather than after the fact.
 #
 # This inverts the direction. Nothing from GitHub executes here. The matrix runs
 # because YOU ran it, and the result is PUSHED out as a commit status. There is
@@ -34,6 +35,13 @@
 # main -> Require status checks to pass -> add the context printed below
 # (default: goldens/gpu). Until a status with that context arrives, the PR
 # cannot merge.
+#
+# NOT AVAILABLE YET ON THIS REPOSITORY, and worth knowing before relying on it:
+# branch protection needs GitHub Pro or a public repo. On a private free plan
+# `GET /repos/{owner}/{repo}/branches/main/protection` returns 403 "Upgrade to
+# GitHub Pro or make this repository public to enable this feature". Until then
+# the status is ADVISORY -- it shows on the PR, it does not block the merge.
+# Going public (the stated intent) enables it at no cost.
 
 [CmdletBinding()]
 param(
@@ -92,6 +100,30 @@ if ($Build) {
     if ($LASTEXITCODE -ne 0) { throw "build failed with exit code $LASTEXITCODE" }
 }
 
+# --- missing-golden guard ----------------------------------------------------
+# A cell whose golden PNG is absent registers as a WILL_FAIL placeholder: the
+# render runs, the compare cannot, and ctest reports it as PASSED. That
+# inversion (issue #31) is latent in the matrix -- and this script would
+# INHERIT it, because it derives its verdict from ctest's summary line. A
+# missing golden would be counted toward `passed` and published as
+# state=success over a cell that compared nothing, which is precisely the kind
+# of green-that-means-nothing this attestation exists to avoid.
+#
+# So refuse to publish when any such cell is registered. Reporting is still
+# allowed without -Post, because knowing is useful even when attesting is not.
+$missing = (& ctest --test-dir $BuildDir -N -L golden_missing 2>&1 | Out-String)
+$missingCount = 0
+if ($missing -match 'Total Tests:\s*(\d+)') { $missingCount = [int]$matches[1] }
+if ($missingCount -gt 0) {
+    Write-Host "$missingCount missing-golden placeholder cell(s) are registered." -ForegroundColor Yellow
+    Write-Host "Those PASS under ctest without comparing anything (WILL_FAIL, issue #31)," -ForegroundColor Yellow
+    Write-Host "so a published status would overstate what was verified." -ForegroundColor Yellow
+    if ($Post) {
+        Write-Host "Refusing to publish. Commit the missing goldens, or re-run without -Post." -ForegroundColor Red
+        exit 3
+    }
+}
+
 # --- run ---------------------------------------------------------------------
 Write-Host "Running the golden matrix on $gpu ..." -ForegroundColor Cyan
 $sw  = [System.Diagnostics.Stopwatch]::StartNew()
@@ -129,6 +161,7 @@ $result = [ordered]@{
     failures      = $failures
     duration_s    = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     ctest_exit    = $rc
+    missing_cells = $missingCount
 }
 $result | ConvertTo-Json -Depth 4 | Set-Content -Path $JsonOut -Encoding utf8
 

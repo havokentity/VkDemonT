@@ -4307,7 +4307,8 @@ float3 starsOnly(float3 rd, float3 sun) {
             float2 starPos = float2(0.30 + h2 * 0.40,
                                     0.30 + frac(h * 7.91) * 0.40);
             float dist = length(cellF - starPos);
-            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float brightness = (pow(frac(h * 13.7), 4.0) * 4.0 + 0.5)
+                             * kPtProcStarLegacyScale;
             float intensity = brightness * exp(-dist * dist * 100.0);
             float colorMix = frac(h * 5.31);
             float3 hot  = float3(0.85, 0.92, 1.10);
@@ -4442,7 +4443,8 @@ float3 starsRadianceRaw(float3 ro, float3 rd) {
             float2 starPos = float2(0.30 + h2 * 0.40,
                                     0.30 + frac(h * 7.91) * 0.40);
             float dist = length(cellF - starPos);
-            float brightness = pow(frac(h * 13.7), 4.0) * 4.0 + 0.5;
+            float brightness = (pow(frac(h * 13.7), 4.0) * 4.0 + 0.5)
+                             * kPtProcStarLegacyScale;
             float intensity = brightness * exp(-dist * dist * 100.0);
             float colorMix = frac(h * 5.31);
             float3 hot  = float3(0.85, 0.92, 1.10);
@@ -7182,14 +7184,13 @@ float3 starsPhysical(float3 ro, float3 rd) {
     // overwhelming. Against a ~15 W/m^2/sr noon zenith it is ~2e-5 --
     // utterly lost, which is why you cannot see stars by day in reality.
     //
-    // CAVEAT, and it is the live one: procSky's night floor is NOT that
-    // true night sky. It is a painted stand-in, (0.005, 0.010, 0.030) *
-    // kPtLegacySkyScale = 0.0589 W/m^2/sr of luma -- some 2e5 times a real
-    // moonless sky, which is the "five orders of magnitude" the golden
-    // matrix's own night-cell hold note records. Against THAT floor Vega
-    // is 0.6% of the background and stays invisible. Physical stars are a
-    // precondition for a night sky that reads correctly; they are not on
-    // their own sufficient, and the floor is the next thing to fix.
+    // The night floor this used to warn about IS FIXED. It was a painted
+    // stand-in at 0.0589 W/m^2/sr of luma, some 2e5 times a real moonless
+    // sky, against which Vega was 0.6% of the background and invisible --
+    // so physical stars alone did nothing. procSky now adds
+    // kPtNightSkyTint * kPtNightSkyRadiance = 2.5e-7 W/m^2/sr, derived from
+    // V = 22.0 mag/arcsec^2 of dark-site sky brightness, and Vega is ~1200x
+    // that. Both halves are in place; neither is waiting on the other.
     return s * sunSlantTransmittance(ro, rd);
 }
 // --- end Planetary P6 physical sky ------------------------------------------
