@@ -233,6 +233,103 @@ jobs:
   # NOTE: this packages the compile-tested Windows binary; the runner has
   # no NVIDIA GPU, so the nightly is not render-validated. Validate on
   # real RTX hardware before promoting a nightly to a tagged release.
+  # ---------------------------------------------------------------------------
+  # GPU golden matrix -- self-hosted runner on the owner's RTX 5090.
+  #
+  # WHY THIS EXISTS. Every golden cell is a vulkan cell (the software backend
+  # and its Embree dependency were removed), and GitHub-hosted runners have no
+  # usable Vulkan ICD. So from the moment that landed until this job, CI
+  # verified unit tests and NOTHING about what the renderer actually draws --
+  # the 40-cell matrix that catches rendering regressions could not run
+  # anywhere except a developer's machine, by hand.
+  #
+  # WHY pull_request ONLY, and not push. The matrix is a ~7 minute burst of
+  # GPU rendering. The runner host is a workstation, not a build server, and
+  # heavy GPU work landing unannounced while the owner is using the machine
+  # has already crashed it once. Gating on PRs gives the merge gate that was
+  # actually wanted while leaving ordinary work-in-progress pushes alone.
+  #
+  # WHY A SELF-HOSTED RUNNER RATHER THAN A SEPARATE LOCAL CI. Keeping it inside
+  # GitHub Actions preserves PR status checks, so this can block a merge. A
+  # bespoke local script cannot. It also means the NRD source build and the
+  # Slang toolchain stay warm on disk between runs instead of being refetched.
+  #
+  # WHY PIXEL-EXACT GOLDENS ARE VIABLE HERE AT ALL. The matrix is pinned at
+  # MAX_DELTA/MEAN_DELTA/FAIL_PERCENT 0. That is only sustainable because the
+  # hardware is FIXED: the render is bit-identical run-to-run on this GPU
+  # (docs/DETERMINISM_BASELINE.md). On heterogeneous hosted runners a
+  # threshold-0 matrix would be permanently red.
+  #
+  # THE RUNNER IS DELIBERATELY NOT A SERVICE. It is started on demand via
+  # tools/ci/start-runner.ps1 (or the .bat beside it). A PR opened while it is
+  # down gets no GPU check until it comes up -- GitHub queues the job, so it is
+  # deferred rather than lost. That is a conscious trade for not having a boot
+  # service fire renders mid-game.
+  #
+  # DLSS is OFF here for the same reason it is off on the hosted PR lane: no
+  # object file depends on it yet. Revisit when the NGX calls land.
+  gpu-goldens:
+    name: GPU golden matrix (self-hosted RTX 5090)
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, windows, gpu]
+    # Generous: a cold configure builds NRD from source, and the megakernel
+    # compiles at -O0 (see PT_SLANGC_OPT -- raising it hangs the GPU).
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner host has the VS toolchain, the Vulkan SDK and the GPU
+      # driver installed as part of being a development machine. It is
+      # deliberately NOT provisioned by this workflow: reprovisioning a
+      # workstation from CI is how workstations get broken.
+      - name: Configure
+        shell: pwsh
+        run: |
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          cmake --preset win-clang-release -DPT_ENABLE_DLSS=OFF
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          cmake --build build/win-clang-release
+
+      # Clear stale actual/diff PNGs so an always-upload artefact cannot carry
+      # a previous run's images, and recreate the directories -- imgdiff writes
+      # via stb_image_write, which does not mkdir.
+      - name: Golden matrix
+        id: goldens
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue `
+              build/win-clang-release/golden_actual, build/win-clang-release/golden_diff
+          New-Item -ItemType Directory -Force -Path `
+              build/win-clang-release/golden_actual, build/win-clang-release/golden_diff | Out-Null
+          $vsw = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          $inst = & $vsw -latest -prerelease -property installationPath
+          Import-Module (Join-Path $inst "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+          Enter-VsDevShell -VsInstallPath $inst -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -host_arch=x64" | Out-Null
+          ctest --test-dir build/win-clang-release -R golden --output-on-failure
+
+      # A failing cell is only actionable with the images. Uploaded on failure
+      # only -- on success these are byte-identical to what is already
+      # committed, so uploading them every run would be pure noise.
+      - name: Upload golden diffs
+        if: failure() && steps.goldens.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-diffs-gpu
+          path: |
+            build/win-clang-release/golden_actual/
+            build/win-clang-release/golden_diff/
+          if-no-files-found: warn
+
   nightly-release:
     name: Nightly release (scheduled)
     needs: windows
