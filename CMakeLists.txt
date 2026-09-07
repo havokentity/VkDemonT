@@ -65,6 +65,28 @@ option(PT_ENABLE_OPTIX
 # pixel-exact golden matrix keeps a ground-truth reference.
 option(PT_ENABLE_NRD
     "Build NVIDIA NRD denoiser (Vulkan-only; needs ShaderMake/dxc-spirv toolchain)" ON)
+# --- DLSS: Super Resolution / DLAA / Ray Reconstruction --------------------
+# Default ON by owner decision. The integration plan
+# (docs/DLSS_INTEGRATION_PLAN.md section 7) recommended OFF on the grounds that
+# enabling it downloads NVIDIA-RTX-SDK-licensed binaries, so the act of
+# flipping the flag is the act of accepting that licence. The owner's call is
+# that this is a headline feature of an NVIDIA-exclusive engine and a flag
+# nobody turns on is a flag nobody tests -- which is exactly how
+# PT_ENABLE_NRD's OFF default let two hard CMake errors sit in its dependency
+# block, unconfigurable, until 2026-09-07.
+#
+# The honest half of that recommendation is kept: cmake/Dependencies.cmake
+# names the licence and the URL in a message(STATUS) line, so what is being
+# downloaded is stated rather than implied.
+#
+# Gated on PT_ENABLE_VULKAN_BACKEND via PT_DLSS_ACTIVE, matching PT_NRD_ACTIVE,
+# so a Linux / no-Vulkan configure skips the fetch entirely.
+#
+# The RUNTIME cvar r_dlss still defaults to `off`: the out-of-the-box render
+# stays native and physically correct, and the pixel-exact golden matrix keeps
+# a ground-truth reference. Compiled in and one console command away.
+option(PT_ENABLE_DLSS
+    "Build NVIDIA DLSS SR / DLAA / Ray Reconstruction (Vulkan-only; downloads NVIDIA-RTX-SDK-licensed binaries at configure time)" ON)
 option(PT_ENABLE_TRACY          "Enable Tracy profiler client"          ON)
 # ASan + mimalloc do not coexist cleanly without MI_TRACK_ASAN; opt-in only.
 # Driven by the linux-asan-ubsan-debug preset in CMakePresets.json on CI;

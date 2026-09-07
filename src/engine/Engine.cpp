@@ -711,6 +711,59 @@ namespace cvar {
     // upscaler needs decoupled, and nothing else. Neither implements
     // DLSS; both are the plumbing DLSS Super Resolution / DLAA / Ray
     // Reconstruction plug into.
+    // --- DLSS (docs/DLSS_INTEGRATION_PLAN.md) ------------------------------
+    PT_CVAR(r_dlss, "off",
+            "NVIDIA DLSS Super Resolution. The renderer traces at a reduced "
+            "resolution and DLSS reconstructs the display-resolution image "
+            "from the render-resolution colour plus depth, motion vectors and "
+            "the frame's sub-pixel jitter offset.\n"
+            "off = no upscaling; the path tracer renders at the swapchain "
+            "size and r_render_scale is the user's knob. dlaa = render at "
+            "native resolution and use DLSS purely as an anti-aliaser (ratio "
+            "1.0); it costs GPU time rather than saving it, and is the "
+            "highest-quality option. quality / balanced / performance / "
+            "ultra_performance select NVIDIA's published presets, whose "
+            "per-axis render ratios are 2/3, 0.58, 1/2 and 1/3 -- at "
+            "3840x2160 that is 2560x1440, 2227x1253, 1920x1080 and 1280x720, "
+            "or 44.4%%, 33.6%%, 25%% and 11.1%% of the display pixel count.\n"
+            "Those ratios are DOCUMENTATION, NOT CONSTANTS: the engine calls "
+            "NGX_DLSS_GET_OPTIMAL_SETTINGS for the current swapchain size and "
+            "uses whatever render extent comes back, so an SDK that changes a "
+            "ratio is followed automatically and a rounding mismatch between "
+            "the size DLSS was created for and the size it is fed -- which is "
+            "an error, not a nuisance -- cannot happen.\n"
+            "UltraQuality is deliberately absent: it exists in NVIDIA's enum "
+            "but has historically not been implemented by the runtime. An "
+            "`auto` mode is also absent, because NVIDIA's per-resolution "
+            "default table is a user-experience convention rather than a "
+            "derived quantity, and this engine does not smuggle conventions "
+            "in as if they were physics.\n"
+            "While this is not off the engine OWNS r_render_scale and "
+            "overwrites it with the queried ratio, so the console, the perf "
+            "overlay and config.cfg all report the truth; writes to "
+            "r_render_scale are latched but inert until DLSS is off again. "
+            "Falls back to off with a log line if the build lacks "
+            "PT_ENABLE_DLSS, if the GPU/driver does not support the feature, "
+            "or if the optimal-settings query fails for the requested mode.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_dlss_rr, "0",
+            "NVIDIA DLSS Ray Reconstruction. 0 = DLSS upscales only, and "
+            "whatever r_denoiser selects still does the denoising. 1 = DLSS "
+            "REPLACES the denoiser: Ray Reconstruction is a denoiser and an "
+            "upscaler in one pass, so stacking it on top of SVGF or NRD would "
+            "denoise twice and lose detail the second pass cannot recover. "
+            "When this is on the engine forces the denoiser chain off and "
+            "logs the reason once -- it is not a silent override.\n"
+            "Requires r_dlss != off (RR is a mode of the same feature, not an "
+            "independent one) and needs guide buffers the engine does not "
+            "yet produce on this path: specular albedo, roughness and "
+            "specular hit distance are allocated only behind a "
+            "MetalFX-family denoiser gate that no live backend selects, so "
+            "they are currently dead. Until that is fixed this cvar reports "
+            "unavailable and falls back to plain Super Resolution rather "
+            "than feeding RR buffers full of zeros.",
+            CVAR_ARCHIVE);
+    // --- end DLSS ----------------------------------------------------------
     PT_CVAR(r_render_scale, "1.0",
             "Internal render resolution as a fraction of the presentation "
             "(swapchain) resolution. 1.0 (default) means the path tracer, "
@@ -2664,6 +2717,16 @@ Engine::Engine() {
     if (auto* v = pt::console::Console::Get().FindCVar("r_tonemap_op")) {
         v->allowed_values = {"aces", "agx", "khronos_pbr_neutral",
                              "reinhard", "linear"};
+    }
+    // r_dlss: attached here rather than at PT_CVAR so the console rejects
+    // typos and the web console renders a dropdown, same as r_tonemap_op
+    // above. "ultra_quality" is deliberately NOT in this list -- it exists in
+    // NVIDIA's NVSDK_NGX_PerfQuality_Value enum but has historically not been
+    // implemented by the runtime, and offering a mode that resolves to
+    // "unavailable" is worse than not offering it.
+    if (auto* v = pt::console::Console::Get().FindCVar("r_dlss")) {
+        v->allowed_values = {"off", "dlaa", "quality", "balanced",
+                             "performance", "ultra_performance"};
     }
 }
 Engine::~Engine() { Shutdown(); if (g_instance == this) g_instance = nullptr; }

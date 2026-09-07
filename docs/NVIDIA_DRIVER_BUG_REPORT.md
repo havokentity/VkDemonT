@@ -1,44 +1,46 @@
 # NVIDIA driver bug report: GPU hang (TDR / `VK_ERROR_DEVICE_LOST`) on the first dispatch of a large fully-inlined SPIR-V compute kernel
 
-Status: **DO NOT FILE YET** (changed 2026-09-07). Was "ready to file".
+Status: **READY TO FILE** — the hold is discharged (2026-09-07, second update).
 
-> **A latent undefined-behaviour bug was found in our own shader and fixed,
-> and it is a live alternative explanation for this hang.**
+> **RETEST DONE. The hang is real, is NOT ours, and the report is now stronger
+> than the original draft.**
 >
-> GPU-assisted validation on the `-O0` build -- the one that renders
-> correctly -- reported a genuine out-of-bounds storage-buffer read:
+> Earlier today GPU-assisted validation found a genuine out-of-bounds read in
+> our own shader (`mesh_uvs`, binding 35, ~3 KB past a 16-byte placeholder),
+> which was a live alternative explanation for this hang: an OOB read is
+> undefined behaviour, and UB is exactly the licence an optimiser needs to emit
+> something pathological. The report was held rather than filed.
 >
-> ```
-> VUID-vkCmdDispatch-storageBuffers-06936
-> (set = 0, binding = 35) access out of bounds. The descriptor buffer
-> size is 16 bytes, ... highest out of bounds access was at [3119] bytes
-> ```
+> That bug is fixed (commit `a88f5a9`) and GPU-AV now reports **0 out-of-bounds
+> and 0 validation errors** on a run that completes and renders. The kernel was
+> then rebuilt at `-O2` and retested:
 >
-> `binding 35` is `mesh_uvs`. When a mesh carries no UVs the host binds a
-> 16-byte placeholder, and the shader read ~3 KB out of it on every mesh
-> hit -- roughly 200x past the end. Fixed in commit a88f5a9 (`ptMeshUv`
-> bounds-checks against the buffer's real length); re-running GPU-AV on the
-> same fixture now reports **0 out-of-bounds and 0 validation errors** on a
-> run that completes and renders.
+> | | |
+> |---|---|
+> | `-O2` module size | 8,664,484 bytes (fully inlined) |
+> | Result | **still hangs** |
+> | Time to failure | 254 s (mostly driver pipeline JIT) |
+> | `VK_ERROR_DEVICE_LOST` reports | 28 |
+> | Windows TDR events | **ID 153, `nvlddmkm`, 15:54:11 and 15:54:13** |
 >
-> This matters because an out-of-bounds read is undefined behaviour, and UB
-> is precisely the licence an optimiser needs to generate something
-> pathological. It is therefore a plausible mechanism for the `-O2` hang
-> described below -- in which case this is OUR bug, not NVIDIA's, and
-> filing would be wrong. NVIDIA would also run GPU-AV, find it in a minute,
-> and reject the report.
+> So the OOB was a real bug worth fixing and was **not** the cause. File it.
 >
-> **Before filing, rebuild at `-O2` with the fix in place and re-test the
-> hang.** If it no longer hangs, delete this document. If it still hangs,
-> file -- and say in the report that the module is clean under GPU-AV, which
-> is a much stronger claim than the original draft could make.
+> **Two claims this retest adds, and they are the strongest ones in the
+> report** — make them explicitly when filing:
 >
-> Note that the `-O2` test deliberately hangs the GPU (recoverable TDR), so
-> run it when nothing else needs the machine. Venue: the NVIDIA Developer Program
-bug portal (developer.nvidia.com, "Report a Bug" under the developer account),
-with the Vulkan section of the NVIDIA developer forums as the fallback. Once
-filed, record the bug ID in `HANDOFF.md` under "Native-Vulkan bringup" -- that
-is the acceptance item for `docs/NEXTGEN_PLAN.md` step 0.
+> 1. The module is **valid**: it passes `spirv-val --target-env vulkan1.4`
+>    cleanly (both `-O0` and `-O2`, SDK 1.4.341.1, exit 0, no diagnostics).
+> 2. The application is **clean**: the same workload under GPU-assisted
+>    validation reports zero out-of-bounds accesses and zero validation errors
+>    at `-O0`. There is no application-side undefined behaviour left to blame.
+>
+> Together those close the two questions NVIDIA would otherwise ask first, and
+> they were only answerable because the hold was taken seriously rather than
+> the report being fired off this morning.
+>
+> Note when filing: the sizes below quote the original bisection (6.6 MB /
+> 336 KB). Current tree is **8.66 MB (`-O2`) vs 435 KB (`-O0`)** — quote the
+> current pair.
 
 Everything below is taken from the bisection recorded in `HANDOFF.md`
 ("Native-Vulkan bringup status") and `cmake/Slang.cmake` (the `PT_SLANGC_OPT`

@@ -14,6 +14,56 @@ all driven from console cvars.
 
 ---
 
+## 0a. Owner decisions taken against this plan (2026-09-07)
+
+Recorded here because two of them REVERSE recommendations made below, and a plan
+that quietly disagrees with the code is worse than no plan.
+
+1. **`PT_ENABLE_DLSS` defaults ON**, not OFF as section 7.2 recommends. The
+   recommendation was sound in isolation -- enabling the flag is the act of
+   accepting the NVIDIA RTX SDK licence, so making that deliberate has value.
+   The owner's counter-argument is stronger for this repo: DLSS is a headline
+   feature of an NVIDIA-exclusive engine, and a flag nobody turns on is a flag
+   nobody tests. That is not hypothetical -- `PT_ENABLE_NRD`'s OFF default is
+   exactly why its dependency block shipped two hard CMake errors and had
+   *never once configured successfully* until 2026-09-07. The honest half of
+   7.2 is kept: `cmake/Dependencies.cmake` names the licence and the URL in a
+   `message(STATUS)` line, so what is being downloaded is stated.
+
+2. **The licensing obligations are accepted, not treated as a blocker.**
+   Attribution (NVIDIA Marks in an about box / credits) is a real deliverable
+   before a public release and is on the list; it is not a gate on *using* the
+   SDK. There is no fee and no approval step. Section 7.1's framing of "what
+   the owner must accept" overstated this.
+
+3. **Build size is explicitly a non-concern.** The several-hundred-megabyte
+   fetch is accepted. Note it costs the repo nothing: `build/` is gitignored,
+   so a FetchContent'd SDK never enters git (`.git` is ~77 MB and stays there).
+   The only real repo risk would be *vendoring* the DLLs, which would also hit
+   GitHub's hard 100 MB per-file limit -- so FetchContent is the mechanism, not
+   a preference.
+
+4. **The runtime cvar `r_dlss` still defaults to `off`.** Build-time ON,
+   runtime off. Two reasons, the second being the one that matters: it matches
+   `r_denoiser`'s existing `off` default, and the engine's radiometry was just
+   made physically correct (#338) -- if DLSS were on by default the
+   out-of-the-box image would be a neural reconstruction rather than the ground
+   truth, and all 40 pixel-exact golden cells would silently become DLSS output
+   tests.
+
+5. **Golden strategy for DLSS: pin our contract, not NVIDIA's output.**
+   Deterministic, ours, and diagnosable -- render extent matches the mode's
+   queried optimal size, the reported jitter is the expected Halton value,
+   guide buffers are non-degenerate. Plus ONE pixel-exact end-to-end cell,
+   re-pinned on a deliberate DLL bump like any other cell. Explicitly NO
+   loose-tolerance DLSS cell: measured on this tree, a *complete* star wipeout
+   is `mean_delta 0.019` over 0.44%% of pixels, which the matrix's usual
+   `32/4/2` would pass without blinking. A pixel-exact DLSS golden also cannot
+   say WHY it moved -- the network smears the cause across the frame -- which
+   is why the input assertions exist alongside it rather than instead of it.
+
+---
+
 ## 0. What this plan depends on and does not implement
 
 | Prerequisite | Owner | Status on `740341f` |

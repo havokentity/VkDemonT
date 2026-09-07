@@ -205,6 +205,97 @@ if(PT_ENABLE_NRD AND PT_ENABLE_VULKAN_BACKEND)
     message(STATUS "NRD denoiser: enabled (v4.17.3 via FetchContent)")
 endif()
 
+# --- DLSS: Super Resolution / DLAA / Ray Reconstruction (Vulkan-only) ------
+# Activated only when:
+#   - PT_ENABLE_DLSS = ON              (default ON; owner decision, see the
+#                                       option() comment in CMakeLists.txt)
+#   - PT_ENABLE_VULKAN_BACKEND = ON    (DLSS is a Vulkan/NGX path here)
+# Consumers check PT_DLSS_ACTIVE, never PT_ENABLE_DLSS directly, so a stale
+# =ON in the cache on a no-Vulkan host is harmless -- the same pattern
+# PT_NRD_ACTIVE uses above.
+#
+# STRUCTURALLY DIFFERENT FROM EVERY OTHER DEPENDENCY IN THIS FILE, and the
+# difference is why this is not a FetchContent_MakeAvailable:
+#
+#   * DLSS ships PREBUILT BINARIES, not source. There is nothing to compile.
+#     Consumption is: add include/ to the include path, link one import
+#     library, and copy the runtime DLLs next to demont.exe. That is an
+#     IMPORTED target, so we Populate and wire it by hand rather than
+#     add_subdirectory() a project that has no CMakeLists.
+#   * The binaries are real files in git, not LFS pointers -- the repo has no
+#     .gitattributes, verified, which is the thing that would otherwise make a
+#     tag-tarball fetch silently deliver stubs instead of DLLs.
+#   * The tarball is LARGE (several hundred MB for the ~100 MB we use):
+#     lib/Windows_x86_64/rel/ alone is nvngx_dlss.dll 59.0 MB +
+#     nvngx_dlssd.dll 40.9 MB + nvngx_dlssg.dll 7.5 MB, and the dev/
+#     debug-overlay variants add ~125 MB more. Accepted deliberately -- the
+#     owner's call is that build size does not matter here -- but it is the
+#     reason a first configure with this ON is slow.
+#
+# LICENSING, stated rather than implied. These are NVIDIA-RTX-SDK-licensed
+# binaries. Redistribution is permitted as part of an application with
+# material additional functionality beyond the SDK (a path tracer qualifies),
+# and attribution -- crediting NVIDIA and showing the NVIDIA Marks in an
+# about box / credits -- is required before a public release ships with this
+# enabled. There is no fee and no approval gate. Note that "Streamline is
+# MIT" does not change any of this: Streamline's MIT source loads these same
+# licensed binaries.
+set(PT_DLSS_ACTIVE OFF)
+if(PT_ENABLE_DLSS AND NOT PT_ENABLE_VULKAN_BACKEND)
+    message(STATUS "PT_ENABLE_DLSS requires PT_ENABLE_VULKAN_BACKEND; DLSS inactive.")
+endif()
+if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND NOT WIN32)
+    message(STATUS "PT_ENABLE_DLSS: only the Windows_x86_64 SDK layout is wired; DLSS inactive.")
+endif()
+if(PT_ENABLE_DLSS AND PT_ENABLE_VULKAN_BACKEND AND WIN32)
+    # URL_HASH is deliberately absent until the tag is pinned at bringup, and
+    # this is a KNOWN GAP rather than an oversight: every other fetch in this
+    # file pins a SHA256, and this one must too before it is trusted. The
+    # first successful configure prints the computed hash (see below) so it
+    # can be pasted in. Until then the fetch is reproducible by tag but not
+    # verified against tampering.
+    # SOURCE_SUBDIR names a directory that deliberately does not exist. The
+    # DLSS repo has no CMakeLists.txt -- it is a binary drop, not a project --
+    # so MakeAvailable must populate it WITHOUT trying to add_subdirectory().
+    # Pointing SOURCE_SUBDIR at a non-existent path is the documented way to
+    # get that, and it is why this is not the bare FetchContent_Populate()
+    # that CMP0169 deprecates.
+    FetchContent_Declare(dlss
+        GIT_REPOSITORY https://github.com/NVIDIA/DLSS.git
+        GIT_TAG        v310.7.0
+        GIT_SHALLOW    TRUE
+        SOURCE_SUBDIR  cmake-does-not-build-this
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(dlss)
+
+    set(PT_DLSS_INCLUDE_DIR "${dlss_SOURCE_DIR}/include")
+    # nvsdk_ngx_d.lib is the DYNAMIC-CRT import library. The project builds
+    # with clang-cl against the dynamic runtime, so nvsdk_ngx_s.lib (static
+    # CRT) would be the wrong one and would produce CRT-mismatch link errors
+    # rather than anything self-explanatory.
+    set(PT_DLSS_IMPORT_LIB   "${dlss_SOURCE_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    # The runtime DLLs that must sit next to demont.exe. nvngx_dlssg.dll
+    # (Frame Generation) is deliberately NOT shipped: it is out of scope, and
+    # shipping an unused 7.5 MB licensed binary invites questions.
+    set(PT_DLSS_RUNTIME_DLLS
+        "${dlss_SOURCE_DIR}/lib/Windows_x86_64/rel/nvngx_dlss.dll"
+        "${dlss_SOURCE_DIR}/lib/Windows_x86_64/rel/nvngx_dlssd.dll")
+
+    if(NOT EXISTS "${PT_DLSS_IMPORT_LIB}")
+        message(WARNING
+            "PT_ENABLE_DLSS: expected import library not found at "
+            "${PT_DLSS_IMPORT_LIB} -- the SDK layout has moved. DLSS inactive.")
+    else()
+        add_library(dlss_ngx STATIC IMPORTED GLOBAL)
+        set_target_properties(dlss_ngx PROPERTIES
+            IMPORTED_LOCATION             "${PT_DLSS_IMPORT_LIB}"
+            INTERFACE_INCLUDE_DIRECTORIES "${PT_DLSS_INCLUDE_DIR}")
+        set(PT_DLSS_ACTIVE ON)
+        message(STATUS "DLSS: enabled (v310.7.0, NVIDIA RTX SDK licence) -- ${dlss_SOURCE_DIR}")
+    endif()
+endif()
+
 # --- doctest: unit test framework (header-only) ----------------------------
 # Single-header testing framework. Fast compile (the framework header
 # itself is ~7000 lines but only the TU declaring DOCTEST_CONFIG_IMPLEMENT
