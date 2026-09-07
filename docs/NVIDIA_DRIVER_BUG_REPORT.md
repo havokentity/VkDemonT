@@ -42,6 +42,24 @@ Status: **READY TO FILE** — the hold is discharged (2026-09-07, second update)
 > 336 KB). Current tree is **8.66 MB (`-O2`) vs 435 KB (`-O0`)** — quote the
 > current pair.
 
+> **STRONGEST ISOLATING EVIDENCE — ADD THIS TO THE REPORT.** The Step 1 probe
+> (`docs/STEP1_PROBE_NOTES.md`) compiled *the same megakernel text* as a
+> **ray-generation** stage instead of a compute stage, at `-O2`, and it does
+> **not** hang:
+>
+> | stage | `-O2` module | 60-frame soak |
+> |---|---|---|
+> | compute (`main`) | 8.66 MB | **HANGS** — TDR 153, `VK_ERROR_DEVICE_LOST` |
+> | raygen (`PathTraceRaygen.slang`, same source under `PT_RT_PIPELINE=1`) | 8.63 MB | **PASSES** — 0 `DEVICE_LOST`, no event 153 |
+>
+> Near-identical module size, same source text, same driver, same machine. That
+> makes "the module is simply too large" untenable as an explanation and points
+> at the compute-pipeline compilation path specifically. It is the single most
+> useful fact in this report and was not available when the report was drafted.
+>
+> (Driver pipeline creation for the raygen variant took 799 s cold, which is
+> its own problem, but it is compile time and not a hang.)
+
 Everything below is taken from the bisection recorded in `HANDOFF.md`
 ("Native-Vulkan bringup status") and `cmake/Slang.cmake` (the `PT_SLANGC_OPT`
 comment), plus the environment block the engine now prints at startup. Nothing
