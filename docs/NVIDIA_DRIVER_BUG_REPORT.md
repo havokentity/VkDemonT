@@ -1,6 +1,40 @@
 # NVIDIA driver bug report: GPU hang (TDR / `VK_ERROR_DEVICE_LOST`) on the first dispatch of a large fully-inlined SPIR-V compute kernel
 
-Status: **ready to file** (owner action). Venue: the NVIDIA Developer Program
+Status: **DO NOT FILE YET** (changed 2026-09-07). Was "ready to file".
+
+> **A latent undefined-behaviour bug was found in our own shader and fixed,
+> and it is a live alternative explanation for this hang.**
+>
+> GPU-assisted validation on the `-O0` build -- the one that renders
+> correctly -- reported a genuine out-of-bounds storage-buffer read:
+>
+> ```
+> VUID-vkCmdDispatch-storageBuffers-06936
+> (set = 0, binding = 35) access out of bounds. The descriptor buffer
+> size is 16 bytes, ... highest out of bounds access was at [3119] bytes
+> ```
+>
+> `binding 35` is `mesh_uvs`. When a mesh carries no UVs the host binds a
+> 16-byte placeholder, and the shader read ~3 KB out of it on every mesh
+> hit -- roughly 200x past the end. Fixed in commit a88f5a9 (`ptMeshUv`
+> bounds-checks against the buffer's real length); re-running GPU-AV on the
+> same fixture now reports **0 out-of-bounds and 0 validation errors** on a
+> run that completes and renders.
+>
+> This matters because an out-of-bounds read is undefined behaviour, and UB
+> is precisely the licence an optimiser needs to generate something
+> pathological. It is therefore a plausible mechanism for the `-O2` hang
+> described below -- in which case this is OUR bug, not NVIDIA's, and
+> filing would be wrong. NVIDIA would also run GPU-AV, find it in a minute,
+> and reject the report.
+>
+> **Before filing, rebuild at `-O2` with the fix in place and re-test the
+> hang.** If it no longer hangs, delete this document. If it still hangs,
+> file -- and say in the report that the module is clean under GPU-AV, which
+> is a much stronger claim than the original draft could make.
+>
+> Note that the `-O2` test deliberately hangs the GPU (recoverable TDR), so
+> run it when nothing else needs the machine. Venue: the NVIDIA Developer Program
 bug portal (developer.nvidia.com, "Report a Bug" under the developer account),
 with the Vulkan section of the NVIDIA developer forums as the fallback. Once
 filed, record the bug ID in `HANDOFF.md` under "Native-Vulkan bringup" -- that
