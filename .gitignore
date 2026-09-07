@@ -49,3 +49,4 @@ captures/
 # Python bytecode cache
 __pycache__/
 *.pyc
+golden-result.json
