@@ -272,7 +272,27 @@ jobs:
     # compiles at -O0 (see PT_SLANGC_OPT -- raising it hangs the GPU).
     timeout-minutes: 90
     steps:
+      # clean: false is LOAD-BEARING on a self-hosted runner, not a tidiness
+      # preference. actions/checkout defaults to clean: true, which runs
+      # `git clean -ffdx` -- and build/ is gitignored, so that DELETES the
+      # entire build tree including _deps before every run.
+      #
+      # The consequence was every job re-downloading all ~12 FetchContent
+      # dependencies from scratch, and GitHub rate-limiting the burst into
+      # HTTP 504s. Observed failing on glm, civetweb and NRD in consecutive
+      # runs while a plain curl for the same tarballs from the same machine
+      # returned 200 -- the burst was the problem, not connectivity.
+      #
+      # It also silently destroyed the main reason to use a self-hosted
+      # runner: warm caches. The NRD source build and the Slang toolchain are
+      # supposed to persist between runs. With clean: true they never did.
+      #
+      # Tracked files are still reset by checkout, so this does not leave
+      # stale source lying around; it only preserves ignored build output,
+      # which CMake and ninja already handle incrementally.
       - uses: actions/checkout@v4
+        with:
+          clean: false
 
       # The runner host has the VS toolchain, the Vulkan SDK and the GPU
       # driver installed as part of being a development machine. It is

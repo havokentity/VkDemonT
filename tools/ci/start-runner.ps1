@@ -45,6 +45,11 @@ param(
     [string]$Time,
     # Treat -Time as LOCAL and report UTC, rather than the default direction.
     [switch]$FromLocal,
+    # Print the runner's own job lines verbatim instead of annotating each
+    # UTC stamp with local time. Escape hatch: the annotation works by piping
+    # run.cmd through a rewriter, and if that ever interferes with the
+    # runner's console handling this turns it off without editing the script.
+    [switch]$RawTimestamps,
     [string]$RunnerDir = "$env:USERPROFILE\actions-runner",
     [string]$Repo      = "havokentity/VkDemonT",
     # Must match what the workflow's `runs-on` asks for. The GPU golden matrix
@@ -203,5 +208,44 @@ Write-Host "The GPU golden matrix runs on pull_request only, so ordinary pushes"
 Write-Host "will not spin the GPU up behind your back." -ForegroundColor DarkGray
 Write-Host ""
 
+# The runner binary stamps its own job lines in UTC:
+#
+#     2026-09-07 14:35:51Z: Listening for Jobs
+#     2026-09-07 12:01:29Z: Running job: GPU golden matrix
+#
+# That format comes from the runner itself and is not configurable, so the
+# only way to see local time alongside it is to rewrite the lines as they
+# stream past. Both are printed rather than replacing UTC, because the UTC
+# value is what matches the web UI and what you quote when reporting a run.
+$tzAbbrev = -join ([System.TimeZoneInfo]::Local.StandardName -split '\s+' |
+                   ForEach-Object { $_.Substring(0,1) })
+$inv = [System.Globalization.CultureInfo]::InvariantCulture
+$styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor `
+          [System.Globalization.DateTimeStyles]::AdjustToUniversal
+
 Push-Location $RunnerDir
-try { & .\run.cmd } finally { Pop-Location }
+try {
+    if ($RawTimestamps) {
+        & .\run.cmd
+    } else {
+        & .\run.cmd 2>&1 | ForEach-Object {
+            $line = [string]$_
+            if ($line -match '^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})Z:(.*)$') {
+                $u = [DateTime]::MinValue
+                if ([DateTime]::TryParseExact(
+                        ($matches[1] + ' ' + $matches[2]),
+                        'yyyy-MM-dd HH:mm:ss', $inv, $styles, [ref]$u)) {
+                    $l = $u.ToLocalTime()
+                    ('{0} {1}Z / {2} {3}:{4}' -f $matches[1], $matches[2],
+                     $l.ToString('HH:mm:ss'), $tzAbbrev, $matches[3])
+                } else {
+                    # Unparseable stamp: pass it through untouched rather than
+                    # dropping a line the runner considered worth printing.
+                    $line
+                }
+            } else {
+                $line
+            }
+        }
+    }
+} finally { Pop-Location }
