@@ -881,7 +881,21 @@ namespace cvar {
             "single frame is aliased and the accumulator needs the full "
             "sequence period to average out. That is why it defaults off.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_camera_jitter_period, "16",
+    PT_CVAR(r_camera_jitter_period, "0",
+            "Frames in the Halton(2, 3) sub-pixel cycle before it repeats. "
+            "0 = DERIVE IT, which is the default: 16 when nothing is "
+            "upscaling, and ceil(8 / scale^2) when DLSS or r_render_scale "
+            "is engaged -- 18 at 2/3 (quality), 32 at 1/2 (performance), "
+            "72 at 1/3 (ultra performance), floored at 16, capped at 256.\n"
+            "A fixed 16 was right for the denoiser this was written for "
+            "and wrong for a temporal upscaler. At ultra performance DLSS "
+            "reconstructs nine output pixels per input pixel, and a "
+            "16-phase sequence under-covers that sub-pixel grid by about "
+            "4.5x, so the reconstruction oscillates instead of converging "
+            "and the image shimmers. Ray Reconstruction shows it worst, "
+            "having no denoiser upstream to have smoothed the input "
+            "first. Set a number to override; 16 is the old behaviour.\n"
+            "THE PARAGRAPH BELOW DESCRIBES THE MANUAL PATH ONLY.\n"
             "Number of frames in the r_camera_jitter Halton(2, 3) cycle "
             "before it repeats. Only meaningful when r_camera_jitter is 1. "
             "16 matches the phase count the denoiser-side Halton offset in "
@@ -1244,10 +1258,24 @@ namespace cvar {
     // the manual sun cvars with positions computed from observer
     // lat/lon and current UTC time. Default location: Chennai, India.
     PT_CVAR(r_sky_use_astronomical, "0",
-            "1 = compute sun position from r_sky_lat/r_sky_lon and current UTC, ignoring r_sun_elevation/r_sun_azimuth. 0 = use manual sun cvars.",
+            "1 = compute the sun from the date and the Greenwich sidereal "
+            "angle, ignoring r_sun_elevation/r_sun_azimuth. 0 = use the "
+            "manual sun cvars.\n"
+            "SEEDED TO 1 BY THE `earth` SCENE and left at 0 as the registered "
+            "default. The manual sun is ONE fixed direction in a world frame "
+            "anchored at the reference site, so on a globe it nails the lit "
+            "hemisphere to that site and no amount of flying reaches "
+            "daylight. Astronomical mode builds an EARTH-FIXED direction "
+            "instead, so half the planet is lit and the terminator is a real "
+            "place. It is not the registered default because the date cvars "
+            "(r_sky_year/month/day) mean `today` when unset, which would make "
+            "any fixture that forgot to pin this depend on the wall "
+            "calendar.\n"
+            "ON A SPHERICAL FRAME the observer is the camera, not "
+            "r_sky_lat/lon.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_sky_lat,         "13.0827", "Observer latitude in degrees (+N). Default: Chennai, India. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
-    PT_CVAR(r_sky_lon,         "80.2707", "Observer longitude in degrees (+E). Default: Chennai, India. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_lat,         "13.0827", "Observer latitude in degrees (+N). Default: Chennai, India. Ignored when r_sky_use_astronomical = 0 -- AND when r_planet_spherical_frame = 1, where the observer is the CAMERA: its geodetic position is derived from where it actually is, because on a body you can fly around a fixed observer would pin the sky to one spot on the ground. The sun DIRECTION does not depend on this in either case (it is earth-fixed); this only chooses whose horizon r_sun_elevation / r_sun_azimuth report against.", CVAR_ARCHIVE);
+    PT_CVAR(r_sky_lon,         "80.2707", "Observer longitude in degrees (+E). Default: Chennai, India. Ignored when r_sky_use_astronomical = 0, and superseded by the camera position when r_planet_spherical_frame = 1 -- see r_sky_lat.", CVAR_ARCHIVE);
     PT_CVAR(r_sky_hour,        "12.0",    "Hour of day (0..24) for the astronomical sun + starmap. Interpreted in UTC if r_sky_hour_local = 0, else in the selected city's local time. r_sky_animate = 1 advances this every frame. Ignored when r_sky_use_astronomical = 0 (manual-sun mode -- the engine emits a one-line warning if this cvar is changed in that mode).", CVAR_ARCHIVE);
     PT_CVAR(r_sky_hour_local,  "1",       "If 1, r_sky_hour is the city's local time (using r_sky_tz_offset_hours, set by r_sky_city). If 0, UTC. Ignored when r_sky_use_astronomical = 0.", CVAR_ARCHIVE);
     // Date selector. All three at 0 means "use current date" (default). Set
@@ -2291,17 +2319,47 @@ namespace cvar {
             "over-blurs through a magnifier today -- so terrain is no "
             "worse, and this is the floor for scenes that care.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_planet_lod_max_level,  "19",
-            "Detail ceiling. Level 19 chunks are 19.1 m across with 0.30 m "
-            "vertex spacing -- walking scale. The ceiling exists because a "
-            "level-0 chunk's 156 km vertex spacing reaches one pixel at "
-            "2.87e8 m, so ~20 levels span everything from underfoot to "
-            "further away than geometry means anything at all. Lower it to "
-            "cap memory and bake cost on a slower machine.", CVAR_ARCHIVE);
-    PT_CVAR(r_planet_chunk_budget,   "1024",
+    PT_CVAR(r_planet_lod_max_level,  "18",
+            "Detail ceiling. Level 18 chunks are 38.2 m across with 0.61 m "
+            "vertex spacing. The ceiling exists because a level-0 chunk's "
+            "156 km vertex spacing reaches one pixel at 2.87e8 m, so ~20 "
+            "levels span everything from underfoot to further away than "
+            "geometry means anything at all.\n"
+            "WHY 18 AND NOT THE 19 THIS SHIPPED WITH. Below the DEM's "
+            "texel size every vertex the field returns is FRACTAL, not "
+            "measured -- earth_lite is 2048x1024, so 19.5 km per texel, "
+            "and level 19's 0.30 m spacing is sixteen octaves below the "
+            "last real datum. Those octaves are not detail, they are "
+            "invention at a scale where the eye can tell: the surface "
+            "acquires a fine crumbly texture that no landscape has and "
+            "that reads as noise rather than as ground. One level up "
+            "halves the finest vertex spacing and costs nothing real, "
+            "because there was nothing real there. Raise it again with a "
+            "finer DEM behind it (tools/fetch_planet_dem.py --width 8192 "
+            "gives 4.9 km per texel) or if the fractal look is wanted; "
+            "kMaxLevel = 19 is still the hard ceiling.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_chunk_budget,   "0",
             "Terrain LEAF cap: the size of the frontier the selector may "
-            "ask for. The ARENA is larger, and by an exact amount rather "
-            "than a margin -- residency is the whole cut (#319), and a "
+            "ask for. 0 = SIZE IT TO THE BOARD, which is the default.\n"
+            "The flat 1024 this shipped with was a number for a machine "
+            "that might have had 8 GB, and it was the wrong number on "
+            "anything larger in a way that was visible rather than "
+            "academic: 1024 leaves cannot cover a planet from eye height "
+            "at the 0.5 px target, so EnforceBudget raised tau until the "
+            "balanced set fit and the surface came back faceted -- while "
+            "the arena it was being squeezed into had used 110 MB of a "
+            "32 GB board. Automatic sizing takes a quarter of the "
+            "device-local heap, divides by the per-slot cost, rounds down "
+            "to a power of two and stops at 16384 (see AutoLeafBudget). "
+            "On a 32 GB board that is 16384 leaves, a 21845-slot arena, "
+            "about 1.8 GB of vertex data. A board that will not report "
+            "its memory gets the old 1024.\n"
+            "The ceiling is a CPU bound, not a memory one: the selector "
+            "rebuilds and re-balances the whole cut every unfrozen frame. "
+            "Type a number to override, up to kMaxLeafBudget (65536); "
+            "`planet_stats` reports what was chosen.\n"
+            "The ARENA is larger than this cap, and by an exact amount "
+            "rather than a margin -- residency is the whole cut (#319), and a "
             "quadtree cut with L leaves has exactly (L - 6) / 3 interior "
             "nodes, so the arena is L + (L - 6) / 3 slots: 1363 at the "
             "default 1024. Those ancestors are kept resident and "
@@ -2362,10 +2420,17 @@ namespace cvar {
             "(pt_planet_settle_rounds) so the freeze happens on a CONVERGED set "
             "rather than on whatever had streamed in by then.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_planet_workers,        "4",
-            "Chunk-bake worker threads. Generation is embarrassingly "
-            "parallel and entirely off the render thread; a level-19 chunk "
-            "costs ~22 000 elevation-field evaluations.", CVAR_ARCHIVE);
+    PT_CVAR(r_planet_workers,        "0",
+            "Chunk-bake worker threads. 0 = half the machine's hardware "
+            "threads, which is the default; a fixed 4 left a 32-thread "
+            "desktop baking at an eighth of its rate, and bake throughput "
+            "is exactly what the terrain is waiting on whenever it is "
+            "visibly filling in. Half rather than all because the render "
+            "thread, the driver and the pipeline-build worker are also "
+            "real, and a pool that saturates every core makes the frame it "
+            "is streaming for late. Generation is embarrassingly parallel "
+            "and entirely off the render thread; a level-19 chunk costs "
+            "~22 000 elevation-field evaluations.", CVAR_ARCHIVE);
     PT_CVAR(r_planet_dem,            "assets/planet/earth_lite.ptdem",
             "Path to the elevation grid, relative to the asset root. The "
             "engine ships TOOLING rather than the data: run "
@@ -3309,6 +3374,29 @@ bool Engine::Init() {
         // moving. Verified a no-op: seed_cvar only writes when the cvar
         // is unassigned, and it writes the value it already holds.
         seed_cvar("r_show_stars", "1");
+        // --- A SUN THAT IS ACTUALLY ON THE EARTH -----------------------
+        //
+        // The manual sun is one fixed direction in the world frame, and
+        // the world frame is anchored at the reference site -- so on a
+        // body you can fly around it nails the lit hemisphere to the site.
+        // Fly far enough and it is night everywhere, permanently, with no
+        // way to reach daylight short of editing r_sun_elevation. For the
+        // default scene, whose entire premise is that you can leave the
+        // ground and go somewhere else, that is the wrong default.
+        //
+        // Astronomical mode computes an EARTH-FIXED sun from the date and
+        // the Greenwich sidereal angle (see the sun block in RenderFrame),
+        // so half the globe is lit, the terminator is a real place, and
+        // flying east runs you into the sunrise.
+        //
+        // SEEDED HERE RATHER THAN MADE THE CVAR DEFAULT, deliberately. In
+        // this mode the sun follows r_sky_year/month/day, all of which
+        // default to "today" -- so a global default would make every
+        // fixture that forgot to pin it depend on the wall calendar. 66 of
+        // the 73 golden scenes already pin it to 0 and the rest do not use
+        // a sun; seeding leaves all of them exactly as they were, because
+        // seed_cvar writes only what the scene has not already assigned.
+        seed_cvar("r_sky_use_astronomical", "1");
         // The planet IS the scene; the historical grey plane at y = 0
         // would sit above the ellipsoid everywhere except the tangent
         // point and paint a flat-Earth horizon over it -- the same reason
@@ -7398,9 +7486,63 @@ void Engine::UpdatePlanetTerrain() {
     constexpr double kDeg2Rad = 0.017453292519943295;
     cfg.site_lat_rad = fget("r_planet_site_lat", 0.0) * kDeg2Rad;
     cfg.site_lon_rad = fget("r_planet_site_lon", 0.0) * kDeg2Rad;
-    cfg.worker_count = iget("r_planet_workers", 4);
+    // AUTOMATIC SIZING, RESOLVED EXACTLY ONCE, HERE. Both the restart
+    // comparison below and PlanetTerrain::Init clamp this number, and if
+    // they ever disagreed about what "auto" meant the comparison would
+    // report a mismatch every frame and restart the streamer forever. So
+    // `cfg` carries the concrete figure from this point on and nothing
+    // downstream has to know that 0 ever meant anything.
+    cfg.worker_count = iget("r_planet_workers", 0);
+    if (cfg.worker_count <= 0) {
+        // Chunk baking is embarrassingly parallel, entirely off the render
+        // thread, and is what the terrain is waiting for whenever it is
+        // visibly filling in -- so it gets half the machine. Half rather
+        // than all: the render thread, the driver's own threads and the
+        // pipeline-build worker are all real, and a bake pool that
+        // saturates every core makes the frame it is streaming for late.
+        const unsigned hw = std::thread::hardware_concurrency();
+        cfg.worker_count = (hw >= 4u) ? static_cast<int>(hw / 2u) : 4;
+    }
     cfg.blas_budget_ms = fget("r_planet_blas_budget_ms", 2.0);
-    if (auto* v = C.FindCVar("r_planet_dem")) cfg.dem_path = v->value;
+    // --- PREFER A LOCAL HIGH-RESOLUTION BAKE ------------------------------
+    //
+    // The committed grid is earth_lite: 2048x1024, 19.5 km per texel. That
+    // is what a source repository can carry, and it is roughly ten times
+    // coarser than the ETOPO 2022 source it was decimated from -- so every
+    // LOD level past about ten is drawing FRACTAL detail rather than
+    // measured ground.
+    //
+    // tools/fetch_planet_dem.py --width 8192 bakes the finer grid (4.9 km
+    // per texel, 134 MB, far too large to commit). If that file is sitting
+    // there, use it. The rule is narrow on purpose: it fires ONLY when
+    // r_planet_dem still holds its registered default, so anyone who has
+    // pointed the cvar somewhere -- another body, a test fixture, a
+    // deliberate ablation back to the lite grid -- keeps exactly what they
+    // asked for, and the choice is logged either way at terrain start-up.
+    if (auto* v = C.FindCVar("r_planet_dem")) {
+        cfg.dem_path = v->value;
+        // NEVER UNDER A CAPTURE, for the same reason the leaf budget is
+        // not auto-sized there: five planet golden scenes leave
+        // r_planet_dem at its default, and swapping the elevation data
+        // under them because a 134 MB file happens to exist on THIS
+        // disk would make those cells depend on the machine. Those
+        // scenes now pin the cvar as well -- this is the backstop, not
+        // the fix.
+        const bool capturing = iget("pt_smoke_frames", 0) > 0 ||
+                               iget("pt_planet_settle_rounds", 0) > 0;
+        if (!capturing && v->value == v->default_value) {
+            static const char* kPreferred[] = {
+                "assets/planet/earth_8k.ptdem",
+            };
+            for (const char* cand : kPreferred) {
+                std::error_code ec{};
+                if (std::filesystem::exists(pt::ResolveAssetPath(cand), ec)) {
+                    cfg.dem_path = cand;
+                    break;
+                }
+            }
+        }
+    }
     cfg.field.hurst               = fget("r_planet_hurst", 0.5);
     cfg.field.hurst_fine          = fget("r_planet_hurst_fine", 1.0);
     cfg.field.hillslope_break_m   = fget("r_planet_hillslope_break", 106.0);
@@ -7410,8 +7552,27 @@ void Engine::UpdatePlanetTerrain() {
     cfg.lod.tau_px       = fget("r_planet_lod_error_px", 0.5);
     cfg.lod.hysteresis   = fget("r_planet_lod_hysteresis", 1.4);
     cfg.lod.min_level    = iget("r_planet_lod_min_level", 0);
-    cfg.lod.max_level    = iget("r_planet_lod_max_level", pt::planet::kMaxLevel);
-    cfg.lod.chunk_budget = iget("r_planet_chunk_budget", 1024);
+    cfg.lod.max_level    = iget("r_planet_lod_max_level",
+                                pt::planet::kMaxLevel - 1);
+    cfg.lod.chunk_budget = iget("r_planet_chunk_budget", 0);
+    if (cfg.lod.chunk_budget <= 0) {
+        // NEVER AUTO-SIZE UNDER A CAPTURE. The budget decides the leaf set,
+        // the leaf set decides the pixels, and an automatic budget is a
+        // function of the BOARD -- so a golden captured with one would
+        // reproduce only on cards with the same memory. A capture gets the
+        // fixed historical default instead, which is also what every planet
+        // cell that pins the cvar already asks for.
+        //
+        // Cells are still expected to state their own value. This is the
+        // backstop for one that forgets, and it fails towards the number
+        // the matrix was built on rather than towards this machine.
+        const bool capturing = iget("pt_smoke_frames", 0) > 0 ||
+                               iget("pt_planet_settle_rounds", 0) > 0;
+        cfg.lod.chunk_budget =
+            capturing ? pt::planet::kDefaultLeafBudget
+                      : pt::planet::AutoLeafBudget(
+                            device_ ? device_->DeviceLocalMemoryBytes() : 0u);
+    }
 
     const bool have = planet_terrain_ && planet_terrain_->Ready();
     bool restart = false;
@@ -7426,7 +7587,8 @@ void Engine::UpdatePlanetTerrain() {
         // TLAS capacity directly would report a mismatch on every frame and
         // restart the streamer forever.
         if (planet_terrain_->LeafBudget() !=
-            static_cast<std::uint32_t>(std::clamp(cfg.lod.chunk_budget, 8, 8192))) {
+            static_cast<std::uint32_t>(std::clamp(cfg.lod.chunk_budget, 8,
+                                                  pt::planet::kMaxLeafBudget))) {
             restart = true;
         }
         if (std::abs(planet_terrain_->Field().Params().hurst - cfg.field.hurst) > 1e-12 ||
@@ -11242,12 +11404,43 @@ void Engine::RenderFrame() {
     // it resolves to 16 unless the operator deliberately changed it,
     // and the DEFAULT value of 16 is what preserves the pre-existing
     // denoiser jitter bit-for-bit.
+    //
+    // AUTOMATIC PHASE COUNT WHEN SOMETHING IS UPSCALING (0 = auto, the
+    // default). 16 phases is the right number for a denoiser and the wrong
+    // one for a temporal upscaler at an aggressive render scale, and the
+    // failure is exactly what it looks like: DLSS at ultra performance is
+    // reconstructing NINE output pixels per input pixel from a 16-phase
+    // sequence, so the sub-pixel grid is under-covered by ~4.5x and the
+    // reconstruction oscillates between frames instead of converging. It
+    // reads as the whole image shimmering, and Ray Reconstruction shows it
+    // worst because RR has no separate denoiser upstream to have already
+    // smoothed the input.
+    //
+    // NVIDIA's guidance is base_phases / scale^2 with a base of 8: 18 at
+    // 2/3 (quality), 32 at 1/2 (performance), 72 at 1/3 (ultra
+    // performance). Floored at 16 so nothing that was working gets FEWER
+    // phases than before, and capped at 256 with the manual path.
+    //
+    // Gated on an upscaler actually being engaged, which is what keeps the
+    // golden matrix bit-identical: no cell sets r_dlss or r_render_scale,
+    // so every one of them takes the 16 below unchanged.
     std::uint32_t jitter_period = 16u;
-    if (auto* v = C.FindCVar("r_camera_jitter_period")) {
-        int n = v->GetInt();
-        if (n < 1)   n = 1;
-        if (n > 256) n = 256;
-        jitter_period = static_cast<std::uint32_t>(n);
+    {
+        int requested = 0;
+        if (auto* v = C.FindCVar("r_camera_jitter_period")) requested = v->GetInt();
+        if (requested > 0) {
+            jitter_period = static_cast<std::uint32_t>(std::clamp(requested, 1, 256));
+        } else {
+            const bool upscaling =
+                (dlss_active_ && dlss_settings_.supported) || render_scale_engaged_;
+            float scale = 1.0f;
+            if (auto* v = C.FindCVar("r_render_scale")) scale = v->GetFloat();
+            if (upscaling && scale > 0.0f && scale < 1.0f) {
+                const double phases = std::ceil(8.0 / (double(scale) * double(scale)));
+                jitter_period = static_cast<std::uint32_t>(
+                    std::clamp(phases, 16.0, 256.0));
+            }
+        }
     }
     std::uint32_t hi = (push.frame_index % jitter_period) + 1u;
     push.halton_jitter[0] = halton(hi, 2) - 0.5f;
@@ -11442,13 +11635,111 @@ void Engine::RenderFrame() {
     // every committed golden stays byte-for-byte.
     const double frame_jd = compute_jd();
     // --- end canonical frame clock ----------------------------------------
+    // Set when the sun direction has already been written in WORLD space
+    // and must not be rebuilt from horizon coordinates below. Only the
+    // globe path does that; every other path leaves this false and the
+    // original elevation/azimuth construction runs untouched.
+    bool sun_dir_is_set = false;
+    // --- ASTRONOMICAL SUN -------------------------------------------------
+    //
+    // TWO FRAMES, and the difference only appears once the scene is a globe
+    // you can fly around.
+    //
+    // The horizon path below is the original: compute the sun's altitude and
+    // azimuth for an observer at r_sky_lat/lon, then build a world direction
+    // from them as though world +Y were that observer's up. On a PLANAR
+    // scene that is exactly right -- world up IS the observer's up, there is
+    // only one horizon, and this is what every existing fixture is pinned
+    // against.
+    //
+    // On a PLANET it is wrong, and wrong in the way the user actually hits:
+    // world +Y is the up at the REFERENCE SITE, not wherever the camera has
+    // flown to. Feeding site-frame elevation/azimuth into the shader nails
+    // the sun to the site's sky, so the lit hemisphere travels with you and
+    // the terminator is unreachable -- fly far enough and it is simply night
+    // everywhere, permanently.
+    //
+    // The fix is to stop going through the horizon at all. The sun's
+    // direction is a property of the Earth's orientation, not of an
+    // observer: take the equatorial position, turn it into an EARTH-FIXED
+    // direction with the Greenwich sidereal angle, and rotate that into
+    // world with the site's own ecef_to_world. One direction, globally
+    // correct, and the local elevation anywhere falls out of a dot product
+    // with that point's up -- which is what makes flying east into the
+    // sunrise work.
     if (astro_on) {
+        const auto sun_eq = pt::astro::sunPosition(frame_jd);
+        // Sub-solar longitude: the meridian the sun is over right now.
+        const double gmst_deg  = pt::astro::gmstDegrees(frame_jd);
+        const double sub_lon_d = sun_eq.ra_deg - gmst_deg;
+        const double sub_lat_r = glm::radians(sun_eq.dec_deg);
+        const double sub_lon_r = glm::radians(sub_lon_d);
+        // Earth-fixed unit vector toward the sun, in the same ECEF
+        // convention GeodeticToEcef uses: +X at (0N, 0E), +Y at (0N, 90E),
+        // +Z at the north pole. Declination is geocentric where the
+        // ellipsoid wants geodetic, and the two differ by up to 11.5
+        // arcmin -- comfortably inside the sun's own 16 arcmin radius, so
+        // the distinction is below the size of the object being placed.
+        const glm::dvec3 sun_ecef(std::cos(sub_lat_r) * std::cos(sub_lon_r),
+                                  std::cos(sub_lat_r) * std::sin(sub_lon_r),
+                                  std::sin(sub_lat_r));
+
+        // THE GLOBE TEST IS THE FRAME, NOT THE TERRAIN. What makes the
+        // horizon path wrong is that world +Y is the up at ONE point on an
+        // ellipsoid, and that is true of r_planet_spherical_frame whether
+        // or not chunks are streaming. An ocean-only planet is still a
+        // planet you can fly around.
+        bool globe = false;
+        pt::planet::PlanetSite site{};
+#if PT_PLANET_ENABLED
+        if (auto* v = C.FindCVar("r_planet_spherical_frame"); v && v->GetBool()) {
+            globe = true;
+            if (planet_terrain_ && planet_terrain_->Ready()) {
+                site = planet_terrain_->Site();
+            } else {
+                // No streamer to own the frame, so rebuild it from the
+                // same two cvars the streamer would have used. Cheap: two
+                // trig calls and a cross product.
+                constexpr double kD2R = 0.017453292519943295;
+                double slat = 0.0, slon = 0.0;
+                if (auto* a = C.FindCVar("r_planet_site_lat")) slat = a->GetFloat();
+                if (auto* a = C.FindCVar("r_planet_site_lon")) slon = a->GetFloat();
+                site = pt::planet::PlanetSite::FromGeodetic(slat * kD2R, slon * kD2R);
+            }
+        }
+#endif
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
-        const double jd = frame_jd;
-        auto sun_eq = pt::astro::sunPosition(jd);
-        auto sun_h  = pt::astro::equatorialToHorizon(sun_eq, lat, lon, jd);
+
+#if PT_PLANET_ENABLED
+        if (globe && camera_ != nullptr) {
+            // `site` is the frame chosen above.
+            // THE OBSERVER IS THE CAMERA. r_sky_lat/lon describe a fixed
+            // spot on the ground, which is the right idea for a sky dome
+            // over a level scene and the wrong one for a camera in orbit.
+            // Where the camera IS is what decides what time of day it sees.
+            double cam_lat = 0.0, cam_lon = 0.0;
+            pt::planet::EcefToGeodetic(site.WorldToEcef(camera_->pos_w),
+                                       cam_lat, cam_lon);
+            lat = glm::degrees(cam_lat);
+            lon = glm::degrees(cam_lon);
+
+            const glm::dvec3 sun_world =
+                glm::normalize(site.ecef_to_world * sun_ecef);
+            push.sun_and_mode[0] = static_cast<float>(sun_world.x);
+            push.sun_and_mode[1] = static_cast<float>(sun_world.y);
+            push.sun_and_mode[2] = static_cast<float>(sun_world.z);
+            sun_dir_is_set = true;
+        }
+#endif
+        // Horizon coordinates AT THE OBSERVER -- the camera on a globe, the
+        // configured site otherwise. On the globe path these no longer build
+        // the direction; they are the honest local reading of the direction
+        // that was built above, which is what r_sun_elevation should show
+        // and what every elevation-driven look (twilight tint, star gate)
+        // downstream of the cvar wants.
+        auto sun_h  = pt::astro::equatorialToHorizon(sun_eq, lat, lon, frame_jd);
         sun_elev_deg = static_cast<float>(sun_h.altitude_deg);
         sun_azim_deg = static_cast<float>(sun_h.azimuth_deg);
         // Reflect computed values back to the manual cvars so the
@@ -11462,9 +11753,11 @@ void Engine::RenderFrame() {
     const float elev_r = glm::radians(sun_elev_deg);
     const float azim_r = glm::radians(sun_azim_deg);
     const float ce = std::cos(elev_r), se = std::sin(elev_r);
-    push.sun_and_mode[0] =  ce * std::sin(azim_r);
-    push.sun_and_mode[1] =  se;
-    push.sun_and_mode[2] = -ce * std::cos(azim_r);
+    if (!sun_dir_is_set) {
+        push.sun_and_mode[0] =  ce * std::sin(azim_r);
+        push.sun_and_mode[1] =  se;
+        push.sun_and_mode[2] = -ce * std::cos(azim_r);
+    }
 
     // Moon. Only meaningful in astronomical mode -- the phase angle
     // requires sun + moon at the same epoch / observer, which only
@@ -12217,6 +12510,37 @@ void Engine::RenderFrame() {
         double lat = 13.0827, lon = 80.2707;
         if (auto* v = C.FindCVar("r_sky_lat")) lat = v->GetFloat();
         if (auto* v = C.FindCVar("r_sky_lon")) lon = v->GetFloat();
+        // THE SKY IS AT INFINITY, SO THE OBSERVER HERE IS THE FRAME.
+        //
+        // This matrix maps a WORLD DIRECTION to J2000, and world +X/+Y/+Z
+        // are the east/up/south of the REFERENCE SITE -- that is what
+        // PlanetSite::FromGeodetic builds. So the lat/lon that makes the
+        // mapping correct is the SITE's, and once it is right the answer
+        // holds everywhere in the frame: a camera in orbit and a camera on
+        // the ground looking the same way see the same stars, because they
+        // are looking at the same point on the celestial sphere. The
+        // camera position genuinely does not enter, which is the one place
+        // the sky differs from the sun above.
+        //
+        // Feeding r_sky_lat/lon instead rotates the whole star field by the
+        // difference between that spot and the site. On the default earth
+        // scene that is Chennai against Everest: 15 degrees of latitude,
+        // so the celestial pole sits 15 degrees off where the ground says
+        // it should, and the stars disagree with the sun about where the
+        // terminator is.
+        //
+        // Gated on astronomical mode because that is where an absolute sky
+        // orientation is being claimed at all, and because every existing
+        // spherical-frame fixture pins r_sky_use_astronomical 0 -- all
+        // sixteen of them stay byte-identical.
+#if PT_PLANET_ENABLED
+        if (astro_on) {
+            if (auto* v = C.FindCVar("r_planet_spherical_frame"); v && v->GetBool()) {
+                if (auto* a = C.FindCVar("r_planet_site_lat")) lat = a->GetFloat();
+                if (auto* a = C.FindCVar("r_planet_site_lon")) lon = a->GetFloat();
+            }
+        }
+#endif
         const double jd = frame_jd;
         float m[9];
         pt::astro::worldToJ2000Matrix(lat, lon, jd, m);
@@ -21456,6 +21780,11 @@ void Engine::RegisterCsgCommands() {
                            device_ ? device_->AccelGpuStallCount()
                                    : static_cast<std::uint64_t>(0),
                            planet_stall_baseline_);
+            out.FormatLine("planet_stats: leaf_budget={} arena_slots={} "
+                           "held={} starved={}",
+                           planet_terrain_->LeafBudget(),
+                           planet_terrain_->TlasCapacity() - 1u,
+                           st.held, st.starved);
             out.FormatLine("planet_stats: dem={} site={:.4f},{:.4f} "
                            "tlas_capacity={}",
                            planet_terrain_->HasDem() ? "real" : "procedural",

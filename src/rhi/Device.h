@@ -68,6 +68,38 @@ public:
     virtual TextureHandle     CreateTexture(const TextureDesc&)           = 0;
     virtual PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) = 0;
     virtual AccelStructHandle CreateBLAS(const BLASDesc&)                 = 0;
+
+    // --- Deferred BLAS creation (the streaming path) ----------------------
+    //
+    // CreateBLAS records a build, submits it and BLOCKS on a fence before
+    // returning. That is correct and it is fine for a mesh built once at
+    // load. It is the wrong shape for terrain, because the submission
+    // queues behind whatever the frame has already given the GPU: measured
+    // on an idle 640x400 fixture one build costs 0.077 ms, and measured in
+    // a real session with the path tracer, DLSS and a denoiser running it
+    // costs 7.6 ms -- a whole frame. Against the streamer's millisecond
+    // build budget that admits exactly ONE chunk per frame, which is why
+    // returning from orbit left several hundred chunks resident-but-unbuilt
+    // and the ground stayed open for as many frames.
+    //
+    // This variant submits and returns. The handle is valid immediately --
+    // the acceleration structure OBJECT exists and has a device address --
+    // but its CONTENTS are undefined until the build completes, so it must
+    // not be referenced from a TLAS until AccelReady() says so. Tracing a
+    // structure that is still building is undefined behaviour, not a
+    // glitchy frame.
+    //
+    // Default implementation is the blocking one, which is trivially ready.
+    virtual AccelStructHandle CreateBLASDeferred(const BLASDesc& d) {
+        return CreateBLAS(d);
+    }
+    // False while a deferred build for this handle is still in flight.
+    // O(1); safe to call per structure per frame.
+    virtual bool AccelReady(AccelStructHandle) const { return true; }
+    // Retire finished deferred builds and release the transient buffers
+    // they held (AS-input vertex/index copies and build scratch). Never
+    // blocks. Call once per frame before consulting AccelReady.
+    virtual void PollAccelBuilds() {}
     virtual AccelStructHandle CreateTLAS(const TLASDesc&)                 = 0;
 
     // Re-point an existing TLAS at a new instance array WITHOUT a device
@@ -240,6 +272,17 @@ public:
     virtual bool         SupportsHardwareRT() const = 0;
     virtual const char*  DeviceName()       const = 0;
     virtual std::size_t  CurrentAllocatedBytes() const = 0;
+    // Size of the board's largest DEVICE_LOCAL memory heap, in bytes --
+    // VRAM, as the driver reports it. 0 means "cannot tell", which callers
+    // must treat as "size for the conservative default" rather than as
+    // zero bytes available.
+    //
+    // This is the HEAP, not what is free: it is meant for sizing decisions
+    // taken once at start-up (how large a streaming arena to build on this
+    // board), where the right question is how much the card has, not how
+    // much is unallocated at this instant. Anything that needs the live
+    // figure wants VK_EXT_memory_budget and a per-frame query.
+    virtual std::size_t  DeviceLocalMemoryBytes() const { return 0; }
 
     // True iff a previous Vulkan call returned VK_ERROR_DEVICE_LOST (or
     // an equivalent terminal status on another backend). Once latched

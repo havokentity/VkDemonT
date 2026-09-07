@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pt::rhi::vk { class VulkanNrdDenoiser; }
@@ -201,6 +202,9 @@ public:
     TextureHandle     CreateTexture(const TextureDesc&) override;
     PipelineHandle    CreateComputePipeline(const ComputePipelineDesc&) override;
     AccelStructHandle CreateBLAS(const BLASDesc&) override;
+    AccelStructHandle CreateBLASDeferred(const BLASDesc&) override;
+    bool              AccelReady(AccelStructHandle) const override;
+    void              PollAccelBuilds() override;
     AccelStructHandle CreateTLAS(const TLASDesc&) override;
     bool UpdateTLASInstances(AccelStructHandle h,
                              std::span<const TLASInstance> instances) override;
@@ -245,6 +249,7 @@ public:
     bool         SupportsHardwareRT() const override { return rt_supported_; }
     const char*  DeviceName()       const override { return device_name_.c_str(); }
     std::size_t  CurrentAllocatedBytes() const override;
+    std::size_t  DeviceLocalMemoryBytes() const override;
     bool         IsDeviceLost() const override { return device_lost_; }
 
     // SVGF/NRD denoiser. The denoiser pipelines + scratch textures are
@@ -769,6 +774,45 @@ private:
     BufferEntry                 swap_capture_staging_ {};
     std::size_t                 swap_capture_staging_capacity_ = 0;
 
+    // --- Deferred acceleration-structure builds ---------------------------
+    //
+    // A build submitted by CreateBLASDeferred and not yet known to have
+    // finished. Everything the GPU still needs lives here: the fence that
+    // says when it is done, the one-shot command buffer, the build scratch,
+    // and the host-visible AS-INPUT copies of the vertex and index data.
+    //
+    // Those last two are the reason this record exists rather than a bare
+    // fence. CreateBLAS memcpys the caller's arrays into mapped buffers and
+    // destroys them the moment the build has landed -- which is safe only
+    // because it waited. Without the wait they must outlive the submission,
+    // and freeing them early is a use-after-free the GPU commits, not the
+    // CPU: the symptom is corrupt geometry or a device loss, not a crash
+    // anywhere near the mistake.
+    struct PendingAccelBuild {
+        VkFence         fence = VK_NULL_HANDLE;
+        VkCommandBuffer cmd   = VK_NULL_HANDLE;
+        BufferEntry     scratch{};
+        BufferEntry     vbuf{};
+        BufferEntry     ibuf{};
+        std::uint64_t   handle_id = 0;
+    };
+    std::vector<PendingAccelBuild>  pending_builds_;
+    // Membership index for AccelReady, which the terrain streamer calls
+    // once per resident chunk per frame -- a linear scan of the pending
+    // list would be O(resident * in_flight) on exactly the frames when
+    // both are large.
+    std::unordered_set<std::uint64_t> pending_build_ids_;
+    // Block until every deferred build has landed, then release them. For
+    // teardown and for the destroy path, where a structure must not go away
+    // while the GPU is still writing it.
+    void DrainPendingAccelBuilds();
+    void RetirePendingBuild(PendingAccelBuild& p);
+    // Shared body for CreateBLAS and CreateBLASDeferred. `defer` non-null
+    // submits without waiting and is filled with everything the in-flight
+    // build still owns. Declared here rather than beside the overrides
+    // because it names PendingAccelBuild.
+    AccelStructHandle CreateBLASImpl(const BLASDesc&, PendingAccelBuild* defer);
+
     struct AccelEntry {
         VkAccelerationStructureKHR accel          = VK_NULL_HANDLE;
         VkBuffer                   buffer         = VK_NULL_HANDLE;
@@ -856,7 +900,8 @@ private:
                                     AccelEntry& entry,
                                     VkAccelerationStructureTypeKHR type,
                                     VkDeviceSize as_size,
-                                    VkDeviceSize scratch_size);
+                                    VkDeviceSize scratch_size,
+                                    PendingAccelBuild* defer = nullptr);
     // Translate the RHI build policy into VkBuildAccelerationStructureFlagsKHR.
     static VkBuildAccelerationStructureFlagsKHR VkAccelFlags(AccelBuildFlags flags);
     // Allocate a scratch buffer whose USABLE device address is aligned

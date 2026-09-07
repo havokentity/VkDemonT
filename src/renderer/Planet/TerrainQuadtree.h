@@ -242,10 +242,30 @@ public:
 
     // Replace the pending request list. Requests already in flight finish;
     // queued-but-unstarted ones are discarded. Cheap enough to call every
-    // frame.
+    // frame -- and it HAS to be, because PlanetTerrain::Update calls it
+    // every frame with "everything the selector wants that is not yet in
+    // baked_".
+    //
+    // Keys that are already CLAIMED -- popped by a worker and not yet
+    // drained -- are dropped from the incoming list rather than queued
+    // again (#341). Without that filter the caller's own loop is a
+    // duplicate-bake generator: a chunk leaves the queue the moment a
+    // worker takes it but does not reach the caller's `baked_` map until
+    // it has been drained, and the drain is capped at 64 per frame, so
+    // every frame in between re-asks for a chunk that is already being
+    // baked or is already sitting in done_. Measured on the caller's exact
+    // loop: 497 bakes for 384 distinct chunks, and the ratio grows with
+    // the backlog because the backlog is what delays the drain.
     void Request(const std::vector<ChunkKey>& keys);
 
-    // Move up to `max` finished bakes out. Non-blocking.
+    // Move up to `max` finished bakes out, OLDEST FIRST. Non-blocking.
+    //
+    // Order is not a detail here. The queue is priority-ordered and workers
+    // take the highest-priority key first, so completion order tracks the
+    // camera's need -- and draining from the back handed that order back
+    // REVERSED, delivering the chunks nearest the camera last whenever a
+    // backlog exceeded the per-frame cap. That is the "terrain fills in
+    // from the wrong end" half of #341.
     int Drain(std::vector<TerrainChunkData>& out, int max);
 
     int  InFlight() const noexcept { return in_flight_.load(std::memory_order_acquire); }
@@ -278,6 +298,12 @@ private:
     // notify_all on it would spin every thread in the pool.
     std::condition_variable       idle_cv_;
     std::vector<ChunkKey>         queue_;         // back() is next
+    // Keys a worker has taken and the caller has not yet drained: in
+    // flight, or finished and waiting in done_. Request subtracts this so
+    // the same chunk is never baked twice. Guarded by mu_, which is why
+    // Drain takes mu_ before out_mu_ -- the documented order, never the
+    // reverse.
+    std::set<ChunkKey>            claimed_;
     const ElevationField*         field_ = nullptr;
     PlanetSite                    site_{};
 

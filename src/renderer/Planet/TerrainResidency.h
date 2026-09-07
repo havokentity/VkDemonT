@@ -176,6 +176,49 @@ std::set<ChunkKey> CutAncestors(const std::set<ChunkKey>& leaves);
 // choose between a desired leaf and a retained ancestor at steady state.
 std::size_t WholeCutSlots(std::size_t leaf_budget) noexcept;
 
+// --- SIZING THE ARENA TO THE BOARD ----------------------------------------
+//
+// The leaf budget used to be a flat 1024 whatever the card was, and 1024
+// leaves cannot cover a planet from eye height at the selector's 0.5 px
+// target -- EnforceBudget raises tau until the balanced set fits, so on a
+// 32 GB board the terrain was being coarsened to fit an arena that had
+// used 110 MB of it. That is a real visual cost (the surface reads as
+// faceted) paid for nothing.
+//
+// WHAT A LEAF COSTS. A slot holds kChunkVertexCount * kVertexPayloadFloats
+// floats of shader-visible vertex data -- 4225 * 5 * 4 = 84 500 bytes,
+// which the "110 MB for 1363 slots" start-up line confirms -- plus its
+// BLAS, which the driver sizes and which measures out in the same order.
+// kSlotBytesEstimate carries both. Residency is the whole cut, so a
+// budget of L leaves buys WholeCutSlots(L) slots: about 4/3 L.
+//
+// WHY A FRACTION AND NOT THE WHOLE HEAP. The path tracer's own working set
+// -- framebuffers at render and display extent, the denoiser's history,
+// DLSS's internal buffers, ReSTIR's reservoirs, the scene TLAS, textures --
+// shares the board, and none of it is sized here. kVramFraction leaves
+// that room. It is deliberately not tuned to the last byte: the difference
+// between 12 000 and 16 000 leaves is not visible, and running the board
+// out of memory is.
+inline constexpr std::size_t kSlotBytesEstimate = 176u * 1024u;
+inline constexpr double      kVramFraction      = 0.25;
+
+// Hard ceiling on the leaf budget, whether it was chosen automatically or
+// typed in. This bounds CPU work, not memory: the selector rebuilds and
+// re-balances the whole cut every frame it is not frozen, and Balance is a
+// four-neighbour walk per leaf iterated to a fixed point. Memory would
+// allow more on a large board; the render thread would not enjoy it.
+inline constexpr int kMaxLeafBudget = 65536;
+
+// The leaf budget to use on a board with `vram_bytes` of device-local
+// memory. 0 (the backend cannot tell) returns kDefaultLeafBudget, which is
+// what shipped before any of this existed -- an unknown board is treated as
+// a small one. Capped at kAutoLeafCeiling rather than at kMaxLeafBudget so
+// that "automatic" stays a number the render thread is known to be happy
+// with and pushing past it remains a deliberate act.
+inline constexpr int kDefaultLeafBudget = 1024;
+inline constexpr int kAutoLeafCeiling   = 16384;
+int AutoLeafBudget(std::size_t vram_bytes) noexcept;
+
 struct ResidencyCover {
     // The disjoint cover to hand the TLAS. Every member is resident.
     std::set<ChunkKey>    published;

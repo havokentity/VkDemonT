@@ -432,6 +432,7 @@ void AsyncChunkBaker::Stop() {
     {
         std::lock_guard lk(mu_);
         queue_.clear();
+        claimed_.clear();
     }
     {
         std::lock_guard lk(out_mu_);
@@ -446,6 +447,10 @@ void AsyncChunkBaker::SetSources(const ElevationField* field, const PlanetSite& 
         field_ = field;
         site_  = site;
         queue_.clear();
+        // Claims go with the queue. Everything in flight against the old
+        // sources is about to be dropped on the generation check, so
+        // holding its keys would block the re-request that has to follow.
+        claimed_.clear();
     }
     generation_.fetch_add(1, std::memory_order_acq_rel);
     {
@@ -462,20 +467,42 @@ void AsyncChunkBaker::Request(const std::vector<ChunkKey>& keys) {
         std::lock_guard lk(mu_);
         // Highest priority is consumed first, and the workers pop from the
         // back, so store reversed.
-        queue_.assign(keys.rbegin(), keys.rend());
+        //
+        // Claimed keys are skipped (#341). The caller re-asks for anything
+        // that has not reached its own map yet, and between a worker taking
+        // a key and the caller draining the result that is EVERY frame --
+        // so without this the pool would rebake work it is already doing,
+        // and the deeper the backlog the more of it. Dropping them here
+        // rather than at the caller keeps the rule where the fact lives:
+        // only the pool knows what it has claimed.
+        queue_.clear();
+        queue_.reserve(keys.size());
+        for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+            if (claimed_.find(*it) == claimed_.end()) queue_.push_back(*it);
+        }
     }
     cv_.notify_all();
 }
 
 int AsyncChunkBaker::Drain(std::vector<TerrainChunkData>& out, int max) {
-    std::lock_guard lk(out_mu_);
-    int n = 0;
-    while (!done_.empty() && n < max) {
-        out.push_back(std::move(done_.back()));
-        done_.pop_back();
-        ++n;
+    if (max <= 0) return 0;
+    // mu_ before out_mu_ -- the order documented in the header and asserted
+    // by Idle(). mu_ is needed because releasing a claim is what lets the
+    // key be requested again.
+    std::lock_guard lk(mu_);
+    std::lock_guard out_lk(out_mu_);
+    // OLDEST FIRST. done_ is appended in completion order and the workers
+    // consume the queue in priority order, so the front of done_ is the
+    // work the camera needed most. Taking from the back served that order
+    // backwards under any backlog deeper than `max`.
+    const std::size_t n =
+        std::min(done_.size(), static_cast<std::size_t>(max));
+    for (std::size_t i = 0; i < n; ++i) {
+        claimed_.erase(done_[i].key);
+        out.push_back(std::move(done_[i]));
     }
-    return n;
+    done_.erase(done_.begin(), done_.begin() + static_cast<std::ptrdiff_t>(n));
+    return static_cast<int>(n);
 }
 
 bool AsyncChunkBaker::Idle() const {
@@ -527,6 +554,13 @@ void AsyncChunkBaker::WorkerLoop() {
             // barrier and would return one bake early, which is exactly the
             // kind of "converged" that is detected rather than guaranteed.
             in_flight_.fetch_add(1, std::memory_order_acq_rel);
+            // Claim it for the same reason, one step further on: the key is
+            // out of the queue now, so Request can no longer see it there.
+            // The claim is what stops the next frame's request putting it
+            // straight back, and it is held until Drain hands the result
+            // over -- not merely until the bake ends -- because the caller
+            // keeps re-asking for anything it has not received.
+            claimed_.insert(key);
         }
         if (field != nullptr) {
             TerrainChunkData data;
@@ -535,6 +569,16 @@ void AsyncChunkBaker::WorkerLoop() {
                 std::lock_guard lk(out_mu_);
                 done_.push_back(std::move(data));
             }
+            // A stale result is dropped and its claim is NOT withdrawn
+            // here. SetSources cleared claimed_ when it bumped the
+            // generation, so there is nothing of ours left to withdraw --
+            // and erasing the key anyway could withdraw a FRESH claim a
+            // second worker has since taken on it against the new sources.
+        } else {
+            // No field: the bake never ran, so release the claim rather
+            // than stranding the key where nothing will ever drain it.
+            std::lock_guard lk(mu_);
+            claimed_.erase(key);
         }
         // Retire the claim and wake any barrier. The decrement happens under
         // mu_ so a waiter cannot evaluate its predicate between the
