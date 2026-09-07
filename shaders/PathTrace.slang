@@ -3279,6 +3279,47 @@ bool intersectAabb(float3 ro, float3 rd_inv, float3 mn, float3 mx, float t_max) 
 // of it and of the origin, so traceScene derives `t_min` once here rather
 // than making every caller carry a second parameter that could drift out
 // of step with the first.
+// Barycentric-interpolated per-vertex UV, bounds-checked against the UV
+// buffer that is ACTUALLY bound.
+//
+// mesh_uvs (binding 35) is declared unconditionally, but when a mesh carries
+// no UVs the host binds a 16-BYTE PLACEHOLDER under PARTIALLY_BOUND. The
+// per-material tile gate downstream (tex_tiles != kPbrNoTexTile) was
+// documented -- in this shader and in VulkanDevice.cpp -- as the thing that
+// made that safe. It is not: it gates the texture SAMPLE, while the UV read
+// happens first and unconditionally. Every mesh hit on an untextured mesh
+// therefore read past the end of a 16-byte buffer.
+//
+// GPU-assisted validation reports it exactly:
+//
+//   VUID-vkCmdDispatch-storageBuffers-06936
+//   (set = 0, binding = 35) access out of bounds. The descriptor buffer
+//   size is 16 bytes, ... highest out of bounds access was at [3119] bytes
+//
+// That is undefined behaviour, and UB is precisely the licence an optimiser
+// needs to generate something pathological -- which is not academic here,
+// because this same kernel miscompiles into a non-terminating GPU hang at
+// slangc -O1 and above (see the PT_SLANGC_OPT comment in cmake/Slang.cmake).
+// A latent OOB read is a live candidate for that, so it is fixed before any
+// of it is blamed on a driver.
+//
+// Checked against the real element count via GetDimensions rather than a new
+// push constant: the descriptor already carries the length, so this cannot
+// drift out of sync with whatever the host actually bound. A missing UV
+// buffer yields uv_n = 4 (16 bytes / 4), every index fails the test, and the
+// hit gets uv = 0 -- which is what the tile gate was going to do with it.
+float2 ptMeshUv(uint i0, uint i1, uint i2, float w0, float w1, float w2) {
+    uint uv_n = 0u, uv_stride = 0u;
+    mesh_uvs.GetDimensions(uv_n, uv_stride);
+    // Highest float index any of the three vertices will touch.
+    uint hi = max(max(i0, i1), i2) * 2u + 1u;
+    if (hi >= uv_n) return float2(0.0);
+    float2 uv0 = float2(mesh_uvs[i0 * 2u + 0u], mesh_uvs[i0 * 2u + 1u]);
+    float2 uv1 = float2(mesh_uvs[i1 * 2u + 0u], mesh_uvs[i1 * 2u + 1u]);
+    float2 uv2 = float2(mesh_uvs[i2 * 2u + 0u], mesh_uvs[i2 * 2u + 1u]);
+    return uv0 * w0 + uv1 * w1 + uv2 * w2;
+}
+
 HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
     float t_min = ptRayTMin(ro, cone);
     HitInfo h;
@@ -3747,10 +3788,8 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 // (b1, b2) for v1/v2; v0 weight = 1 - b1 - b2. When the
                 // mesh has no UV buffer the host forces the tile indices
                 // to kPbrNoTexTile so the sample is skipped (h.uv stays 0).
-                float2 uv0 = float2(mesh_uvs[i0 * 2 + 0], mesh_uvs[i0 * 2 + 1]);
-                float2 uv1 = float2(mesh_uvs[i1 * 2 + 0], mesh_uvs[i1 * 2 + 1]);
-                float2 uv2 = float2(mesh_uvs[i2 * 2 + 0], mesh_uvs[i2 * 2 + 1]);
-                h.uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+                h.uv = ptMeshUv(i0, i1, i2,
+                                1.0 - bary.x - bary.y, bary.x, bary.y);
 #if PT_PLANET_ENABLED
                 h.tex_tiles = idesc.tex_tiles;
 #else
@@ -3898,10 +3937,7 @@ HitInfo traceScene(float3 ro, float3 rd, float shutter_t01, PtRayCone cone) {
                 bw1 = (d11 * d20 - d01 * d21) / denom;   // weight of v1
                 bw2 = (d00 * d21 - d01 * d20) / denom;   // weight of v2
             }
-            float2 uv0 = float2(mesh_uvs[i0 * 2u + 0u], mesh_uvs[i0 * 2u + 1u]);
-            float2 uv1 = float2(mesh_uvs[i1 * 2u + 0u], mesh_uvs[i1 * 2u + 1u]);
-            float2 uv2 = float2(mesh_uvs[i2 * 2u + 0u], mesh_uvs[i2 * 2u + 1u]);
-            h.uv = uv0 * (1.0 - bw1 - bw2) + uv1 * bw1 + uv2 * bw2;
+            h.uv = ptMeshUv(i0, i1, i2, 1.0 - bw1 - bw2, bw1, bw2);
             h.tex_tiles = mesh_tex_indices;
         }
     }
