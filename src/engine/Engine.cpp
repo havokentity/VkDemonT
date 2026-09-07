@@ -6891,12 +6891,13 @@ void Engine::EnsurePipelineHandles() {
     // --- ReSTIR DI Phase A (issue #78) -------------------------------------
     // Three compute kernels chained behind PathTrace's WRS
     // candidate-generation pass: temporal reuse -> spatial reuse ->
-    // final shadow + Lambert composite. Metal-only at Phase A scope;
-    // Vulkan pipeline-build worker has no entry for these names so
-    // the resolve leaves the ids at 0 and the dispatch gates collapse
-    // cleanly to "no ReSTIR, legacy single-pick NEE in PathTrace."
-    // Vulkan plumbing is a follow-up alongside SigmaShadow /
-    // StarsComposite / AuroraComposite -- same shape.
+    // final shadow + Lambert composite. Registered on Vulkan since #23
+    // (the kernels are compiled to SPIR-V in src/rhi_vulkan/CMakeLists
+    // and built by VulkanDevice's pipeline worker). Software returns a
+    // non-zero id for any name but runs no compute, and the dispatch
+    // gate additionally requires a denoiser + the full G-buffer, so a
+    // backend that cannot host these still collapses cleanly to "no
+    // ReSTIR, legacy single-pick NEE in PathTrace."
     resolve(restir_temporal_pipeline_id_, "restir_temporal");
     resolve(restir_spatial_pipeline_id_,  "restir_spatial");
     resolve(restir_final_pipeline_id_,    "restir_final");
@@ -10936,20 +10937,49 @@ void Engine::RenderFrame() {
     push._pad_light_tail = 0u;
     // --- ReSTIR DI Phase A (issue #78) -------------------------------------
     // r_restir master toggle, gated additionally on:
-    //   - denoiser_active_       : Phase A composite writes into denoise_color
-    //   - restir_*_pipeline_id_  : Metal-only at MVP scope; Vulkan gate
-    //                              collapses to 0 cleanly
+    //   - denoiser_active_       : Phase A composite writes into
+    //                              denoise_color, which only the
+    //                              denoiser path allocates
+    //   - restir_*_pipeline_id_  : all three kernels registered. Before
+    //                              #23 these were structurally 0 on
+    //                              Vulkan -- the kernels were never
+    //                              compiled for SPIR-V -- which is what
+    //                              made `r_restir 1` a no-op.
+    //   - reservoir buffers      : all THREE, not just curr. The
+    //                              temporal pass binds prev and swap too
+    //                              (bindings 49 / 50), and a missing
+    //                              bind on a partially-bound descriptor
+    //                              set is an unbound-descriptor read,
+    //                              not a zero.
+    //   - the G-buffers          : depth / motion / normal / albedo /
+    //                              denoise_color. These are declared
+    //                              storage images with EXPLICIT formats;
+    //                              there is no safe placeholder, so the
+    //                              honest gate is "all present".
     //   - light_count > 0        : nothing to resample when the light
     //                              list is empty
     bool restir_user_on = false;
     if (auto* v = C.FindCVar("r_restir")) restir_user_on = (v->GetInt() != 0);
+    const bool restir_pipes_ok =
+        restir_temporal_pipeline_id_ != 0 &&
+        restir_spatial_pipeline_id_  != 0 &&
+        restir_final_pipeline_id_    != 0;
+    const bool restir_bufs_ok =
+        restir_reservoir_curr_buf_id_ != 0 &&
+        restir_reservoir_prev_buf_id_ != 0 &&
+        restir_reservoir_swap_buf_id_ != 0;
+    const bool restir_gbuf_ok =
+        depth_tex_id_         != 0 &&
+        motion_tex_id_        != 0 &&
+        normal_tex_id_        != 0 &&
+        albedo_tex_id_        != 0 &&
+        denoise_color_tex_id_ != 0;
     bool restir_dispatch_active =
         restir_user_on &&
         denoiser_active_ &&
-        restir_temporal_pipeline_id_ != 0 &&
-        restir_spatial_pipeline_id_  != 0 &&
-        restir_final_pipeline_id_    != 0 &&
-        restir_reservoir_curr_buf_id_ != 0 &&
+        restir_pipes_ok &&
+        restir_bufs_ok &&
+        restir_gbuf_ok &&
         light_count_uploaded_ > 0u;
     // Issue #164 -- ReSTIR + MetalFX integration. MTLFXTemporalDenoisedScaler
     // applies a TAA neighborhood color clamp that rejects bright per-pixel
@@ -10973,31 +11003,97 @@ void Engine::RenderFrame() {
     // pattern. Those kinds are gone with the macOS backend, so the override
     // is gone with them -- no live denoiser needs ReSTIR suppressed.
     push.restir_enabled = restir_dispatch_active ? 1u : 0u;
-    // One-shot gate diagnostics: ONLY when r_restir = 1 but the gate
-    // evaluates to 0 (so the user-visible "nothing happens" mismatch
-    // gets a diagnostic line per session). When ReSTIR engages
-    // successfully the "Phase A engaged" log inside the dispatch block
-    // below covers it; the silent-success path here avoids spamming
-    // the journal for the common case.
+    // Gate diagnostics: when r_restir = 1 but the gate evaluates to 0,
+    // say WHICH conditions failed, and say it again if the answer
+    // changes.
+    //
+    // This used to be a one-shot latch, which made it lie. Startup on
+    // Vulkan spends its first frames with no pipelines, no denoiser and
+    // no G-buffer -- an async pipeline build off a cold NVIDIA cache
+    // runs for MINUTES -- so a latch fires on frame 1, reports the
+    // transient startup state as if it were the verdict, and then never
+    // retracts when ReSTIR engages 5 minutes later. Logging on CHANGE
+    // instead reports the real sequence (first "still building", then
+    // the "Phase A engaged" line from the dispatch block below), and it
+    // still costs one line per distinct reason rather than one per
+    // frame. The cap stops a scene that flickers between two failing
+    // reasons from filling the journal.
     {
-        static bool s_restir_gate_failure_logged = false;
-        // Skip this generic gate-failure log when the MetalFX-family
-        // gate above already explained the disengagement (issue #164):
-        // (The MetalFX-family suppression this used to exclude is gone
-        // with those kinds; the generic message is now the only one.)
-        if (restir_user_on && !restir_dispatch_active &&
-            !s_restir_gate_failure_logged) {
-            LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching "
-                     "(denoiser_active={}, pipes_t/s/f={}{}{}, "
-                     "reservoir_buf={}, light_count={}). The dispatch "
-                     "engages when ALL of those are non-zero / true.",
-                     denoiser_active_,
-                     restir_temporal_pipeline_id_ != 0,
-                     restir_spatial_pipeline_id_  != 0,
-                     restir_final_pipeline_id_    != 0,
-                     restir_reservoir_curr_buf_id_ != 0,
-                     light_count_uploaded_);
-            s_restir_gate_failure_logged = true;
+        // The failing conditions as a bitmask, so the per-frame work on
+        // the common path is five branches and an integer compare -- the
+        // message itself is only built on the frames where the answer
+        // actually changed.
+        enum : std::uint32_t {
+            kRestirGateNoDenoiser = 1u << 0,
+            kRestirGateBuilding   = 1u << 1,
+            kRestirGateNoPipes    = 1u << 2,
+            kRestirGateNoBufs     = 1u << 3,
+            kRestirGateNoGbuf     = 1u << 4,
+            kRestirGateNoLights   = 1u << 5,
+        };
+        static std::uint32_t s_restir_gate_mask = 0u;
+        static int s_restir_gate_logs = 0;
+        constexpr int kMaxRestirGateLogs = 6;
+        std::uint32_t mask = 0u;
+        if (restir_user_on && !restir_dispatch_active) {
+            if (!denoiser_active_)          mask |= kRestirGateNoDenoiser;
+            if (!restir_pipes_ok) {
+                // pathtrace_pipeline_id_ == 0 means the async pipeline
+                // worker simply hasn't got here yet; that is a wait, not
+                // a fault, and the two deserve different words.
+                mask |= (pathtrace_pipeline_id_ == 0) ? kRestirGateBuilding
+                                                      : kRestirGateNoPipes;
+            }
+            if (!restir_bufs_ok)            mask |= kRestirGateNoBufs;
+            if (!restir_gbuf_ok)            mask |= kRestirGateNoGbuf;
+            if (light_count_uploaded_ == 0u) mask |= kRestirGateNoLights;
+        }
+        // mask == 0 means engaged, or the user turned r_restir off.
+        // Recording that resets the change detector, so a LATER
+        // regression -- a resize that drops the G-buffer, a denoiser
+        // switch -- logs again instead of being swallowed as "same as
+        // last time".
+        if (mask != s_restir_gate_mask) {
+            if (mask != 0u && s_restir_gate_logs < kMaxRestirGateLogs) {
+                // Name the conditions that ACTUALLY failed rather than
+                // dumping every input and leaving the reader to diff
+                // them. The pre-#23 form printed five booleans, three of
+                // which were structurally false on every Vulkan build
+                // for a reason the message never gave -- "pipes_t/s/f=
+                // 000" is a symptom; "the kernels were never compiled
+                // for this backend" was the cause.
+                std::string why;
+                auto add = [&why](const char* s) {
+                    if (!why.empty()) why += "; ";
+                    why += s;
+                };
+                if (mask & kRestirGateNoDenoiser) {
+                    add("no denoiser active (ReSTIR composites into "
+                        "denoise_color, which only the denoiser path "
+                        "allocates -- set r_denoiser svgf_atrous)");
+                }
+                if (mask & kRestirGateBuilding) {
+                    add("compute pipelines still building");
+                }
+                if (mask & kRestirGateNoPipes) {
+                    add("restir_temporal/spatial/final pipelines failed "
+                        "to build on this backend");
+                }
+                if (mask & kRestirGateNoBufs) {
+                    add("reservoir SSBOs not allocated");
+                }
+                if (mask & kRestirGateNoGbuf) {
+                    add("G-buffer incomplete (needs depth + motion + "
+                        "normal + albedo + denoise_color)");
+                }
+                if (mask & kRestirGateNoLights) {
+                    add("scene has no analytic lights to resample");
+                }
+                LOG_INFO("engine: r_restir=1 but ReSTIR NOT dispatching -- {}.",
+                         why);
+                ++s_restir_gate_logs;
+            }
+            s_restir_gate_mask = mask;
         }
     }
     std::uint32_t restir_k = 8u;
@@ -13515,38 +13611,47 @@ void Engine::RenderFrame() {
             GpuPassMark(cb, "RestirTemporal");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_temporal_pipeline_id_});
-            // Texture slot 0: depth_tex (camera-space Z).
-            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
-            // Texture slot 1: motion_tex (reprojection delta).
-            cb->BindStorageTexture(1, pt::rhi::TextureHandle{motion_tex_id_});
-            // Texture slot 2: normal_tex (disocclusion gate). When the
-            // active denoiser doesn't allocate normals (rare; the
-            // engine forces it on for MetalFX so the bind always has
-            // a non-zero id under the dispatch gate above), bind the
-            // 1x1 bloom_dummy as a placeholder to satisfy Metal's
-            // pipeline validation. The shader's disocclusion code
-            // tolerates a black normal -- it just falls back to "no
-            // temporal reuse" for that pixel.
-            const std::uint64_t restir_normal_id =
-                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
-            cb->BindStorageTexture(2, pt::rhi::TextureHandle{restir_normal_id});
-            // Buffer slot 0: reservoir_curr_in (PathTrace output).
-            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
-            // Buffer slot 1: reservoir_prev_in.
-            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_}, 0);
-            // Buffer slot 2: reservoir_curr_out (we ping-pong back into
-            // the curr buffer via the spatial pass; the temporal pass
-            // writes a TRANSIENT result that the spatial pass reads).
-            // Use restir_reservoir_swap_buf_id_ here so the temporal
-            // output sits in a different buffer than its inputs --
-            // necessary to avoid the WAR hazard if the spatial pass
-            // reads neighbour pixels at slightly different positions.
-            cb->BindBuffer(2, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
-            // Buffer slot 3: light_prims (re-evaluate prev survivor's pdf).
+            // ENGINE SLOTS, NOT DECLARATION ORDER (#23). These were a
+            // dense 0,1,2 / 0,1,2,3 run when the kernels only ever ran on
+            // Slang's Metal backend, which assigns slots by declaration
+            // order. Vulkan routes each slot through
+            // kSlotToTexBinding[] / kSlotToBufBinding[] into ONE shared
+            // descriptor-set layout, where the dense run landed on the
+            // scene TLAS and the mesh buffers -- and buffer slot 0 is
+            // skipped by the descriptor-write loop entirely, so
+            // reservoir_curr_in reached the GPU as nothing at all.
+            // Every resource below now uses the SAME engine slot
+            // PathTrace uses for it, so the slot -> binding translation
+            // matches the kernel's vk::binding declarations.
+            //
+            //   tex 3  -> binding 7   depth_tex (camera-space Z)
+            //   tex 4  -> binding 8   motion_tex (reprojection delta)
+            //   tex 8  -> binding 16  normal_tex (disocclusion gate)
+            //   buf 14 -> binding 29  reservoir A: PathTrace's WRS output
+            //   buf 13 -> binding 28  reservoir B: last frame's final
+            //   buf 15 -> binding 30  reservoir C: this pass's output
+            //   buf 12 -> binding 27  light_prims
+            //
+            // Slots 13 and 15 belong to the light tree and the smoke
+            // emitters. ReSTIR BORROWS them: no ReSTIR kernel reads
+            // either, PathTrace rebinds both every frame before the
+            // dispatch that does, and nothing between here and that
+            // rebind touches bindings 28 or 30. Opening two new bindings
+            // instead was measured at 16 s of vkDestroyDevice per
+            // process -- see the ceiling note in VulkanDevice.cpp.
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
+            cb->BindStorageTexture(4, pt::rhi::TextureHandle{motion_tex_id_});
+            cb->BindStorageTexture(8, pt::rhi::TextureHandle{normal_tex_id_});
+            cb->BindBuffer(14, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            cb->BindBuffer(13, pt::rhi::BufferHandle{restir_reservoir_prev_buf_id_}, 0);
+            // C is a THIRD buffer, not curr rewritten in place: the
+            // spatial pass that consumes it reads neighbour pixels, so
+            // it cannot share a buffer with its own output either.
+            cb->BindBuffer(15, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
             pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
                 ? pt::rhi::BufferHandle{light_buffer_id_}
                 : pt::rhi::BufferHandle{placeholder_storage_id_};
-            cb->BindBuffer(3, restir_lights, 0);
+            cb->BindBuffer(12, restir_lights, 0);
 
             struct RestirTemporalPush {
                 std::uint32_t width;
@@ -13634,20 +13739,23 @@ void Engine::RenderFrame() {
             GpuPassMark(cb, "RestirSpatial");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_spatial_pipeline_id_});
-            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
-            const std::uint64_t restir_normal_id =
-                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
-            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
-            // Input: post-temporal reservoir (swap buffer).
-            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
-            // Output: final reservoir for this frame, lands in curr
-            // (the spatial pass writes the FINAL survivor that
-            // RestirFinal reads and that becomes next frame's prev).
-            cb->BindBuffer(1, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            // Engine slots, not declaration order -- see the temporal
+            // pass above.
+            //   tex 3  -> binding 7   depth_tex
+            //   tex 8  -> binding 16  normal_tex
+            //   buf 15 -> binding 30  reservoir C: post-temporal input
+            //   buf 14 -> binding 29  reservoir A: this frame's FINAL
+            //                         survivor -- what RestirFinal reads
+            //                         and what becomes next frame's prev
+            //   buf 12 -> binding 27  light_prims
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
+            cb->BindStorageTexture(8, pt::rhi::TextureHandle{normal_tex_id_});
+            cb->BindBuffer(15, pt::rhi::BufferHandle{restir_reservoir_swap_buf_id_}, 0);
+            cb->BindBuffer(14, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
             pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
                 ? pt::rhi::BufferHandle{light_buffer_id_}
                 : pt::rhi::BufferHandle{placeholder_storage_id_};
-            cb->BindBuffer(2, restir_lights, 0);
+            cb->BindBuffer(12, restir_lights, 0);
 
             struct RestirSpatialPush {
                 std::uint32_t width;
@@ -13689,27 +13797,37 @@ void Engine::RenderFrame() {
             GpuPassMark(cb, "RestirFinal");
             cb->BindComputePipeline(
                 pt::rhi::PipelineHandle{restir_final_pipeline_id_});
-            cb->BindStorageTexture(0, pt::rhi::TextureHandle{depth_tex_id_});
-            const std::uint64_t restir_normal_id =
-                (normal_tex_id_ != 0) ? normal_tex_id_ : bloom_dummy_tex_id_;
-            cb->BindStorageTexture(1, pt::rhi::TextureHandle{restir_normal_id});
-            cb->BindStorageTexture(2, pt::rhi::TextureHandle{albedo_tex_id_});
-            cb->BindStorageTexture(3, pt::rhi::TextureHandle{denoise_color_tex_id_});
-            // Input reservoir (post-spatial; lives in curr buf).
-            cb->BindBuffer(0, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
+            // Engine slots, not declaration order -- see the temporal
+            // pass above.
+            //   tex 2   -> binding 6   denoise_color (read + ADD)
+            //   tex 3   -> binding 7   depth_tex
+            //   tex 8   -> binding 16  normal_tex
+            //   tex 9   -> binding 17  albedo_tex
+            //   buf 14  -> binding 29  reservoir A: post-spatial survivor
+            //   buf 12  -> binding 27  light_prims
+            //   buf 3   -> binding 5   primitives (shadow-ray scan)
+            //   accel 2 -> binding 2   scene_tlas
+            cb->BindStorageTexture(2, pt::rhi::TextureHandle{denoise_color_tex_id_});
+            cb->BindStorageTexture(3, pt::rhi::TextureHandle{depth_tex_id_});
+            cb->BindStorageTexture(8, pt::rhi::TextureHandle{normal_tex_id_});
+            cb->BindStorageTexture(9, pt::rhi::TextureHandle{albedo_tex_id_});
+            cb->BindBuffer(14, pt::rhi::BufferHandle{restir_reservoir_curr_buf_id_}, 0);
             pt::rhi::BufferHandle restir_lights = (light_buffer_id_ != 0)
                 ? pt::rhi::BufferHandle{light_buffer_id_}
                 : pt::rhi::BufferHandle{placeholder_storage_id_};
-            cb->BindBuffer(1, restir_lights, 0);
+            cb->BindBuffer(12, restir_lights, 0);
             pt::rhi::BufferHandle restir_prims = (prim_buffer_id_ != 0)
                 ? pt::rhi::BufferHandle{prim_buffer_id_}
                 : pt::rhi::BufferHandle{placeholder_storage_id_};
-            cb->BindBuffer(2, restir_prims, 0);
-            // TLAS bind for the shadow trace. Only present on backends
-            // that support RT (Metal always; native Vulkan when
-            // VK_KHR_ray_query is available).
+            cb->BindBuffer(3, restir_prims, 0);
+            // TLAS bind for the shadow trace. Accel slot 2 is the ONLY
+            // acceleration-structure slot the Vulkan descriptor-write
+            // path reads (it writes bound_accel_[2] to binding 2 and
+            // ignores the rest), which is why the old slot-3 bind
+            // silently dropped the TLAS. rf.tlas_present below gates the
+            // shader's RayQuery, so a build without RT never reads it.
             if (tlas_present) {
-                cb->BindAccelStruct(3, pt::rhi::AccelStructHandle{scene_tlas_id_});
+                cb->BindAccelStruct(2, pt::rhi::AccelStructHandle{scene_tlas_id_});
             }
 
             struct RestirFinalPush {

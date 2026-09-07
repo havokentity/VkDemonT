@@ -42,30 +42,61 @@
 // boundary between ReSTIR-reused and ReSTIR-fresh aligns with
 // denoiser temporal boundaries.
 //
-// Bindings (Slang's MSL backend allocates buffer/texture slots in
-// declaration order; the engine's BindStorageTexture / BindBuffer
-// match these positions):
-//   texture(0)  depth_tex
-//   texture(1)  motion_tex
-//   texture(2)  normal_tex
-//   buffer (0)  reservoir_curr_in   (already written by PathTrace)
-//   buffer (1)  reservoir_prev_in
-//   buffer (2)  reservoir_curr_out
-//   buffer (3)  light_prims         (re-evaluate prev survivor's p_hat)
+// VULKAN BINDING NOTICE (issue #23)
+// =================================
+// These numbers are NOT declaration-order slots. They are positions in
+// VulkanDevice.cpp's ONE shared descriptor-set layout, which every
+// compute kernel in this engine rides -- a kernel that declares a
+// binding the shared layout does not have (or declares the wrong TYPE
+// at a number the layout already owns) is a hard
+// vkCreateComputePipelines failure, not a silently wrong read.
+//
+// The kernel was originally authored against Slang's Metal backend,
+// which assigns Metal slots in DECLARATION order and ignores
+// vk::binding entirely, so the old 0..6 run was correct there and
+// meaningless here: binding 2 in the shared layout is the scene TLAS
+// and bindings 3/4/5 are mesh_positions / mesh_indices / primitives.
+// Each declaration below now names the SAME binding PathTrace.slang
+// uses for that resource, and the engine binds it through the SAME
+// engine slot PathTrace does (Engine.cpp -> kSlotToTexBinding[] /
+// kSlotToBufBinding[] in VulkanDevice.cpp):
+//
+//   binding 7  <- engine tex slot 3   depth_tex
+//   binding 8  <- engine tex slot 4   motion_tex
+//   binding 16 <- engine tex slot 8   normal_tex
+//   binding 27 <- engine buf slot 12  light_prims
+//   binding 29 <- engine buf slot 14  reservoir A (PathTrace's WRS output)
+//   binding 28 <- engine buf slot 13  reservoir B (last frame's final)
+//   binding 30 <- engine buf slot 15  reservoir C (this pass's output)
+//
+// The port added NO new bindings. Reservoir A had one already; B and C
+// BORROW the light-tree (28) and smoke-emitter (30) bindings, which no
+// ReSTIR kernel reads and which the engine rebinds every frame before
+// the PathTrace dispatch that does. That is not tidiness: the shared
+// layout's binding numbers stop at 48, and declaring two more at 49/50
+// made vkDestroyDevice take SIXTEEN SECONDS on this driver, measured.
+// The ceiling note above kSlotToBufBinding[] in VulkanDevice.cpp has
+// the numbers.
+//
+// A reservoir buffer keeps ONE binding for its whole life rather than
+// one per role: A is always 29, B always 28, C always 30, and the
+// engine's end-of-frame A/B swap moves handles, not bindings.
 //
 // Push: width/height + camera basis (to reconstruct hit_world from
 // depth + thread id) + light_count.
 
-// vk::image_format: depth_tex R32F, motion_tex RG16F, normal_tex
-// RGBA16F. See PathTrace.slang for the NVIDIA Format=Unknown
-// rationale.
-[[vk::binding(0, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
-[[vk::binding(1, 0), vk::image_format("rg16f")]]   RWTexture2D<float2> motion_tex;
-[[vk::binding(2, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
-[[vk::binding(3, 0)]]   StructuredBuffer<float4>  reservoir_curr_in;
-[[vk::binding(4, 0)]]   StructuredBuffer<float4>  reservoir_prev_in;
-[[vk::binding(5, 0)]] RWStructuredBuffer<float4>  reservoir_curr_out;
-[[vk::binding(6, 0)]]   StructuredBuffer<float4>  light_prims;
+// vk::image_format is MANDATORY on every storage image here, not
+// decoration: a storage image left at Format=Unknown silently no-ops
+// its OpImageWrite on this NVIDIA driver. Formats match the engine's
+// actual image views and PathTrace.slang's declarations at the same
+// bindings -- depth_tex R32F, motion_tex RG16F, normal_tex RGBA16F.
+[[vk::binding(7, 0),  vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(8, 0),  vk::image_format("rg16f")]]   RWTexture2D<float2> motion_tex;
+[[vk::binding(16, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
+[[vk::binding(29, 0)]]   StructuredBuffer<float4>  reservoir_curr_in;
+[[vk::binding(28, 0)]]   StructuredBuffer<float4>  reservoir_prev_in;
+[[vk::binding(30, 0)]] RWStructuredBuffer<float4>  reservoir_curr_out;
+[[vk::binding(27, 0)]]   StructuredBuffer<float4>  light_prims;
 
 import RestirReservoir;
 

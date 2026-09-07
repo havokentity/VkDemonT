@@ -123,10 +123,8 @@ pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/SdfFractals.slang)
 # --- end SDF Phase 3 -------------------------------------------------------
 # --- ReSTIR DI Phase A (issue #78) ----------------------------------------
 # Shared Reservoir struct + WRS streaming primitives imported by
-# PathTrace.slang. The Restir compute kernels themselves are Metal-only
-# at MVP scope (Vulkan dispatch follow-up); we still need the module
-# for the SPIR-V PathTrace build because the candidate-generation
-# block imports it.
+# PathTrace.slang's candidate-generation block AND by all three Restir
+# compute kernels below.
 pt_compile_slang_module(SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirReservoir.slang)
 # --- end ReSTIR DI Phase A ------------------------------------------------
 
@@ -265,6 +263,47 @@ if(PT_NRD_ACTIVE)
         TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/NrdUnpack.slang
         STAGE compute ENTRY main TARGETS spirv)
 endif()
+# --- ReSTIR DI, Vulkan dispatch (issue #23) --------------------------------
+# The three resampling kernels behind PathTrace's WRS candidate
+# generation: temporal reuse -> spatial reuse -> shadow test + Lambert
+# composite. These were authored for Slang's Metal backend and never
+# built for SPIR-V, which is the whole reason `r_restir 1` logged
+# "ReSTIR NOT dispatching" -- VulkanDevice had no pipeline to resolve.
+#
+# All three ride the shared descriptor-set layout; their vk::binding
+# numbers were rewritten from Metal declaration-order slots to real
+# shared-layout positions (see the VULKAN BINDING NOTICE at the top of
+# RestirTemporal.slang). The port also added storage-buffer bindings 49
+# and 50 to that layout for the reservoir ping-pong, with the matching
+# descriptor-pool bump in VulkanDevice.cpp.
+#
+# Every push block is <= 112 B (VulkanDevice::kPushSplitOffset), so none
+# of them spills into the Frame UBO and none needs a `cbuffer Frame`.
+# Engine.cpp static_asserts that for RestirTemporalPush, which sits at
+# exactly 112.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirTemporal.slang
+    STAGE compute ENTRY main TARGETS spirv
+    MODULE_DEPS RestirReservoir)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirSpatial.slang
+    STAGE compute ENTRY main TARGETS spirv
+    MODULE_DEPS RestirReservoir)
+# RestirFinal traces the survivor's shadow ray, so it gets the same
+# rq / norq pair PathTrace does: the default blob declares RayQueryKHR
+# + scene_tlas at binding 2, the norq blob declares neither and loads on
+# drivers without VK_KHR_ray_query. VulkanDevice picks one at pipeline
+# build time off rt_supported_, exactly as it does for pathtrace.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang
+    STAGE compute ENTRY main TARGETS spirv
+    MODULE_DEPS RestirReservoir PathTraceMath)
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/RestirFinal.slang
+    STAGE compute ENTRY main TARGETS spirv
+    VARIANT norq EXTRA_DEFINES -DPT_SPIRV_NO_RAYQUERY
+    MODULE_DEPS RestirReservoir PathTraceMath)
+# --- end ReSTIR DI, Vulkan dispatch ----------------------------------------
 # --- Acceleration-structure probe (issue #254 P0 / issue #251) -------------
 # Test-only ray-query kernel used by tests/rhi_accel_update_test.cpp to
 # read CommittedInstanceID() back out of a multi-instance TLAS. Declares

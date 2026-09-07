@@ -126,6 +126,11 @@ private:
     //          injection SSBO at vk::binding 30.
     //   16     SPH particles (#22, Fluid Phase 3), the splat list
     //          SSBO at vk::binding 31.
+    // ReSTIR DI's Vulkan dispatch (#23) needs THREE reservoir SSBOs
+    // bound at once -- RestirTemporal reads A and B while writing C --
+    // but adds no slot: it borrows slots 13 and 15 for B and C on its
+    // own dispatches. See the note above kSlotToBufBinding[] in
+    // VulkanDevice.cpp for why it borrows rather than grows.
     // Pre-#136 the array was [12] which silently dropped any
     // BindBuffer(>= 12, ...) at the bounds-check in BindBuffer().
     // Now [24]. Keep this in sync with kSlotToBufBinding[] in

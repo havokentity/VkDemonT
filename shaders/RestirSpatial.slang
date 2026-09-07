@@ -37,13 +37,29 @@
 // A second spatial pass is a trivial follow-up: dispatch this same
 // kernel back-to-back with the in/out buffers swapped.
 
-// vk::image_format: depth_tex R32F, normal_tex RGBA16F. See
-// PathTrace.slang for the NVIDIA Format=Unknown rationale.
-[[vk::binding(0, 0), vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
-[[vk::binding(1, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
-[[vk::binding(2, 0)]]   StructuredBuffer<float4>  reservoir_in;
-[[vk::binding(3, 0)]] RWStructuredBuffer<float4>  reservoir_out;
-[[vk::binding(4, 0)]]   StructuredBuffer<float4>  light_prims;
+// VULKAN BINDING NOTICE (issue #23) -- see RestirTemporal.slang's copy
+// for the full rationale. Short version: these are positions in
+// VulkanDevice.cpp's ONE shared descriptor-set layout, not the
+// declaration-order slots Slang's (now-removed) Metal backend used.
+//
+//   binding 7  <- engine tex slot 3   depth_tex
+//   binding 16 <- engine tex slot 8   normal_tex
+//   binding 27 <- engine buf slot 12  light_prims
+//   binding 30 <- engine buf slot 15  reservoir C  (temporal's output)
+//   binding 29 <- engine buf slot 14  reservoir A  (this pass's output,
+//                                     and what RestirFinal reads)
+//
+// The in/out pair MUST be two different buffers: this pass reads
+// NEIGHBOUR pixels, so writing in place would race.
+//
+// vk::image_format is MANDATORY on every storage image -- Format=Unknown
+// silently no-ops OpImageWrite on this NVIDIA driver. depth_tex R32F,
+// normal_tex RGBA16F, matching the engine's views and PathTrace.slang.
+[[vk::binding(7, 0),  vk::image_format("r32f")]]    RWTexture2D<float>  depth_tex;
+[[vk::binding(16, 0), vk::image_format("rgba16f")]] RWTexture2D<float4> normal_tex;
+[[vk::binding(30, 0)]]   StructuredBuffer<float4>  reservoir_in;
+[[vk::binding(29, 0)]] RWStructuredBuffer<float4>  reservoir_out;
+[[vk::binding(27, 0)]]   StructuredBuffer<float4>  light_prims;
 
 import RestirReservoir;
 
