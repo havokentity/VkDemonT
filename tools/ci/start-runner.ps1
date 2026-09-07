@@ -20,6 +20,14 @@
 #   pwsh tools/ci/start-runner.ps1            # start it, Ctrl+C to stop
 #   pwsh tools/ci/start-runner.ps1 -Status    # is it registered? online?
 #   pwsh tools/ci/start-runner.ps1 -Reconfigure
+#   pwsh tools/ci/start-runner.ps1 -Time 2026-09-07T12:46:43Z   # -> local
+#   pwsh tools/ci/start-runner.ps1 -Time 12:46                  # -> local
+#   pwsh tools/ci/start-runner.ps1 -Time 18:16 -FromLocal       # -> UTC
+#
+# The -Time converter exists because GitHub Actions stamps every log line in
+# UTC (the trailing Z) in both the web UI and this runner's console, and there
+# is no runner or workflow setting that localises it. Converting in your head
+# while reading a failing job is exactly when you get it wrong.
 #
 # -Reconfigure re-registers the runner against the repo. Needed if the runner
 # was removed on the GitHub side, if labels change, or after restoring this
@@ -31,6 +39,12 @@
 param(
     [switch]$Status,
     [switch]$Reconfigure,
+    # Convert a timestamp between GitHub's UTC and local time. Accepts what you
+    # can actually paste out of a job log without editing it -- a full ISO
+    # stamp with the Z, or a bare HH:mm / HH:mm:ss.
+    [string]$Time,
+    # Treat -Time as LOCAL and report UTC, rather than the default direction.
+    [switch]$FromLocal,
     [string]$RunnerDir = "$env:USERPROFILE\actions-runner",
     [string]$Repo      = "havokentity/VkDemonT",
     # Must match what the workflow's `runs-on` asks for. The GPU golden matrix
@@ -66,6 +80,61 @@ if (-not (Test-Path $RunnerDir)) {
     Write-Host "Download it from https://github.com/actions/runner/releases (win-x64)," -ForegroundColor Yellow
     Write-Host "extract to that path, then re-run this script with -Reconfigure." -ForegroundColor Yellow
     exit 1
+}
+
+# ---- timestamp conversion ---------------------------------------------------
+# Runs before the runner-directory check on purpose: converting a timestamp is
+# useful on any machine, including one where the runner is not installed.
+if ($Time) {
+    $parsed = $null
+    $styles = [System.Globalization.DateTimeStyles]::None
+    $inv    = [System.Globalization.CultureInfo]::InvariantCulture
+
+    # 1. A full stamp that CARRIES ITS OWN OFFSET (trailing Z, or +HH:MM).
+    #
+    #    The offset test is deliberate rather than just trying TryParse first:
+    #    TryParse happily accepts a bare "12:46" and silently assumes LOCAL,
+    #    so the greedy version converted a UTC log time as though it were
+    #    already local and reported it unchanged. Only strings that actually
+    #    carry a zone go down this path.
+    $hasOffset = ($Time -match 'Z$') -or ($Time -match '[+-][0-9]{2}:?[0-9]{2}$')
+    $dto = [DateTimeOffset]::MinValue
+    if ($hasOffset -and [DateTimeOffset]::TryParse($Time, $inv,
+            [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$dto)) {
+        $parsed = $dto
+    } else {
+        # 2. A bare time. Assume today, in whichever zone -FromLocal selects.
+        $t = [DateTime]::MinValue
+        foreach ($fmt in @('HH:mm:ss', 'HH:mm', 'H:mm:ss', 'H:mm')) {
+            if ([DateTime]::TryParseExact($Time, $fmt, $inv, $styles, [ref]$t)) { break }
+        }
+        if ($t -eq [DateTime]::MinValue) {
+            Write-Host "Could not parse '$Time'." -ForegroundColor Red
+            Write-Host "Try an ISO stamp (2026-09-07T12:46:43Z) or a bare HH:mm." -ForegroundColor Yellow
+            exit 2
+        }
+        $today = (Get-Date).Date
+        $stamp = $today.AddHours($t.Hour).AddMinutes($t.Minute).AddSeconds($t.Second)
+        # Unspecified kind is required: (Get-Date).Date returns a LOCAL-kind
+        # DateTime, and DateTimeOffset's constructor rejects an explicit offset
+        # that disagrees with the kind it was handed. Marking it Unspecified is
+        # what lets the same value be stamped UTC or local on request.
+        $stamp = [DateTime]::SpecifyKind($stamp, [DateTimeKind]::Unspecified)
+        if ($FromLocal) {
+            $parsed = [DateTimeOffset]::new($stamp, [System.TimeZoneInfo]::Local.GetUtcOffset($stamp))
+        } else {
+            $parsed = [DateTimeOffset]::new($stamp, [TimeSpan]::Zero)   # bare == UTC
+        }
+    }
+
+    $utc   = $parsed.ToUniversalTime()
+    $local = $parsed.ToLocalTime()
+    Write-Host ""
+    Write-Host ("  UTC   (GitHub) : {0}" -f $utc.ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Cyan
+    Write-Host ("  Local ({0}) : {1}" -f [System.TimeZoneInfo]::Local.StandardName,
+                $local.ToString('yyyy-MM-dd HH:mm:ss')) -ForegroundColor Green
+    Write-Host ""
+    exit 0
 }
 
 # ---- status -----------------------------------------------------------------
