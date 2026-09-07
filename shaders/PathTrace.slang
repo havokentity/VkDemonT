@@ -1452,7 +1452,20 @@ cbuffer Push {
     uint write_specular_albedo_gbuffer;
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
-    uint _pad_specular_gbuffers0;
+    // NRD first-bounce hit distance (issue #50). 1 -> stash the distance
+    // from the primary hit to the FIRST INDIRECT hit in denoise_color.a
+    // instead of the constant 1.0 that site otherwise writes.
+    // NVIDIA's RayTracingDenoiser packs its noisy diffuse input as
+    // float4(radiance, hitDist) (RELAX_FrontEnd_PackRadianceAndHitDist),
+    // and RELAX sizes its pre-pass blur radius from that distance. The
+    // engine has no spare G-buffer slot for it -- denoise_color.a is
+    // read by nothing downstream (DenoiseTemporal / DenoiseAtrous /
+    // DenoiseFinalize all take .rgb), so it carries the channel.
+    // Set ONLY by DenoiserKind::Nrd with a working NRD library; every
+    // other path keeps the historical 1.0 and is bit-identical.
+    // Occupies what used to be `_pad_specular_gbuffers0` -- same wire
+    // offset, no push-constant growth.
+    uint write_nrd_hitdist;
     // --- Water Phase 1 (#134) -------------------------------------------------
     // See Engine.cpp's PtPush::water_params0 / water_params1 for full docs.
     //   water_params0.xyz = Beer's-law absorption per channel (1/m).
@@ -1945,7 +1958,9 @@ cbuffer Frame {
     uint write_specular_albedo_gbuffer;
     uint write_roughness_gbuffer;
     uint write_specular_hit_distance_gbuffer;
-    uint _pad_specular_gbuffers0;
+    // See `write_nrd_hitdist` in the Metal Push cbuffer above (issue #50).
+    // Layout-equivalent; occupies the former `_pad_specular_gbuffers0`.
+    uint write_nrd_hitdist;
     // --- Water Phase 1 (#134) -------------------------------------------------
     // See `water_params0` / `water_params1` in the Metal Push cbuffer above.
     float4 water_params0;
@@ -8250,6 +8265,29 @@ void main(uint2 tid : SV_DispatchThreadID) {
     // between samples is well below cloud feature size, so any single
     // sample is a faithful proxy for the unjittered camera ray.
     float frame_cloud_trans = 1.0;
+    // NRD first-bounce hit distance (issue #50). NVIDIA's RELAX packs
+    // its noisy diffuse input as float4(radiance, hitDist) and sizes
+    // the pre-pass blur radius from that distance, so it wants the
+    // length of the segment that CARRIED the incoming light -- the
+    // primary hit to the first indirect hit -- not the camera segment
+    // (that is IN_VIEWZ, which the engine already writes to depth_tex).
+    // Captured from sample 0 / bounce 1 only, in the same spirit as
+    // frame_cloud_trans above: NRD consumes it as a filter-radius
+    // scale, not a radiometric quantity, so one sample is a faithful
+    // proxy and averaging over spp would just cost registers.
+    // Sentinel 0 means "unknown" -- NRD documents that value and RELAX
+    // has a fallback for it (a path with r_max_bounces = 1 never
+    // reaches b == 1 and so reports 0 for every pixel).
+    //
+    // HONESTY NOTE: the passes VulkanNrdLibDenoiser currently enables
+    // (RELAX_DIFFUSE with diffusePrepassBlurRadius = 0 -- see the long
+    // comment at that assignment for why) do not read this channel.
+    // It is written anyway because it is what NRD's own front-end pack
+    // function is defined to carry, and because the alternative (a
+    // constant 0) silently becomes wrong the moment the pre-pass is
+    // re-enabled or a specular signal is added. Cost when unused is a
+    // single register and one predicated store.
+    float frame_nrd_hitdist = 0.0;
     // Sun-NEE shadow-ray visibility accumulator (issue #115). Sums the
     // primary-hit shadow-ray transmittance toward the sun across all
     // spp samples; divided by sample_count at the end of main() to give
@@ -8627,6 +8665,17 @@ void main(uint2 tid : SV_DispatchThreadID) {
         }
 #endif
         // --- end Wave 8 ocean -----------------------------------------------
+        // NRD first-bounce hit distance (issue #50). b == 1 is the first
+        // INDIRECT segment: its origin is the primary hit and h.t is the
+        // distance to whatever produced the bounce radiance. An escaping
+        // ray (nothing occluding, lit by the sky) reports NRD's fp16
+        // ceiling -- the value RELAX_FrontEnd_PackRadianceAndHitDist
+        // itself saturates at, so it is the library's own "as far as
+        // this channel can say". Runtime-gated so every non-NRD dispatch
+        // is untouched.
+        if (write_nrd_hitdist != 0u && b == 1u && s == 0u) {
+            frame_nrd_hitdist = h.hit ? h.t : 65504.0;
+        }
         if (b == 0u) {
             // Sky pixels (no hit) keep the 50km default so cloud
             // marches reach the layer; object hits override.
@@ -11369,13 +11418,21 @@ void main(uint2 tid : SV_DispatchThreadID) {
             w2j_row0.w > 0.5) {
             hdr_src = max(hdr_src - frame_sun_shadowed, float3(0.0));
         }
+        // denoise_color.a: 1.0 historically (nothing downstream reads
+        // it -- DenoiseTemporal / DenoiseAtrous / DenoiseFinalize all
+        // take .rgb). Issue #50 borrows the channel to carry the NRD
+        // first-bounce hit distance to NrdPack.slang, which packs it
+        // into IN_DIFF_RADIANCE_HITDIST.w. Gated so every other path
+        // writes the historical 1.0 bit-for-bit.
+        const float hdr_aux_alpha =
+            (write_nrd_hitdist != 0u) ? frame_nrd_hitdist : 1.0;
         if (w2j_row0.w > 0.5) {
-            denoise_color[tid] = float4(hdr_src, 1.0);
+            denoise_color[tid] = float4(hdr_src, hdr_aux_alpha);
         } else {
             // --- Wave 9 tonemap --- operator from tonemap_params.x (op 0
             // == acesTonemap, byte-identical to the previous default).
             float3 mapped = tonemapDispatch(hdr_src * exposure, tonemap_params.x);
-            denoise_color[tid] = float4(mapped, 1.0);
+            denoise_color[tid] = float4(mapped, hdr_aux_alpha);
         }
     }
     // Cloud-transmittance G-buffer (issue #46 follow-up). DIFFERENT

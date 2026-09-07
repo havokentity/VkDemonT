@@ -2263,6 +2263,13 @@ private:
         OptixTemporalHdr, OptixTemporalHdrAov,
     };
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
+    // Issue #50 -- does the active backend have a working NVIDIA
+    // RayTracingDenoiser? Refreshed from Device::SupportsNrdLibrary()
+    // once per frame, because the runtime half of that answer can flip
+    // (once, downward) after NRD's first init attempt. Drives three
+    // things: which DenoiseDesc::Kind `r_denoiser nrd` maps to, the
+    // one-shot transition log, and PathTrace's write_nrd_hitdist gate.
+    bool                                        nrd_lib_active_        = false;
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
 

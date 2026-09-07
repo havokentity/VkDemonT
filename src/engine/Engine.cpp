@@ -713,9 +713,23 @@ namespace cvar {
             "motion, slightly noisier on disocclusions). svgf_atrous = "
             "svgf_basic + 3-pass a-trous edge-aware spatial filter (~5 ms; "
             "cleaner on disocclusions, mild softening of micro detail). "
-            "nrd = same dispatch chain as svgf_atrous today; reserved for "
-            "the proper NVIDIA RayTracingDenoiser library integration once "
-            "that's wired up on Vulkan (see Raytracer Plan/FOLLOW_UPS.md). "
+            "nrd = NVIDIA RayTracingDenoiser library, RELAX_DIFFUSE "
+            "(temporal accumulation + history fix/clamp + anti-firefly + "
+            "5-pass a-trous, all inside NRD). RELAX rather than REBLUR "
+            "because REBLUR's filter is driven by a NORMALISED hit "
+            "distance whose (A, B, C) curve has to be tuned per scene "
+            "scale, and this renderer spans a Cornell box to a 400 km "
+            "orbit; RELAX takes the raw hit distance and is NVIDIA's "
+            "path-tracing / high-variance choice. The engine feeds it "
+            "motion vectors, linear view Z, oct-packed normal+roughness, "
+            "and radiance demodulated by the SAME aerial-perspective "
+            "guide the SVGF chain uses (G = T*A + (1-T)), then "
+            "remodulates on the far side. Sky pixels are passed through "
+            "un-denoised on purpose -- they are analytic here. Requires a "
+            "build configured with -DPT_ENABLE_NRD=ON (default OFF) and "
+            "the Vulkan backend; without it, or if NRD's instance "
+            "creation fails at runtime, `nrd` degrades to the in-house "
+            "svgf_atrous chain and says so once in the log. "
             "optix_hdr = NVIDIA OptiX HDR denoiser "
             "via CUDA-Vulkan interop (gated by build-time PT_ENABLE_OPTIX, "
             "auto-detected at configure when CUDA Toolkit + OptiX SDK are "
@@ -7832,6 +7846,27 @@ void Engine::RenderFrame() {
         want_kind = DenoiserKind::Off;
     }
     const bool want_denoiser = (want_kind != DenoiserKind::Off);
+    // NRD library availability (issue #50). Folded into one bool the
+    // rest of the frame reads: false on a build without PT_ENABLE_NRD,
+    // and false once the backend's NRD instance has failed at runtime.
+    // Re-read every frame because the runtime half can flip (once,
+    // downward) after the first Kind::Nrd dispatch.
+    {
+        const bool nrd_now = (device_ != nullptr) && device_->SupportsNrdLibrary();
+        if (nrd_now != nrd_lib_active_ && denoiser_kind_ == DenoiserKind::Nrd) {
+            LOG_INFO("engine: NVIDIA RayTracingDenoiser availability changed "
+                     "({} -> {}); `r_denoiser nrd` now routes through {}",
+                     nrd_lib_active_ ? "available" : "unavailable",
+                     nrd_now ? "available" : "unavailable",
+                     nrd_now ? "the NRD library (RELAX_DIFFUSE)"
+                             : "the in-house SVGF a-trous chain");
+            // The two chains keep history in different buffers and (for
+            // NRD) a different colour space, so a mid-session switch has
+            // to start clean.
+            prev_frame_valid_ = false;
+        }
+        nrd_lib_active_ = nrd_now;
+    }
     if (want_denoiser != denoiser_active_ || want_kind != denoiser_kind_) {
         // Toggle (or kind switch -- e.g. svgf -> nrd): free the G-buffer
         // and force a history reset on the next allocation.
@@ -7839,12 +7874,25 @@ void Engine::RenderFrame() {
         denoiser_kind_        = want_kind;
         prev_frame_valid_ = false;
         // One-time log on transitions so the user sees which path
-        // they're on (especially for the nrd-as-svgf-placeholder case).
+        // they're on (especially for `nrd`, which is the real NVIDIA
+        // library on a PT_ENABLE_NRD build and the in-house SVGF chain
+        // everywhere else).
         if (want_kind == DenoiserKind::Nrd) {
-            LOG_INFO("engine: r_denoiser=nrd accepted -- routing through the in-house "
-                     "SVGF kernels (atrous chain) until the NVIDIA RayTracingDenoiser "
-                     "library is integrated. See Raytracer Plan/FOLLOW_UPS.md for the "
-                     "integration plan.");
+            if (nrd_lib_active_) {
+                LOG_INFO("engine: r_denoiser=nrd -- NVIDIA RayTracingDenoiser "
+                         "(RELAX_DIFFUSE): demodulated radiance + hit distance, "
+                         "oct-packed normal/roughness, linear view Z and the "
+                         "engine's motion vectors, denoised in-library and "
+                         "remodulated before bloom + tonemap");
+            } else {
+                // Same shape as the OptiX-unavailable path: say exactly
+                // why, say what runs instead, and don't pretend.
+                LOG_INFO("engine: r_denoiser=nrd requested but the NVIDIA "
+                         "RayTracingDenoiser is unavailable on this build "
+                         "(configure with -DPT_ENABLE_NRD=ON, Vulkan backend) "
+                         "-- running the in-house SVGF a-trous chain instead. "
+                         "Image quality is the svgf_atrous tier, not NRD's.");
+            }
         } else if (want_kind == DenoiserKind::SvgfBasic) {
             LOG_INFO("engine: r_denoiser=svgf_basic -- temporal accumulation only "
                      "(no spatial filter)");
@@ -9278,7 +9326,13 @@ void Engine::RenderFrame() {
         std::uint32_t write_specular_albedo_gbuffer;
         std::uint32_t write_roughness_gbuffer;
         std::uint32_t write_specular_hit_distance_gbuffer;
-        std::uint32_t _pad_specular_gbuffers0;
+        // NRD first-bounce hit distance (issue #50). Occupies what used
+        // to be `_pad_specular_gbuffers0` -- same wire offset, no push
+        // growth. 1 -> PathTrace stashes the primary-hit -> first-
+        // indirect-hit distance in denoise_color.a for NrdPack.slang to
+        // fold into IN_DIFF_RADIANCE_HITDIST.w. Set only for
+        // DenoiserKind::Nrd on a build with a live NRD library.
+        std::uint32_t write_nrd_hitdist;
         // --- Water Phase 1 (#134) ----------------------------------------
         // water_params0.xyz = absorption per channel (1/m, Beer's law);
         //                .w = ior (clamped to [1.0, 2.4] in shader).
@@ -9768,7 +9822,15 @@ void Engine::RenderFrame() {
         (denoiser_active_ && roughness_tex_id_ != 0) ? 1u : 0u;
     push.write_specular_hit_distance_gbuffer =
         (denoiser_active_ && specular_hit_distance_tex_id_ != 0) ? 1u : 0u;
-    push._pad_specular_gbuffers0 = 0u;
+    // NRD first-bounce hit distance (issue #50). `nrd_lib_active_` was
+    // refreshed from Device::SupportsNrdLibrary() earlier in this
+    // frame -- it is false on a build without PT_ENABLE_NRD and on a
+    // build where NRD's instance creation failed, so the extra
+    // trace-loop capture (and the denoise_color.a semantic change it
+    // implies) never runs on any other path.
+    push.write_nrd_hitdist =
+        (denoiser_active_ && denoiser_kind_ == DenoiserKind::Nrd &&
+         nrd_lib_active_) ? 1u : 0u;
     push.env_map_present  = (env_map_tex_id_ != 0) ? 1u : 0u;
     {
         float intensity = 1.0f;
@@ -13019,6 +13081,13 @@ void Engine::RenderFrame() {
         } else if (denoiser_kind_ == DenoiserKind::SvgfBasicMetalFx ||
                    denoiser_kind_ == DenoiserKind::SvgfAtrousMetalFx) {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfMetalFx;
+        } else if (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_) {
+            // Issue #50. `nrd` is no longer an alias for svgf_atrous:
+            // it routes to the real NVIDIA RayTracingDenoiser when the
+            // build has one. Without it we fall through to Kind::Svgf
+            // below, which is the documented graceful degradation (the
+            // transition log above already told the user).
+            dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Nrd;
         } else {
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::Svgf;
         }
@@ -13462,7 +13531,23 @@ void Engine::RenderFrame() {
                 // dd.kind and (for SvgfNoFinalize) routes through
                 // VulkanNrdDenoiser::Encode with final_output=0, which
                 // leaves the denoised linear-HDR in dd.output.
-                dd.kind = pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                // Issue #50: the NRD library path expresses the same
+                // "stop before the finalize" contract by zeroing
+                // final_output (Kind::SvgfNoFinalize is the SVGF-only
+                // spelling of it -- VulkanDevice zeroes final_output
+                // internally for that kind). Without this branch the
+                // dual-Denoise path would silently route every frame
+                // after StarsComposite engages back through SVGF, and
+                // `r_denoiser nrd` would only reach NRD on the handful
+                // of frames before the composite turns on.
+                const bool step1_is_nrd =
+                    (denoiser_kind_ == DenoiserKind::Nrd && nrd_lib_active_);
+                dd.kind = step1_is_nrd
+                              ? pt::rhi::Device::DenoiseDesc::Kind::Nrd
+                              : pt::rhi::Device::DenoiseDesc::Kind::SvgfNoFinalize;
+                if (step1_is_nrd) {
+                    dd.final_output = pt::rhi::TextureHandle{0};
+                }
                 device_->Denoise(dd);
                 // Step 2: stateless celestial composite over the same
                 // texture. composite_stars_to issues its own RAW barrier

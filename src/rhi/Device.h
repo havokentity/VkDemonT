@@ -474,6 +474,30 @@ public:
             // engine's post_denoise_hdr_tex) -- the swap is written by
             // the follow-up FinalizeOnly call.
             SvgfNoFinalize,
+            // NVIDIA RayTracingDenoiser (NRD) library, RELAX_DIFFUSE
+            // (issue #50). Vulkan-only, and only on a build configured
+            // with -DPT_ENABLE_NRD=ON -- SupportsNrdLibrary() reports
+            // whether the backend can actually service this kind, and
+            // the engine downgrades to Kind::Svgf with a log line when
+            // it can't (mirroring the OptiX unavailability path).
+            //
+            // Inputs are the Kind::Svgf set (color / depth / motion /
+            // normal / albedo / output / final_output / exposure_state /
+            // bloom_in / bloom_intensity / hdr_pipeline / tonemap_op /
+            // world_to_view / view_to_clip / jitter / reset_history).
+            // The backend packs them into NRD's IN_MV / IN_VIEWZ /
+            // IN_NORMAL_ROUGHNESS / IN_DIFF_RADIANCE_HITDIST, runs the
+            // RELAX dispatch chain, unpacks OUT_DIFF_RADIANCE_HITDIST
+            // into `output`, and then reuses the SVGF denoiser's
+            // DenoiseFinalize stage for bloom + tonemap + swap exactly
+            // as Kind::Svgf does. Passing final_output = 0 stops before
+            // the finalize, matching Kind::SvgfNoFinalize's contract.
+            //
+            // `albedo_demod_enabled` applies here too: NRD wants
+            // demodulated radiance for the same reason SVGF does, and
+            // the backend reuses the engine's existing demodulation
+            // guide rather than deriving a second one.
+            Nrd,
         };
         Kind kind = Kind::Svgf;
         // Required by MetalFX TemporalDenoisedScaler. Column-major 4x4
@@ -484,6 +508,25 @@ public:
         const float* view_to_clip  = nullptr;
     };
     virtual bool SupportsDenoise() const { return false; }
+
+    // True iff this backend can service DenoiseDesc::Kind::Nrd with a
+    // real NVIDIA RayTracingDenoiser instance (issue #50).
+    //
+    // Two things have to hold, and BOTH are folded into this one
+    // answer so callers never have to reason about build flags:
+    //   1. The build was configured with -DPT_ENABLE_NRD=ON (and the
+    //      Vulkan backend is on -- see cmake/Dependencies.cmake's
+    //      PT_NRD_ACTIVE). Off by default, so the default build always
+    //      returns false here.
+    //   2. NRD's instance creation has not already failed at runtime.
+    //      A failure latches, so this flips to false permanently for
+    //      the session and the engine's next frame downgrades cleanly.
+    //
+    // Contract for callers: when this returns false, do NOT issue
+    // Kind::Nrd -- fall back to Kind::Svgf and say so once in the log.
+    // This mirrors how the engine handles an unavailable OptiX.
+    virtual bool SupportsNrdLibrary() const { return false; }
+
     virtual void Denoise(const DenoiseDesc& /*d*/) {}
 
     // Predictive pipeline JIT prewarming. Engine signals "I will need

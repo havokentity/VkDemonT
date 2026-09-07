@@ -20,6 +20,9 @@ namespace pt::rhi::vk { class VulkanNrdDenoiser; }
 #if defined(PT_ENABLE_OPTIX)
 namespace pt::rhi::vk { class VulkanOptixDenoiser; }
 #endif
+#if defined(PT_ENABLE_NRD)
+namespace pt::rhi::vk { class VulkanNrdLibDenoiser; }
+#endif
 
 struct GLFWwindow;
 
@@ -239,6 +242,9 @@ public:
     // pipeline is even ready). After lazy init, the cached `ready_`
     // flag short-circuits this check.
     bool SupportsDenoise() const override;
+    // True only on a PT_ENABLE_NRD build whose NRD instance hasn't
+    // already failed. See rhi/Device.h for the caller contract.
+    bool SupportsNrdLibrary() const override;
     void Denoise(const DenoiseDesc& d) override;
 
     // Predictive pipeline JIT prewarming (see Device::EnsurePipelineWarmed).
@@ -631,6 +637,21 @@ private:
     // time it's called with a non-zero output texture; freed in
     // DestroyDevice() before any VkPipeline / VkDescriptorPool teardown.
     std::unique_ptr<VulkanNrdDenoiser> denoiser_;
+
+#if defined(PT_ENABLE_NRD)
+    // NVIDIA RayTracingDenoiser library instance (issue #50). Sibling to
+    // denoiser_ / optix_denoiser_, gated by build-time PT_ENABLE_NRD.
+    // Allocated lazily by Denoise() on the first DenoiseDesc::Kind::Nrd
+    // frame. When its Init() fails the object is KEPT (not reset) so the
+    // failure latches and SupportsNrdLibrary() can report it -- rebuilding
+    // and re-failing every frame would just flood the log.
+    std::unique_ptr<VulkanNrdLibDenoiser> nrd_lib_denoiser_;
+    // Latched once NRD's instance / pipeline creation has failed at
+    // runtime. Written by Denoise(), read by SupportsNrdLibrary(), which
+    // is where "not compiled in" and "compiled in but broken" are folded
+    // into the single answer the engine consumes.
+    bool nrd_lib_failed_ = false;
+#endif
 
 #if defined(PT_ENABLE_OPTIX)
     // OptiX denoiser. Sibling to denoiser_ above, gated by build-time
