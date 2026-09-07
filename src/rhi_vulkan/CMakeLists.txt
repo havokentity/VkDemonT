@@ -143,6 +143,13 @@ pt_compile_slang(
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/AutoExposure.slang
     STAGE compute ENTRY main TARGETS spirv)
+# Render-scale resolve (r_render_scale). Bilinear magnify from the
+# internal-extent LDR target to the swapchain; the placeholder that DLSS
+# replaces. Declares only bindings 0 and 1, both storage images already
+# in the shared descriptor-set layout, so no layout entry is added.
+pt_compile_slang(
+    TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/Upscale.slang
+    STAGE compute ENTRY main TARGETS spirv)
 pt_compile_slang(
     TARGET pt_rhi_vulkan SOURCE ${CMAKE_SOURCE_DIR}/shaders/PerfOverlay.slang
     STAGE compute ENTRY main TARGETS spirv)

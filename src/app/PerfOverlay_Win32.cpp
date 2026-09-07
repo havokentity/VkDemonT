@@ -512,7 +512,17 @@ void WinPerf::Paint(HDC dc) {
     }
     if (level >= 2) {
         std::string be   = fmt::format("backend     {}",      s.backend ? s.backend : "");
-        std::string res  = fmt::format("resolution  {}x{}",   s.width, s.height);
+        // Show the internal render extent alongside the window extent
+        // whenever r_render_scale has separated them -- otherwise the
+        // HUD would report the window size while the path tracer is
+        // running at a fraction of it.
+        const bool scaled = (s.render_width  > 0 && s.render_height > 0 &&
+                             (s.render_width != s.width ||
+                              s.render_height != s.height));
+        std::string res  = scaled
+            ? fmt::format("resolution  {}x{} <- {}x{} internal",
+                          s.width, s.height, s.render_width, s.render_height)
+            : fmt::format("resolution  {}x{}",   s.width, s.height);
         double mem_mb    = double(s.gpu_bytes) / (1024.0 * 1024.0);
         std::string mem  = fmt::format("gpu memory  {:.1f} MB", mem_mb);
         std::string spp  = fmt::format("spp         {}",       s.spp);

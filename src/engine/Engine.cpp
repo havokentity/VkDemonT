@@ -706,6 +706,134 @@ namespace cvar {
             "the same constant at every distance.",
             CVAR_ARCHIVE);
     // --- end Planetary P5 ----------------------------------------------------
+    // --- Render-scale / jitter: the DLSS prerequisites -----------------------
+    // These two cvars exist to DECOUPLE the two things a temporal
+    // upscaler needs decoupled, and nothing else. Neither implements
+    // DLSS; both are the plumbing DLSS Super Resolution / DLAA / Ray
+    // Reconstruction plug into.
+    PT_CVAR(r_render_scale, "1.0",
+            "Internal render resolution as a fraction of the presentation "
+            "(swapchain) resolution. 1.0 (default) means the path tracer, "
+            "its accumulator, every denoiser G-buffer and every composite "
+            "pass run at the window's own pixel count and the path tracer "
+            "writes the swapchain directly -- byte-for-byte the behaviour "
+            "this engine has always had, which is what keeps the golden "
+            "matrix pinned at the default. Below 1.0 the entire internal "
+            "chain is allocated and dispatched at round(scale * extent) and "
+            "a final resolve pass magnifies the result onto the swapchain. "
+            "The resolve is a plain gamma-correct bilinear magnify "
+            "(shaders/Upscale.slang) -- a deliberate placeholder, not a "
+            "quality feature: this cvar's job is to give a temporal "
+            "upscaler a smaller image to consume and a bigger one to write, "
+            "and DLSS replaces the resolve when it lands. Expect the raw "
+            "bilinear result to look SOFTER than native at any scale below "
+            "1; that softness is the thing DLSS removes.\n"
+            "Clamped to [0.25, 1.0]. The upper bound is 1.0 because "
+            "supersampling is a different feature with different costs "
+            "(the accumulator, the SVGF history and the ReSTIR reservoir "
+            "ring all scale with the internal pixel count, and the "
+            "swapchain-extent readback paths assume they are never asked "
+            "to shrink). The lower bound is 0.25 because DLSS's own preset "
+            "ladder bottoms out at Ultra Performance = 1/3 linear "
+            "(Performance = 1/2, Balanced = 1/1.7, Quality = 1/1.5), so "
+            "0.25 already sits below every ratio a real upscaler mode "
+            "asks for -- and because the per-pixel angular footprint the "
+            "path tracer derives from the internal extent (ray-cone "
+            "spread, and through it texture LOD and the star point-spread "
+            "function) widens as 1/scale: past 4x the cones are wide "
+            "enough that texture detail and star cores are gone before "
+            "any upscaler gets to see them.\n"
+            "IMPORTANT for anyone extending the renderer: the angular "
+            "footprint above is derived in-shader from "
+            "output.GetDimensions(), and `output` is bound to the "
+            "INTERNAL target, so it follows this cvar automatically. A "
+            "new pass that derives a pixel footprint from the swapchain "
+            "extent instead would silently change star brightness and "
+            "texture LOD the moment this is set below 1.\n"
+            "Requires the `upscale` resolve kernel. If it is unavailable "
+            "the engine pins the scale back to 1.0 and logs once, rather "
+            "than presenting a swapchain nothing wrote.\n"
+            "NOTE for the DLSS integration (docs/DLSS_INTEGRATION_PLAN.md "
+            "P0.1 / SS3.1): this cvar is a RATIO, and the internal extent "
+            "is round(ratio * output). NGX hands back an exact render "
+            "extent for the mode it was created with, and a rounding "
+            "mismatch against that extent is an error rather than a "
+            "nuisance -- so the DLSS path wants to write the extent, not "
+            "the ratio. The single place to hook that is the render-scale "
+            "block at the top of Engine::RenderFrame, where render_w / "
+            "render_h are computed; everything downstream reads those two "
+            "and nothing else.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_camera_jitter, "0",
+            "Deterministic per-frame sub-pixel camera jitter. OFF (0, the "
+            "default) leaves sampling exactly as it has always been: the "
+            "path tracer draws a fresh RANDOM sub-pixel offset per ray, "
+            "which is what makes the accumulator converge to an "
+            "antialiased image, and the denoiser-only Halton offset in "
+            "PathTrace.slang keeps its existing narrow role. ON (1) "
+            "replaces that with a single Halton(2, 3) low-discrepancy "
+            "offset per FRAME, shared by every pixel and every sample, "
+            "applied on the host as a shear of the camera basis -- "
+            "mathematically identical to offsetting every primary ray's "
+            "pixel coordinate, and therefore also applied to the "
+            "unjittered-in-shader depth/motion G-buffer pass, which is "
+            "what a temporal upscaler expects.\n"
+            "This exists because a temporal upscaler needs to KNOW the "
+            "offset it is reconstructing from, and random per-ray "
+            "sampling has no offset to report. Halton(2, 3) is the "
+            "conventional choice for exactly this -- J. H. Halton, 'On "
+            "the efficiency of certain quasi-random sequences of points "
+            "in evaluating multi-dimensional integrals', Numerische "
+            "Mathematik 2 (1960) 84-90; it is the sequence NVIDIA's DLSS "
+            "programming guide recommends for the jitter pattern, and "
+            "the one Unreal's TAA/TSR uses -- because its radical-"
+            "inverse construction keeps every prefix of the sequence "
+            "well-stratified -- so a 4-frame window is as evenly spread "
+            "over the pixel as a 16-frame one, and the upscaler gets "
+            "usable coverage before its history is full.\n"
+            "The offset actually applied is reported by "
+            "Engine::FrameJitterX() / FrameJitterY() (pixels, in "
+            "[-0.5, 0.5], zero when this cvar is off) for the DLSS "
+            "integration to feed the upscaler. Sequence length is "
+            "r_camera_jitter_period frames.\n"
+            "Three properties an upscaler needs follow from shearing the "
+            "BASIS rather than offsetting each sample's uv in the shader, "
+            "and they are the three breaks docs/DLSS_INTEGRATION_PLAN.md "
+            "SS4.2 lists: (1) every spp sample shares the offset, so the "
+            "frame stays a point sample at the reported location instead "
+            "of becoming a box-filtered estimate as r_spp rises; (2) the "
+            "depth / motion / normal / albedo G-buffer pass -- which "
+            "traces at the pixel centre and never saw the in-shader "
+            "jitter -- is jittered identically to the colour, so the "
+            "guides describe the surface the colour sample actually hit; "
+            "and (3) the motion vectors stay jitter-free, because "
+            "curr_view_proj / prev_view_proj are built from the "
+            "UNSHEARED basis. None of the three needs a shader flag or a "
+            "PathTrace.slang edit -- they are properties of where the "
+            "offset is applied.\n"
+            "Turning this on WITHOUT a temporal reconstruction consuming "
+            "it makes the image marginally worse, not better: every "
+            "sample in a frame lands on the same sub-pixel point, so a "
+            "single frame is aliased and the accumulator needs the full "
+            "sequence period to average out. That is why it defaults off.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_camera_jitter_period, "16",
+            "Number of frames in the r_camera_jitter Halton(2, 3) cycle "
+            "before it repeats. Only meaningful when r_camera_jitter is 1. "
+            "16 matches the phase count the denoiser-side Halton offset in "
+            "PathTrace.slang has always used and comfortably exceeds the "
+            "history depth of every temporal filter in this engine, so a "
+            "pixel never sees the same sub-pixel position twice inside one "
+            "reconstruction window. DLSS's guide suggests a base period of "
+            "8 scaled by the reciprocal SQUARE of the render scale "
+            "(8 / scale^2 -- 18 phases at 2/3 scale, 32 at 1/2), so raise "
+            "this when running an aggressive scale and the reconstruction "
+            "looks like it is missing coverage. Clamped to [1, 256]; 1 "
+            "pins a single fixed offset, which is useful for A/B-ing "
+            "jitter against no jitter without the frame-to-frame shimmer "
+            "confusing the comparison.",
+            CVAR_ARCHIVE);
+    // --- end render-scale / jitter -------------------------------------------
     PT_CVAR(r_denoiser,        "off",
             "Denoiser. off = noisy 1-spp, accumulating image only. "
             "svgf_basic = in-house temporal accumulation only "
@@ -3645,6 +3773,9 @@ void Engine::TearDownDevice() {
             id = 0;
         }
         if (bloom_dummy_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{bloom_dummy_tex_id_});
+        // Render-scale internal present target (r_render_scale). Only
+        // ever allocated on a scaled frame, so this is usually a no-op.
+        if (present_ldr_tex_id_ != 0) device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
         if (env_map_tex_id_         != 0) device_->DestroyTexture(pt::rhi::TextureHandle{env_map_tex_id_});
         if (env_marginal_cdf_id_    != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_marginal_cdf_id_});
         if (env_conditional_cdf_id_ != 0) device_->DestroyBuffer(pt::rhi::BufferHandle{env_conditional_cdf_id_});
@@ -3789,6 +3920,20 @@ void Engine::TearDownDevice() {
     editor_overlay_segs_buf_id_      = 0;
     editor_overlay_segs_buf_capacity_ = 0;
     bloom_dummy_tex_id_      = 0;
+    // Render scale (r_render_scale). The pipeline id goes with the
+    // device; the target and the cached extents go with it so the next
+    // device's first scaled frame reallocates instead of handing the
+    // resolve a dangling handle. The engaged latch and the
+    // missing-kernel warning re-arm too, so a backend switch that
+    // gains or loses the resolve kernel logs its new state once.
+    present_ldr_tex_id_      = 0;
+    present_ldr_w_           = 0;
+    present_ldr_h_           = 0;
+    render_w_ = render_h_ = output_w_ = output_h_ = 0;
+    render_scale_engaged_    = false;
+    upscale_pipeline_id_     = 0;
+    upscale_absent_frames_   = 0;
+    upscale_missing_logged_  = false;
     for (auto& id : bloom_mip_tex_id_) id = 0;
     for (auto& w  : bloom_mip_w_)      w  = 0;
     for (auto& h  : bloom_mip_h_)      h  = 0;
@@ -6488,6 +6633,14 @@ void Engine::EnsurePipelineHandles() {
     resolve(tonemap_pipeline_id_,      "tonemap");
     resolve(bloom_down_pipeline_id_,   "bloom_down");
     resolve(bloom_up_pipeline_id_,     "bloom_up");
+    // Render-scale resolve (r_render_scale). Registered by the Vulkan
+    // backend's pipeline-build worker from the embedded Upscale.spv.
+    // An id of 0 means render scaling is unavailable -- either the
+    // async build has not reached this kernel yet or the backend has no
+    // such pipeline; RenderFrame pins the scale to 1.0 in both cases
+    // rather than presenting a swapchain nothing wrote, and only warns
+    // once the async window has demonstrably closed.
+    resolve(upscale_pipeline_id_, "upscale");
     resolve(autoexpose_pipeline_id_,   "autoexpose");
     resolve(perfoverlay_pipeline_id_,  "perfoverlay");
     // Editor 3D-transform gizmo overlay (issue: editor 3D gizmos).
@@ -7960,6 +8113,156 @@ void Engine::RenderFrame() {
         fc = device_->BeginFrame();
     }
 
+    // --- Render scale: split the internal extent from the output extent ----
+    //
+    // THE TRICK, stated plainly: `fc.width` / `fc.height` are REWRITTEN
+    // below to the INTERNAL render extent, and `fc.swapchain_image`
+    // keeps meaning the swapchain. Every `fc.width` / `fc.height` from
+    // here to the end of RenderFrame -- the accumulator, all thirteen
+    // denoiser G-buffers, the ReSTIR reservoir ring, the SIGMA shadow
+    // buffer, the bloom mip chain, the camera aspect ratio, and every
+    // Dispatch's workgroup count -- therefore follows the internal
+    // extent with no further edits. That is deliberate, not laziness:
+    // an opt-in list of "which of these seventy-odd sites should scale"
+    // would rot the first time someone adds a pass, whereas this makes
+    // "internal extent" the default and forces the two genuine
+    // exceptions (the resolve, and the output-resolution overlays after
+    // it) to say so explicitly by using output_w / output_h.
+    //
+    // It also settles the subtlest coupling in the renderer for free.
+    // PathTrace.slang derives its per-pixel angular footprint from
+    // `output.GetDimensions()` -- `cone_spread = 2 * fovYTan / dim.y`,
+    // the ray-cone width that drives texture LOD and the star
+    // point-spread function. `output` is engine texture slot 0, which
+    // is bound to the internal target below, so the footprint widens
+    // with the internal extent exactly as it must. Bind the swapchain
+    // there instead and stars silently change brightness and textures
+    // silently change mip level.
+    const std::uint32_t output_w = fc.width;
+    const std::uint32_t output_h = fc.height;
+    float render_scale = 1.0f;
+    if (auto* v = pt::console::Console::Get().FindCVar("r_render_scale")) {
+        render_scale = v->GetFloat();
+    }
+    // NaN-safe clamp: the comparisons below are false for NaN, so a
+    // garbage cvar value falls through to the 1.0 initialiser rather
+    // than propagating into an extent computation.
+    if (render_scale >= kMinRenderScale && render_scale <= kMaxRenderScale) {
+        // in range; keep it
+    } else if (render_scale > kMaxRenderScale) {
+        render_scale = kMaxRenderScale;
+    } else {
+        render_scale = (render_scale < kMinRenderScale) ? kMinRenderScale : 1.0f;
+    }
+    std::uint32_t render_w = std::max<std::uint32_t>(1u,
+        static_cast<std::uint32_t>(float(output_w) * render_scale + 0.5f));
+    std::uint32_t render_h = std::max<std::uint32_t>(1u,
+        static_cast<std::uint32_t>(float(output_h) * render_scale + 0.5f));
+    // Compare EXTENTS, not the scale factor: a scale of 0.999 on a
+    // 512-wide window rounds back to 512, and that frame must take the
+    // untouched direct-to-swapchain path rather than pay for a 1:1
+    // resolve. This is also what guarantees r_render_scale 1.0 is
+    // bit-identical to the pre-render-scale engine -- the branch is
+    // never entered.
+    bool render_scaled = (render_w != output_w) || (render_h != output_h);
+    if (render_scaled && upscale_pipeline_id_ == 0) {
+        // No resolve kernel available: the internal target would be
+        // rendered and then never copied anywhere, leaving the
+        // presented swapchain as whatever the last frame left in it.
+        // Pin back to native. The warning waits out a grace period
+        // because on Vulkan this is also what a still-building async
+        // pipeline looks like (the loading-frame gate only waits on
+        // `pathtrace`), and a start-up false alarm would teach people
+        // to ignore the message.
+        if (upscale_absent_frames_ < kUpscaleProbeGraceFrames) {
+            ++upscale_absent_frames_;
+        } else if (!upscale_missing_logged_) {
+            LOG_WARN("engine: r_render_scale {:.3f} requested but no `upscale` "
+                     "resolve kernel is available on this backend -- pinning "
+                     "internal resolution to the swapchain extent ({}x{})",
+                     render_scale, output_w, output_h);
+            upscale_missing_logged_ = true;
+        }
+        render_scaled = false;
+        render_w = output_w;
+        render_h = output_h;
+    } else if (upscale_pipeline_id_ != 0) {
+        // Kernel showed up (or was never missing): re-arm, so a later
+        // genuine loss -- device teardown / backend switch -- still
+        // gets its one warning.
+        upscale_absent_frames_  = 0;
+        upscale_missing_logged_ = false;
+    }
+    // Rewrite the frame context. From here on `fc.width`/`fc.height`
+    // ARE the internal extent.
+    fc.width  = render_w;
+    fc.height = render_h;
+    render_w_ = render_w;
+    render_h_ = render_h;
+    output_w_ = output_w;
+    output_h_ = output_h;
+    if (render_scaled != render_scale_engaged_) {
+        if (render_scaled) {
+            LOG_INFO("engine: render scale engaged -- internal {}x{}, "
+                     "presented {}x{} (scale {:.3f}); resolve = bilinear "
+                     "upscale (placeholder for DLSS)",
+                     render_w, render_h, output_w, output_h, render_scale);
+        } else {
+            LOG_INFO("engine: render scale disengaged -- rendering natively "
+                     "at {}x{}", output_w, output_h);
+        }
+        render_scale_engaged_ = render_scaled;
+    }
+    // The internal LDR target: what the path tracer's inline tonemap
+    // (or the denoiser finalize, or Tonemap.slang) writes instead of
+    // the swapchain on a scaled frame, and what the resolve reads.
+    // RGBA8_UNORM because it holds exactly what the swapchain holds --
+    // tonemapped, sRGB-encoded, display-referred colour -- and giving
+    // the placeholder resolve a wider format would only misrepresent
+    // where the precision actually is.
+    if (render_scaled &&
+        (present_ldr_tex_id_ == 0 ||
+         present_ldr_w_ != render_w || present_ldr_h_ != render_h)) {
+        if (present_ldr_tex_id_ != 0) {
+            device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+            present_ldr_tex_id_ = 0;
+        }
+        auto ph = device_->CreateTexture({
+            .width = render_w, .height = render_h,
+            .format = pt::rhi::TextureFormat::RGBA8_UNORM,
+            .usage  = pt::rhi::TextureUsage::Storage,
+            .debug_name = "present_ldr",
+        });
+        present_ldr_tex_id_ = ph.id;
+        present_ldr_w_      = render_w;
+        present_ldr_h_      = render_h;
+        if (present_ldr_tex_id_ == 0) {
+            LOG_ERROR("engine: present_ldr allocation failed at {}x{} -- "
+                      "falling back to native resolution for this frame",
+                      render_w, render_h);
+            render_scaled = false;
+            render_w = output_w; render_h = output_h;
+            fc.width = output_w; fc.height = output_h;
+            render_w_ = output_w; render_h_ = output_h;
+            render_scale_engaged_ = false;
+            present_ldr_w_ = present_ldr_h_ = 0;
+        }
+    } else if (!render_scaled && present_ldr_tex_id_ != 0) {
+        // Scale returned to 1.0 (or the window resized to meet it):
+        // give the VRAM back rather than keeping a target nothing on
+        // the default path will ever read again.
+        device_->DestroyTexture(pt::rhi::TextureHandle{present_ldr_tex_id_});
+        present_ldr_tex_id_ = 0;
+        present_ldr_w_ = present_ldr_h_ = 0;
+    }
+    // The handle every "write the final image here" site binds. On an
+    // unscaled frame this IS fc.swapchain_image, so those sites are
+    // byte-identical to what they were before render scaling existed.
+    const pt::rhi::TextureHandle present_target =
+        render_scaled ? pt::rhi::TextureHandle{present_ldr_tex_id_}
+                      : fc.swapchain_image;
+    // --- end render scale ---------------------------------------------------
+
     auto& cam = *camera_;
 
     // Camera-movement detection -> reset accumulation. Compared in f64:
@@ -8557,7 +8860,16 @@ void Engine::RenderFrame() {
     }
     GpuPassMark(cb, "PathTrace");
     cb->BindComputePipeline(pt::rhi::PipelineHandle{pathtrace_pipeline_id_});
-    cb->BindStorageTexture(0, fc.swapchain_image);
+    // Engine texture slot 0 is `output` in PathTrace.slang -- the
+    // inline-tonemap destination AND the texture whose GetDimensions()
+    // sets the whole kernel's notion of screen size (thread bounds,
+    // primary-ray uv, motion-vector pixel space, and the ray-cone
+    // spread that drives texture LOD and the star PSF). Binding the
+    // internal-extent target here is therefore what makes render
+    // scaling correct rather than merely smaller: every angular
+    // quantity in the megakernel follows the internal extent because
+    // it is derived from this binding.
+    cb->BindStorageTexture(0, present_target);
     cb->BindStorageTexture(1, pt::rhi::TextureHandle{accum_texture_id_});
 
     // Slot mapping (matches PathTrace.slang and the Metal-buffer layout
@@ -10137,19 +10449,116 @@ void Engine::RenderFrame() {
     // --- end ReSTIR DI Phase A ---------------------------------------------
 
     // Halton(2,3) sub-pixel jitter sequence in [-0.5, 0.5] each axis.
-    // 16-sample period before repeating; ample for the denoiser's
-    // internal history depth. Use frame_index_ which already advanced
-    // above, so each frame's color ray is a unique sub-pixel sample.
+    // Period is r_camera_jitter_period frames (default 16 -- the value
+    // this has always used, ample for the denoiser's internal history
+    // depth). Use frame_index_ which already advanced above, so each
+    // frame's color ray is a unique sub-pixel sample.
+    //
+    // TWO CONSUMERS, one sequence. (1) The long-standing denoiser path:
+    // the offset travels in push.halton_jitter and PathTrace.slang
+    // applies it to sample 0 when a denoiser is active. (2) The opt-in
+    // r_camera_jitter path below, which bakes it into the camera basis
+    // for EVERY ray and zeroes the push field so the two cannot
+    // double-count.
     auto halton = [](std::uint32_t i, std::uint32_t base) -> float {
         float f = 1.0f, r = 0.0f;
         while (i > 0) { f /= float(base); r += f * float(i % base); i /= base; }
         return r;
     };
-    std::uint32_t hi = (push.frame_index % 16u) + 1u;
+    // Sequence period. The denoiser-side offset above has always used
+    // 16; r_camera_jitter_period lets the (opt-in) camera-shear path
+    // pick its own, because a temporal upscaler running at an
+    // aggressive render scale wants more phases than a denoiser does --
+    // DLSS's guide asks for base_period / scale^2. Reading the cvar
+    // unconditionally (rather than inside the jitter branch) keeps the
+    // two paths on one sequence definition; with r_camera_jitter off
+    // it resolves to 16 unless the operator deliberately changed it,
+    // and the DEFAULT value of 16 is what preserves the pre-existing
+    // denoiser jitter bit-for-bit.
+    std::uint32_t jitter_period = 16u;
+    if (auto* v = C.FindCVar("r_camera_jitter_period")) {
+        int n = v->GetInt();
+        if (n < 1)   n = 1;
+        if (n > 256) n = 256;
+        jitter_period = static_cast<std::uint32_t>(n);
+    }
+    std::uint32_t hi = (push.frame_index % jitter_period) + 1u;
     push.halton_jitter[0] = halton(hi, 2) - 0.5f;
     push.halton_jitter[1] = halton(hi, 3) - 0.5f;
     last_jitter_x_ = push.halton_jitter[0];
     last_jitter_y_ = push.halton_jitter[1];
+
+    // --- Deterministic camera jitter (r_camera_jitter) ---------------------
+    //
+    // WHY A CAMERA SHEAR AND NOT A SHADER FLAG. The primary ray the
+    // megakernel builds is
+    //
+    //     uv = ((tid + 0.5 + jitter) / dim) * 2 - 1;  uv.y = -uv.y
+    //     rd = fwd + right * (uv.x * aspect * fovYTan)
+    //              + up    * (uv.y * fovYTan)
+    //
+    // so a sub-pixel offset that is CONSTANT across the frame is
+    // algebraically identical to a constant addend on `rd` -- i.e. to
+    // shearing the camera's forward vector. Folding it into
+    // push.fwd_aspect.xyz on the host therefore needs no shader change
+    // and, more importantly, applies to every ray the frame traces:
+    // the spp loop, the unjittered-in-shader depth/motion G-buffer
+    // pass, and the eight downstream composite passes that rebuild the
+    // same primary ray from a memcpy of this camera basis. A temporal
+    // upscaler needs colour and depth jittered together and its motion
+    // vectors NOT jittered (NVIDIA's DLSS guide is explicit: motion
+    // vectors are jitter-free unless you set the jittered-MV flag), and
+    // that is exactly what this produces -- curr_view_proj / prev_view_
+    // proj below are built from the UNSHEARED basis, so the motion
+    // vectors stay clean.
+    //
+    // With the cvar off nothing here executes and push.fwd_aspect keeps
+    // the value written from `fwd` earlier: bit-identical.
+    bool want_camera_jitter = false;
+    if (auto* v = C.FindCVar("r_camera_jitter")) want_camera_jitter = v->GetBool();
+    camera_jitter_active_ = want_camera_jitter;
+    if (want_camera_jitter) {
+        const float jx = push.halton_jitter[0];
+        const float jy = push.halton_jitter[1];
+        // Pixel offset -> NDC offset, in the INTERNAL render extent
+        // (fc.width/fc.height carry that; see the render-scale block).
+        // The y flip mirrors the shader's `uv.y = -uv.y`.
+        const float fovYTan = push.pos_fovtan[3];
+        const float dux =  2.0f * jx / float(std::max(1u, fc.width));
+        const float duy = -2.0f * jy / float(std::max(1u, fc.height));
+        const float sx  = dux * push.fwd_aspect[3] * fovYTan;   // aspect
+        const float sy  = duy * fovYTan;
+        push.fwd_aspect[0] = fwd.x + right.x * sx + up.x * sy;
+        push.fwd_aspect[1] = fwd.y + right.y * sx + up.y * sy;
+        push.fwd_aspect[2] = fwd.z + right.z * sx + up.z * sy;
+        // The shader must not ALSO add its own offset on top: with a
+        // denoiser active it applies halton_jitter to sample 0, and
+        // that offset is now baked into the basis above. Zeroing the
+        // push field is what keeps the two from double-counting.
+        // last_jitter_x_/y_ deliberately keep the real value -- the
+        // denoiser's DenoiseDesc uses them to describe the offset the
+        // colour was rendered with, which is still exactly this.
+        push.halton_jitter[0] = 0.0f;
+        push.halton_jitter[1] = 0.0f;
+        frame_jitter_x_ = jx;
+        frame_jitter_y_ = jy;
+    } else {
+        // Honest report: with the cvar off there is no single offset
+        // that describes the frame (the path tracer draws an
+        // independent random one per ray), so we publish zero and
+        // JitterActive() == false rather than a number a future DLSS
+        // integration might mistake for the truth.
+        frame_jitter_x_ = 0.0f;
+        frame_jitter_y_ = 0.0f;
+    }
+    if (want_camera_jitter != camera_jitter_engaged_) {
+        LOG_INFO("engine: deterministic camera jitter {} -- Halton(2,3), "
+                 "period {} frames, internal extent {}x{}",
+                 want_camera_jitter ? "engaged" : "disengaged",
+                 jitter_period, fc.width, fc.height);
+        camera_jitter_engaged_ = want_camera_jitter;
+    }
+    // --- end deterministic camera jitter -----------------------------------
 
     // pad3 already 0.0f from value-init
     //
@@ -12944,7 +13353,7 @@ void Engine::RenderFrame() {
         // finalize step so it ignores this field either way.
         dd.final_output    = use_engine_tonemap
                                  ? pt::rhi::TextureHandle{0}
-                                 : fc.swapchain_image;
+                                 : present_target;
         dd.exposure_state  = pt::rhi::BufferHandle{exposure_state_id_};
         dd.jitter_x      = last_jitter_x_;
         dd.jitter_y      = last_jitter_y_;
@@ -13485,7 +13894,7 @@ void Engine::RenderFrame() {
                 // Svgf-path setup and apply to FinalizeOnly identically.
                 dd.kind         = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
                 dd.color_in     = pt::rhi::TextureHandle{post_denoise_hdr_tex_id_};
-                dd.final_output = fc.swapchain_image;
+                dd.final_output = present_target;
                 device_->Denoise(dd);
             } else {
                 device_->Denoise(dd);
@@ -13517,7 +13926,7 @@ void Engine::RenderFrame() {
             // / exposure_state / hdr_pipeline when kind == FinalizeOnly.
             dd.kind = pt::rhi::Device::DenoiseDesc::Kind::FinalizeOnly;
             dd.color_in     = pt::rhi::TextureHandle{denoise_color_tex_id_};
-            dd.final_output = fc.swapchain_image;
+            dd.final_output = present_target;
             dd.bloom_in     = (bloom_can_run && bloom_mip_tex_id_[0] != 0)
                                   ? pt::rhi::TextureHandle{bloom_mip_tex_id_[0]}
                                   : pt::rhi::TextureHandle{0};
@@ -14282,7 +14691,7 @@ void Engine::RenderFrame() {
         GpuPassMark(cb, "Tonemap");
         cb->BindComputePipeline(pt::rhi::PipelineHandle{tonemap_pipeline_id_});
         cb->BindStorageTexture(0, pt::rhi::TextureHandle{tonemap_hdr_source_id});
-        cb->BindStorageTexture(1, fc.swapchain_image);
+        cb->BindStorageTexture(1, present_target);
         // exposure_state is already bound at engine slot 6 from the
         // path-trace dispatch earlier this frame. Tonemap.slang has
         // been padded with dummy bindings so its MSL emission puts
@@ -14547,6 +14956,73 @@ void Engine::RenderFrame() {
         vulkan_optix_bloom_engaged_ = false;
     }
 
+    // ---- Render-scale resolve (r_render_scale) ---------------------------
+    //
+    // THE BOUNDARY. Everything above this line ran at the internal
+    // extent; everything below runs at the presentation extent. Whoever
+    // produced the final image this frame -- the path tracer's inline
+    // tonemap, VulkanNrdDenoiser's finalize, or Tonemap.slang -- wrote
+    // it into `present_target`, which on a scaled frame is the
+    // internal-extent `present_ldr` texture rather than the swapchain.
+    // This pass magnifies it onto the swapchain.
+    //
+    // Elided entirely at r_render_scale = 1.0: `render_scaled` is false,
+    // present_target IS the swapchain, and the frame is byte-identical
+    // to the pre-render-scale engine.
+    //
+    // Placed AFTER every colour pass and BEFORE the editor gizmo and the
+    // perf HUD, because those two are UI: drawing them at the internal
+    // extent and then magnifying would give the operator soft, blurred
+    // gizmo handles and an unreadable HUD. They are the only two passes
+    // downstream of here, and both use output_w / output_h rather than
+    // fc.width / fc.height for exactly this reason.
+    //
+    // DLSS replaces this dispatch, and MOVES the boundary upstream of
+    // it. Per docs/DLSS_INTEGRATION_PLAN.md SS5.2 the upscaler consumes
+    // the internal-extent noisy linear HDR plus depth / motion (all
+    // still allocated at fc.width x fc.height above) and
+    // FrameJitterX/Y(), and emits display-resolution linear HDR --
+    // after which the celestial composite, the bloom pyramid and the
+    // tonemap all want to run at DISPLAY resolution, because stars are
+    // sub-pixel point sources a neural reconstructor would smear. So
+    // this pass goes away and the passes above it split around the new
+    // boundary. What survives unchanged is the extent bookkeeping: the
+    // internal/output split, output_w / output_h for anything past the
+    // boundary, and the rule that a pass which derives a pixel
+    // footprint must say which extent it means.
+    if (render_scaled && upscale_pipeline_id_ != 0 &&
+        present_ldr_tex_id_ != 0) {
+        // RAW on present_ldr: the pass that wrote it (path tracer /
+        // denoiser finalize / tonemap) is a compute write and this is
+        // a compute read.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeRead});
+        GpuPassMark(cb, "Upscale");
+        cb->BindComputePipeline(pt::rhi::PipelineHandle{upscale_pipeline_id_});
+        // Engine texture slot 0 -> vk::binding(0) = dst (swapchain),
+        // slot 1 -> vk::binding(1) = src (present_ldr). Slot 1 is
+        // `accum_hdr` for the path tracer; the shared descriptor-set
+        // layout only fixes the descriptor TYPE per binding and both
+        // are storage images, so the reuse is the same pattern
+        // StarsComposite.slang already relies on. See Upscale.slang.
+        cb->BindStorageTexture(0, fc.swapchain_image);
+        cb->BindStorageTexture(1, pt::rhi::TextureHandle{present_ldr_tex_id_});
+        struct UpscalePush {
+            std::uint32_t src_w, src_h;
+            std::uint32_t dst_w, dst_h;
+        } up{ render_w, render_h, output_w, output_h };
+        static_assert(sizeof(UpscalePush) == 16,
+                      "UpscalePush must match the Push cbuffer in "
+                      "shaders/Upscale.slang");
+        cb->PushConstants(&up, sizeof(up));
+        cb->Dispatch((output_w + 7) / 8, (output_h + 7) / 8, 1);
+        // The gizmo / HUD passes below read-modify-write the swapchain
+        // this pass just wrote.
+        cb->Barrier({pt::rhi::BarrierDesc::Stage::ComputeWrite,
+                     pt::rhi::BarrierDesc::Stage::ComputeWrite});
+    }
+    // ---- end render-scale resolve ----------------------------------------
+
     // ---- Editor 3D-transform gizmo dispatch (issue: editor 3D gizmos) ----
     //
     // Post-tonemap, pre-perf-overlay. Writing into the swapchain image
@@ -14607,8 +15083,16 @@ void Engine::RenderFrame() {
         const glm::vec3 fwd_v   = C2.Forward();
         const glm::vec3 right_v = C2.Right();
         const glm::vec3 up_v    = C2.Up();
-        const float aspect_ratio = (fc.height > 0)
-                                      ? float(fc.width) / float(fc.height)
+        // OUTPUT extent, not fc.width/fc.height (which carry the
+        // internal render extent under r_render_scale): this pass runs
+        // AFTER the render-scale resolve and rasterizes straight into
+        // the swapchain. Same number whenever the scale is 1.0, and
+        // the same aspect ratio either way -- the scale is uniform --
+        // but the dispatch bounds below genuinely differ, and getting
+        // those from the internal extent would confine the gizmo to
+        // the top-left corner of the presented image.
+        const float aspect_ratio = (output_h > 0)
+                                      ? float(output_w) / float(output_h)
                                       : 1.0f;
         ep.pos_fovtan[0] = static_cast<float>(C2.pos_w.x);
         ep.pos_fovtan[1] = static_cast<float>(C2.pos_w.y);
@@ -14629,7 +15113,7 @@ void Engine::RenderFrame() {
         ep.num_segments = std::min(editor_gizmo_.SegmentCount(),
                                    editor_overlay_segs_buf_capacity_);
         cb->PushConstants(&ep, sizeof(ep));
-        cb->Dispatch((fc.width + 7) / 8, (fc.height + 7) / 8, 1);
+        cb->Dispatch((output_w + 7) / 8, (output_h + 7) / 8, 1);
     }
 
     // RHI-mode perf overlay: final compute pass that composites a panel
@@ -14668,14 +15152,19 @@ void Engine::RenderFrame() {
             // than the margin -- unsigned subtraction would underflow
             // to a huge value and produce wild panel coords / sizes.
             // It's just a HUD; no harm in dropping it for a tiny window.
-            if (fc.width <= kPanelMargin || fc.height <= kPanelMargin) {
+            //
+            // OUTPUT extent, not fc.width/fc.height: the HUD is drawn
+            // into the swapchain AFTER the render-scale resolve, so its
+            // corner is the corner of the presented image. Identical
+            // numbers at r_render_scale 1.0.
+            if (output_w <= kPanelMargin || output_h <= kPanelMargin) {
                 panel_w = panel_h = 0;
             } else {
-                if (panel_w + kPanelMargin > fc.width)  panel_w = fc.width - kPanelMargin;
-                if (panel_h + kPanelMargin > fc.height) panel_h = fc.height - kPanelMargin;
+                if (panel_w + kPanelMargin > output_w) panel_w = output_w - kPanelMargin;
+                if (panel_h + kPanelMargin > output_h) panel_h = output_h - kPanelMargin;
             }
-            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > fc.width)
-                                  ? 0u : fc.width - panel_w - kPanelMargin;
+            std::uint32_t panel_x = (panel_w == 0u || panel_w + kPanelMargin > output_w)
+                                  ? 0u : output_w - panel_w - kPanelMargin;
             std::uint32_t panel_y = kPanelMargin;
 
             if (panel_w == 0u || panel_h == 0u) {
@@ -15452,8 +15941,17 @@ void Engine::HandleMouseInput() {
                 }
             }
 
-            const int hit_w = accum_w_ > 0 ? accum_w_ : w;
-            const int hit_h = accum_h_ > 0 ? accum_h_ : h;
+            // OUTPUT extent, not the accumulator's. The cursor
+            // position this hit-test is matched against is in window
+            // pixels and the gizmo is rasterized into the swapchain
+            // (after the render-scale resolve), so the screen space the
+            // projection has to agree with is the PRESENTED one. Under
+            // r_render_scale the accumulator is smaller than that, and
+            // using it would put every gizmo handle's hit region at the
+            // wrong place by exactly the scale factor. Identical to the
+            // old expression at scale 1.0.
+            const int hit_w = output_w_ > 0 ? static_cast<int>(output_w_) : w;
+            const int hit_h = output_h_ > 0 ? static_cast<int>(output_h_) : h;
             const float hit_aspect = (hit_h > 0) ? float(hit_w) / float(hit_h) : aspect;
             if (can_hit_gizmo &&
                 editor_gizmo_.HitTest(gizmo_origin, gizmo_size,
@@ -15578,7 +16076,17 @@ void Engine::Tick(double dt) {
     if (!pending_swap_screenshot_path_.empty() && device_ != nullptr) {
         std::uint32_t sw = 0, sh = 0;
         pt::rhi::Device::SwapFormat fmt = pt::rhi::Device::SwapFormat::Other;
-        std::vector<std::uint8_t> raw(std::size_t(accum_w_) * accum_h_ * 4u);
+        // Sized from the OUTPUT extent, not accum_w_/accum_h_. Under
+        // r_render_scale the accumulator is the INTERNAL extent, which
+        // is smaller than the swapchain -- and ReadbackSwapchain's
+        // pre-flight extent check rejects an undersized destination by
+        // returning false forever, so the poll below would spin out its
+        // whole 5-second budget and report "never consumed by Submit"
+        // for what is really a buffer that was allocated too small.
+        // output_w_/output_h_ equal accum_w_/accum_h_ at scale 1.0.
+        const std::size_t swap_bytes =
+            std::size_t(output_w_) * std::size_t(output_h_) * 4u;
+        std::vector<std::uint8_t> raw(swap_bytes);
         const bool ready = device_->ReadbackSwapchain(raw.data(), raw.size(),
                                                       &sw, &sh, &fmt);
         if (ready && sw > 0 && sh > 0) {
@@ -15859,6 +16367,11 @@ void Engine::Tick(double dt) {
             st.backend      = pt::rhi::BackendName(current_backend_);
             st.width        = w;
             st.height       = h;
+            // r_render_scale: the extent the path tracer actually ran
+            // at this frame, which the HUD prints next to the window
+            // extent when the two differ. Zero until the first frame.
+            st.render_width  = static_cast<int>(render_w_);
+            st.render_height = static_cast<int>(render_h_);
             st.gpu_bytes    = device_ ? device_->CurrentAllocatedBytes() : 0;
             if (auto* sv = Cn.FindCVar("r_spp"))         st.spp         = sv->GetInt();
             if (auto* mv = Cn.FindCVar("r_max_bounces")) st.max_bounces = mv->GetInt();
@@ -17013,6 +17526,50 @@ void Engine::RegisterCommands() {
         });
     // --- end Wave 9 scene save/load ---------------------------------------
 
+    // --- Render-scale / jitter diagnostics (DLSS prerequisites) -----------
+    // The console mirror of Engine::RenderWidth() / OutputWidth() /
+    // FrameJitterX() / JitterActive(). Exists so the decoupling can be
+    // CONFIRMED rather than assumed: "is the path tracer actually
+    // running at a smaller extent, and what sub-pixel offset does the
+    // engine claim the last frame used" is precisely the question a
+    // DLSS bring-up asks first, and reading it out of a live session
+    // beats inferring it from image softness.
+    C.RegisterCommand("render_info",
+        "Print the internal render extent, the presentation extent, the "
+        "effective r_render_scale, and the deterministic sub-pixel camera "
+        "jitter offset applied to the last frame. Jitter is reported in "
+        "pixels of the INTERNAL extent, each axis in [-0.5, 0.5]; it reads "
+        "'inactive' when r_camera_jitter is off, which means there is no "
+        "single frame offset (the path tracer draws an independent random "
+        "one per ray), NOT that the offset is zero.",
+        [this](auto /*args*/, pt::console::Output& out) {
+            if (render_w_ == 0u || output_w_ == 0u) {
+                out.PrintLine("render_info: no frame rendered yet");
+                return;
+            }
+            const float sx = float(render_w_) / float(output_w_);
+            const float sy = float(render_h_) / float(output_h_);
+            out.FormatLine("internal {}x{}  presented {}x{}  scale {:.4f} x {:.4f}"
+                           "  ({} pixels vs {})",
+                           render_w_, render_h_, output_w_, output_h_, sx, sy,
+                           std::uint64_t(render_w_) * render_h_,
+                           std::uint64_t(output_w_) * output_h_);
+            out.FormatLine("resolve: {}",
+                           (render_w_ == output_w_ && render_h_ == output_h_)
+                               ? "none (path tracer writes the swapchain directly)"
+                               : (upscale_pipeline_id_ != 0
+                                      ? "bilinear upscale (placeholder for DLSS)"
+                                      : "UNAVAILABLE -- no `upscale` kernel"));
+            if (camera_jitter_active_) {
+                out.FormatLine("jitter: active  Halton(2,3)  offset ({:+.5f}, {:+.5f}) px",
+                               frame_jitter_x_, frame_jitter_y_);
+            } else {
+                out.PrintLine("jitter: inactive (r_camera_jitter 0) -- per-ray random "
+                              "sub-pixel sampling, no reportable frame offset");
+            }
+        });
+    // --- end render-scale / jitter diagnostics ----------------------------
+
     if (auto* cmd = C.RegisterCommand("screenshot",
         "screenshot <name> [accum|denoise_color|bloom_mip0|swap|depth|motion]: dump the target render texture to disk. Output format is selected by r_capture_format (png|ppm); the matching extension is auto-appended to <name>, overriding any extension you typed. ACES-tonemapped for HDR inputs (accum / denoise_color / bloom_mip0); the swap target dumps the actual presented 8-bit BGRA bytes after the engine's sRGB OETF, no host-side tonemap.",
         [this](auto args, pt::console::Output& out) {
@@ -17078,7 +17635,14 @@ void Engine::RegisterCommands() {
                 // enough to satisfy the pre-flight extent check inside
                 // ReadbackSwapchain; the real memcpy happens on Tick's
                 // poll into a properly-sized buffer.
-                std::vector<std::uint8_t> dummy(std::size_t(accum_w_) * accum_h_ * 4u);
+                // OUTPUT extent, like the deferred poll in Tick: the
+                // accumulator is the INTERNAL extent under
+                // r_render_scale, and an undersized buffer fails
+                // ReadbackSwapchain's pre-flight extent check, which
+                // would leave the latched request permanently
+                // unsatisfiable.
+                std::vector<std::uint8_t> dummy(
+                    std::size_t(output_w_) * std::size_t(output_h_) * 4u);
                 (void)device_->ReadbackSwapchain(dummy.data(), dummy.size(),
                                                  &sw, &sh, &fmt);
                 // Latch the resolved path + format. The deferred writer
@@ -21433,8 +21997,17 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             gizmo_size = 1.5f;
         }
     }
-    const float aspect = (accum_h_ > 0)
-                           ? float(accum_w_) / float(accum_h_)
+    // Screen extent every projection / hit-test / drag in this function
+    // works in. It is the PRESENTED extent, not the accumulator's:
+    // the cursor coordinates below come from the window and the gizmo
+    // is rasterized into the swapchain after the render-scale resolve,
+    // so the internal render extent -- which under r_render_scale is
+    // smaller -- is the wrong space to project into. Equal to
+    // accum_w_/accum_h_ (the previous expression) at scale 1.0.
+    const int   screen_w = static_cast<int>(output_w_);
+    const int   screen_h = static_cast<int>(output_h_);
+    const float aspect = (screen_h > 0)
+                           ? float(screen_w) / float(screen_h)
                            : 1.0f;
     // The render-frame camera every projection / hit-test / drag below
     // works against (#255).
@@ -21454,7 +22027,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
     if (!mouse_look) {
         hovered = editor_gizmo_.HitTest(origin, gizmo_size,
                                         cam_r, aspect,
-                                        accum_w_, accum_h_,
+                                        screen_w, screen_h,
                                         mx, my, /*radius_px=*/10.0f);
     }
 
@@ -21555,7 +22128,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 PushSceneSnapshot();
                 editor_gizmo_.BeginDrag(hovered, origin,
                                         cam_r, aspect,
-                                        accum_w_, accum_h_,
+                                        screen_w, screen_h,
                                         mx, my);
             }
         } else if (lmb_down && prev_lmb_down_ && editor_gizmo_.IsDragging()) {
@@ -21571,7 +22144,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // axis lives in world space (not in the prim's local
                 // frame), matching user expectation.
                 const float angle = editor_gizmo_.UpdateRotateDrag(
-                    cam_r, aspect, accum_w_, accum_h_, mx, my);
+                    cam_r, aspect, screen_w, screen_h, mx, my);
                 // Sub-half-degree threshold cuts Execute() churn when
                 // the mouse is roughly still.
                 constexpr float kAngleEps = 1.0e-3f;
@@ -21610,7 +22183,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
             } else if (editor_gizmo_.DragMode() == pt::renderer::EditorOverlay::Mode::Scale) {
                 const glm::vec3 new_pos =
                     editor_gizmo_.UpdateDrag(cam_r, aspect,
-                                             accum_w_, accum_h_, mx, my);
+                                             screen_w, screen_h, mx, my);
                 const glm::vec3 delta = new_pos - editor_drag_pre_pos_;
                 const glm::vec3 ax = [&]() {
                     switch (editor_gizmo_.DragAxis()) {
@@ -21658,7 +22231,7 @@ void Engine::BuildSelectionGizmo(bool gizmo_enabled) {
                 // undo machinery route uniformly.
                 const glm::vec3 new_pos =
                     editor_gizmo_.UpdateDrag(cam_r, aspect,
-                                             accum_w_, accum_h_, mx, my);
+                                             screen_w, screen_h, mx, my);
                 // Skip the dispatch if the delta is sub-millimetre; cuts
                 // the ~60 Hz Execute() churn when the mouse is still.
                 if (glm::distance(new_pos, origin) > 1e-4f) {

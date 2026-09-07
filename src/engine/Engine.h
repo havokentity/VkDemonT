@@ -404,6 +404,57 @@ public:
     }
     // --- end Editor backend accessors ------------------------------------
 
+    // --- Render-scale + jitter reporting (DLSS prerequisites) -------------
+    // Bounds r_render_scale is clamped to. See the cvar's own help text
+    // for why each end sits where it does; in short, 1.0 is the top
+    // because supersampling is a different feature, and 0.25 is the
+    // floor because it is already below DLSS Ultra Performance (1/3)
+    // and because the path tracer's ray-cone footprint -- and with it
+    // texture LOD and the star point-spread function -- widens as
+    // 1/scale.
+    static constexpr float kMinRenderScale = 0.25f;
+    static constexpr float kMaxRenderScale = 1.0f;
+
+    // Everything a temporal upscaler needs to know about the frame the
+    // engine just produced, published here so the DLSS integration can
+    // read it without reaching into RenderFrame's locals.
+    //
+    // The four extents describe the decoupling r_render_scale
+    // introduced: the path tracer and every buffer feeding a
+    // reconstruction (colour, depth, motion, normal, albedo) live at
+    // Render*(), and the image the user sees lives at Output*(). They
+    // are equal whenever r_render_scale resolves to 1.0. Valid from the
+    // first completed RenderFrame; all zero before that.
+    std::uint32_t RenderWidth()  const noexcept { return render_w_; }
+    std::uint32_t RenderHeight() const noexcept { return render_h_; }
+    std::uint32_t OutputWidth()  const noexcept { return output_w_; }
+    std::uint32_t OutputHeight() const noexcept { return output_h_; }
+
+    // The sub-pixel camera offset applied to the frame just rendered,
+    // in pixels of the INTERNAL render extent, each component in
+    // [-0.5, 0.5]. This is the quantity that feeds
+    // NVSDK_NGX_Parameter_Jitter_Offset_{X,Y}. Units already match
+    // (NGX also wants centre-relative pixels of the render extent);
+    // the SIGN convention on Y is the one thing the integration must
+    // verify against the SDK rather than assume, because +Y here is
+    // "down the screen" -- the engine's ray builder flips it
+    // (`uv.y = -uv.y`) on the way to NDC.
+    //
+    // Returns (0, 0) and JitterActive() == false when r_camera_jitter
+    // is off. That is not "no jitter happened" -- with the cvar off the
+    // path tracer still draws an independent RANDOM sub-pixel offset
+    // per ray, which is what gives the accumulator its antialiasing.
+    // It means "there is no single deterministic offset that describes
+    // this frame", which is precisely the state in which a temporal
+    // upscaler must NOT be handed a jitter value. A DLSS integration
+    // should therefore treat JitterActive() == false as a
+    // precondition failure and turn r_camera_jitter on, not as
+    // "jitter is zero".
+    float FrameJitterX() const noexcept { return frame_jitter_x_; }
+    float FrameJitterY() const noexcept { return frame_jitter_y_; }
+    bool  JitterActive() const noexcept { return camera_jitter_active_; }
+    // --- end render-scale + jitter reporting -------------------------------
+
 private:
     // Test-only access (PR #181 follow-up, see forward-declaration above).
     friend struct ::pt::engine::PhysDropArgsTestAccess;
@@ -1499,6 +1550,15 @@ private:
     std::uint64_t                               tonemap_pipeline_id_   = 0;
     std::uint64_t                               bloom_down_pipeline_id_ = 0;
     std::uint64_t                               bloom_up_pipeline_id_   = 0;
+    // Render-scale resolve (r_render_scale). Magnifies the internal-
+    // extent LDR image onto the swapchain. Dispatched ONLY on frames
+    // where the internal extent differs from the swapchain extent, so
+    // at the default scale of 1.0 the id is resolved and never used.
+    // Zero means the backend has no such kernel, which the render-scale
+    // gate reads as "render scaling unavailable" and pins the scale
+    // back to 1.0 -- the alternative would be presenting a swapchain
+    // nothing wrote this frame.
+    std::uint64_t                               upscale_pipeline_id_    = 0;
     // Stateless stars+sun+moon composite (issue #46). Dispatched on
     // Metal between Denoise() and the bloom pyramid so post-denoise
     // HDR receives sub-pixel celestials and bloom downsamples those
@@ -1949,6 +2009,47 @@ private:
     std::uint32_t                               bloom_mip_h_[kBloomMips] {};
     std::uint64_t                               bloom_dummy_tex_id_ = 0;   // 1x1 RGBA16F when bloom off
 
+    // --- Render scale (r_render_scale) -----------------------------------
+    // The internal-extent LDR target the path tracer (or the denoiser's
+    // finalize, or Tonemap.slang) writes INSTEAD of the swapchain when
+    // the internal extent differs from the presentation extent. Same
+    // 8-bit UNORM storage class as the swapchain because it holds the
+    // same thing: already-tonemapped, already-sRGB-encoded display
+    // colour. Allocated lazily on the first scaled frame and freed as
+    // soon as the scale returns to 1.0, so the default configuration
+    // pays no VRAM for a feature it never uses. `_w_` / `_h_` are the
+    // extent it was allocated at, which is what drives reallocation --
+    // both a window resize and an r_render_scale change land here.
+    std::uint64_t                               present_ldr_tex_id_ = 0;
+    std::uint32_t                               present_ldr_w_      = 0;
+    std::uint32_t                               present_ldr_h_      = 0;
+    // This frame's internal render extent and the presentation extent.
+    // Equal whenever r_render_scale resolves to 1.0. Everything
+    // upstream of the resolve pass -- accumulator, G-buffers, SVGF
+    // history, ReSTIR reservoirs, every composite -- is sized and
+    // dispatched at render_*; only the resolve pass, the editor gizmo
+    // overlay and the perf HUD run at output_*.
+    std::uint32_t                               render_w_           = 0;
+    std::uint32_t                               render_h_           = 0;
+    std::uint32_t                               output_w_           = 0;
+    std::uint32_t                               output_h_           = 0;
+    // Engaged/disengaged edge latch for the one-line state log, same
+    // shape as vulkan_dual_denoise_engaged_ and friends: a silent
+    // resolution change is exactly the kind of thing that gets blamed
+    // on the renderer months later.
+    bool                                        render_scale_engaged_ = false;
+    // "The backend has no `upscale` kernel, so render scaling was
+    // pinned to 1.0" -- warned once, after a grace period. The grace is
+    // not politeness: Vulkan builds its pipelines on an async worker
+    // and the loading-frame gate only waits on `pathtrace`, so the
+    // first few real frames can legitimately see a not-yet-registered
+    // resolve kernel. Warning on frame one would cry wolf on every
+    // start-up where r_render_scale was archived below 1.
+    int                                         upscale_absent_frames_  = 0;
+    bool                                        upscale_missing_logged_ = false;
+    static constexpr int kUpscaleProbeGraceFrames = 60;
+    // --- end render scale --------------------------------------------------
+
     // Physical lens flare (Hullin paraxial). LensSystem + traced
     // ghost matrices live for the engine's lifetime; per-frame we
     // compute screen-UV scales from the current viewport via
@@ -2265,6 +2366,21 @@ private:
     DenoiserKind                                denoiser_kind_         = DenoiserKind::Off;
     float                                       last_jitter_x_         = 0.0f;
     float                                       last_jitter_y_         = 0.0f;
+    // --- Deterministic camera jitter (r_camera_jitter) --------------------
+    // The sub-pixel offset ACTUALLY applied to the camera basis this
+    // frame, in pixels of the INTERNAL render extent, each component in
+    // [-0.5, 0.5]. Zero on both axes when r_camera_jitter is off, which
+    // is the honest report: with the cvar off the path tracer draws an
+    // independent random offset per ray and there is no single frame
+    // offset to name. Distinct from last_jitter_* above, which always
+    // carries the raw Halton value because the denoiser's DenoiseDesc
+    // has consumed it since long before this cvar existed.
+    float                                       frame_jitter_x_        = 0.0f;
+    float                                       frame_jitter_y_        = 0.0f;
+    bool                                        camera_jitter_active_  = false;
+    // Engaged/disengaged edge latch for the one-line state log.
+    bool                                        camera_jitter_engaged_ = false;
+    // --- end deterministic camera jitter -----------------------------------
 
     // Auto-exposure now lives entirely on the GPU (see exposure_state_id_
     // above + AutoExposure.slang). The legacy CPU-side `current_exposure_`
