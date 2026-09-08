@@ -2979,14 +2979,23 @@ bool Engine::Init() {
         // real low-sun colour ramp, which is the whole look here. `physical`
         // is deliberately NOT used: it requires r_planet_radius > 0 and
         // would fall back to procedural with a warning in a flat scene.
-        // procedural, NOT hosek. The Hosek-Wilkie fit in this engine
-        // returns a magenta band within a few degrees of the horizon, and
-        // a scene that is half water mirrors that band across the whole
-        // bay -- verified by A/B: same frame, same everything, hosek
-        // magenta and procedural clean. Left as a separate defect rather
-        // than worked around here; when it is fixed this should go back
-        // to hosek, which has the better low-sun colour ramp.
-        seed_cvar("r_sky_mode", "procedural");
+        // hosek: the Hosek-Wilkie analytic dome. Physically-based
+        // turbidity and a real low-sun colour ramp, which is where the
+        // warmth on the towers comes from -- procedural is noticeably
+        // flatter at this elevation.
+        //
+        // An earlier pass here blamed hosek for a magenta cast over the
+        // bay and switched to procedural to dodge it. That was wrong, and
+        // wrong in an instructive way: the "A/B" behind it changed the sky
+        // mode and the post chain in the same step, so it never isolated
+        // anything. Re-run properly on one variable -- and again under the
+        // exact sun the bad frame used -- hosek is clean, and probing the
+        // cooked coefficients directly finds no negative channel anywhere
+        // above the horizon. The magenta was the EDITOR SELECTION tint
+        // (PathTrace.slang's silhouette highlight, keyed on
+        // selected_prim_id) landing on the water plane, which is
+        // primitives_[1] in this scene.
+        seed_cvar("r_sky_mode", "hosek");
         seed_cvar("r_sky_use_astronomical", "0");
         // Low sun, and OFF the view axis rather than behind the skyline.
         // Azimuth is 0 = north = -Z, 90 = east = +X, so 82 puts it away to
