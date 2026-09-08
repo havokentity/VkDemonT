@@ -291,6 +291,16 @@ pt_add_test(pt_core_world_frame
 #    sees. Note this does NOT come from pt_set_compiler_options -- test
 #    binaries deliberately opt out of the library-level policy -- so it
 #    is applied here explicitly.
+#
+#    CI DOES NOT EXERCISE IT. Both ctest jobs build Debug (win-debug and
+#    linux-asan-ubsan-debug), where this generator expression is empty
+#    and the mirror runs at /fp:precise -- so a fast-math-only defect in
+#    these two targets is green on every PR and red only in a local
+#    Release build. That is how the fast-math split of pt_math_sphere's
+#    two historic bodies reached main and stayed there: 25 red assertions
+#    in every local Release build, CI clean on every PR. The pins that
+#    close it are in the test file; a Release ctest job is what would
+#    have caught it, and is still owed.
 pt_add_test(pt_math_sphere
     pt_math_sphere_test.cpp)
 target_compile_definitions(pt_math_sphere PRIVATE
