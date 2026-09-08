@@ -3012,9 +3012,9 @@ bool Engine::Init() {
         // Down on the water south of the city, looking north up the bay:
         // the bridge crosses the left foreground, downtown stands beyond
         // it, and the sun track runs across the water toward the lens.
-        seed_cvar("cam_pos", "-250 100 1450");
+        seed_cvar("cam_pos", "-250 72 1380");
         seed_cvar("cam_yaw", "10");
-        seed_cvar("cam_pitch", "2");
+        seed_cvar("cam_pitch", "2.8");
         // cam_fov is the VERTICAL angle (Camera.h hands it straight to
         // glm::perspectiveRH_ZO), so the 60 default is ~91 degrees across
         // at 16:9 -- an ultra-wide that shrinks a mile-distant skyline to a
@@ -5406,6 +5406,21 @@ void Engine::SeedCityScene() {
         commit(id, p, what);
     };
 
+    // Per-cluster tint around a district's base colour. One albedo covers
+    // the four buildings in a cluster -- SdfPrim carries a single albedo --
+    // so the variation lands in blocks of four, which is closer to how a
+    // real street of the same era and material actually reads than
+    // per-building noise would be. Multiplicative so a dark base stays
+    // dark; the floor keeps a channel from collapsing to black.
+    auto tint = [&hash01](std::array<float, 3> base, std::uint32_t k, float amt) {
+        std::array<float, 3> out{};
+        for (int c = 0; c < 3; ++c) {
+            const float j = hash01(int(k), c, 91) - 0.5f;
+            out[c] = std::clamp(base[c] * (1.0f + amt * j), 0.04f, 1.0f);
+        }
+        return out;
+    };
+
     // A district: a lattice of towers whose heights come from the hash
     // above, tapered toward the rim so the skyline has a profile instead
     // of a wall. Batched four to a cluster; returns the next free id.
@@ -5437,12 +5452,16 @@ void Engine::SeedCityScene() {
                                     kLandTop + 0.5f * h,
                                     oz + float(iz) * pitch + jz});
                 if (int(batch.size()) == kBoxesPerCluster) {
-                    add_box_batch(id++, batch, material, albedo, roughness, what);
+                    const float rj = roughness * (0.7f + 0.6f * hash01(int(id), 7, salt));
+                    add_box_batch(id, batch, material, tint(albedo, id, 0.34f),
+                                  rj, what);
+                    ++id;
                     batch.clear();
                 }
             }
         }
-        add_box_batch(id++, batch, material, albedo, roughness, what);
+        add_box_batch(id, batch, material, tint(albedo, id, 0.34f), roughness, what);
+        ++id;
         return id;
     };
 
@@ -5471,12 +5490,12 @@ void Engine::SeedCityScene() {
     //
     // Both slabs run far below the waterline so no camera near the surface
     // can catch an underside; only the top 4 m stands above water.
-    add_shape(10, R::SDF_SHAPE_BOX, {800.0f, 400.0f, 800.0f, 0.0f},
+    add_shape(10, R::SDF_SHAPE_BOX, {800.0f, 400.0f, 740.0f, 0.0f},
               {250.0f, kLandTop - 400.0f, 0.0f},
-              kLambert, {0.26f, 0.25f, 0.21f}, 0.0f, "peninsula");
+              kLambert, {0.46f, 0.43f, 0.37f}, 0.0f, "peninsula");
     add_shape(11, R::SDF_SHAPE_BOX, {600.0f, 400.0f, 1100.0f, 0.0f},
               {-1650.0f, kLandTop + 30.0f - 400.0f, 0.0f},
-              kLambert, {0.22f, 0.23f, 0.19f}, 0.0f, "west headland");
+              kLambert, {0.38f, 0.38f, 0.31f}, 0.0f, "west headland");
 
     // --- districts --------------------------------------------------------
     // Ids are allocated in RANGES, not one per district: a district expands
@@ -5495,8 +5514,12 @@ void Engine::SeedCityScene() {
                        kLambert, {0.57f, 0.52f, 0.46f}, 0.0f,  29, "south blocks");
     id = emit_district(id, 2, 3, 66.0f,  800.0f,   60.0f,  18.0f, 140.0f, 13.0f,
                        kMetal,   {0.50f, 0.47f, 0.44f}, 0.24f, 53, "east waterfront");
-    id = emit_district(id, 1, 3, 70.0f, -330.0f,  100.0f,  16.0f,  96.0f, 12.0f,
+    id = emit_district(id, 3, 4, 68.0f, -260.0f,  150.0f,  16.0f, 104.0f, 12.0f,
                        kLambert, {0.55f, 0.50f, 0.45f}, 0.0f,  37, "bridge approach");
+    id = emit_district(id, 5, 1, 62.0f,  250.0f,  690.0f,  14.0f,  46.0f, 13.0f,
+                       kLambert, {0.58f, 0.53f, 0.47f}, 0.0f,  67, "south waterfront");
+    id = emit_district(id, 2, 3, 74.0f, -1650.0f,  120.0f,  12.0f,  54.0f, 12.0f,
+                       kLambert, {0.48f, 0.46f, 0.40f}, 0.0f,  71, "headland town");
     LOG_INFO("[city] districts occupy cluster ids 100..{}", id - 1u);
 
     // --- hero towers ------------------------------------------------------
