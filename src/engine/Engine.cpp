@@ -2568,18 +2568,39 @@ namespace cvar {
             "roughly constant at every scale. 0 = the literal cam_speed "
             "everywhere. Only active while r_planet_terrain is on.",
             CVAR_ARCHIVE);
-    PT_CVAR(r_scene_default,         "earth",
+    PT_CVAR(r_scene_default,         "city",
             "Which scene Init() seeds when a fixture does not supply its "
-            "own. `earth` = the planet: real Earth with streamed terrain, "
+            "own. `city` = the default: a bay skyline at golden hour, "
+            "built from SDF clusters with an analytic water plane and a "
+            "suspension bridge -- see Engine::SeedCityScene. `earth` = the "
+            "planet: real Earth with streamed terrain, "
             "the spherical frame and the analytic backstop body, camera at "
             "eye height on the reference site. `spheres_csg` = the engine's "
             "historical default, three analytic spheres on a grey plane "
             "plus the drilled-cube CSG mesh. `none` seeds neither and is "
             "equivalent to setting both pt_smoke_skip_prim_seed and "
             "pt_smoke_skip_csg_seed. Every golden fixture that depended on "
-            "the historical default now states `r_scene_default "
-            "spheres_csg` explicitly, so flipping this default moved no "
-            "pixels.", CVAR_ARCHIVE);
+            "the historical default states `r_scene_default "
+            "spheres_csg` explicitly, and every planetary fixture states "
+            "`earth`, so moving this default moves no pixels in either "
+            "set. The planet stopped being the default because it is a "
+            "poor first impression: the streamer needs hundreds of frames "
+            "to settle, and until it does the opening shot is a smooth "
+            "grey ellipsoid. The city renders its final geometry on frame "
+            "one and is what the path tracer actually looks good doing.",
+            CVAR_ARCHIVE);
+    PT_CVAR(r_scene_last_seeded,     "",
+            "Bookkeeping, not a knob: the r_scene_default value whose seed "
+            "last wrote this install's camera / sun / sky state, recorded "
+            "so a later run can tell whether the archived demont.cfg "
+            "belongs to the scene it is about to open. When it does not, "
+            "the seed re-frames instead of deferring to it -- without "
+            "this, moving the default scene leaves every existing install "
+            "pointing wherever the OLD scene left the camera while a fresh "
+            "clone looks correct. Empty means the archive predates this "
+            "bookkeeping, which is treated as a scene change. Setting it "
+            "by hand only changes whether the next launch re-frames.",
+            CVAR_ARCHIVE);
     // --- END planetary P4 terrain cvars (#258) ----------------------------
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
@@ -3078,7 +3099,14 @@ bool Engine::Init() {
     if (skip_cfg_load) {
         LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg + console_history.txt + camera_bookmarks.cfg load");
     } else {
+        // Everything demont.cfg assigns is stamped CVarSource::Archive so
+        // the scene seed below can tell restored state from an opinion
+        // about THIS run. autoexec.cfg is deliberately outside the scope:
+        // a user's startup script IS an opinion, and outranks the seed the
+        // same way a fixture does.
+        pt::console::Console::Get().SetAssignSource(pt::console::CVarSource::Archive);
         exec_if_exists("demont.cfg");      // archived cvars from last quit
+        pt::console::Console::Get().SetAssignSource(pt::console::CVarSource::Session);
         exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
         // Favourites are a parallel persistence file -- NOT a console
         // script. Loaded directly into Console::favorites_ via
@@ -3304,7 +3332,7 @@ bool Engine::Init() {
     // "the scene did not touch this" test -- imprecise in the one case
     // where a scene explicitly restates the default, which is harmless
     // because the result is the same either way.
-    std::string scene_default = "earth";
+    std::string scene_default = "city";
     if (auto* v = C.FindCVar("r_scene_default")) scene_default = v->value;
     // Returns true when the seed actually wrote -- i.e. the scene had no
     // opinion. Callers that need to know include the stand-on-the-surface
@@ -3319,14 +3347,99 @@ bool Engine::Init() {
     // this seed. Measuring the "feature deleted" signal for the golden
     // tolerances is what surfaced it -- terrain-off came out pixel-identical
     // to terrain-on, because terrain had never actually been turned off.
-    auto seed_cvar = [&C](const char* name, const char* value) {
+    //
+    // ... and `assigned` alone is not enough either, because demont.cfg
+    // sets it too. An archived value belongs to whichever scene was
+    // default when the user last quit, so once the default MOVES, every
+    // existing install carries a camera aimed at the old scene and the
+    // seed politely declines to fix it -- a fresh clone frames the new
+    // scene correctly and every machine that has run the engine before
+    // opens on empty water. That is why CVar::source exists: a value the
+    // ARCHIVE set, for a scene that is no longer the one being seeded, is
+    // not an opinion about this scene and the seed overrides it. A value
+    // this run assigned -- fixture, autoexec, --extra, console -- still
+    // wins, unchanged.
+    const std::string archived_scene = [&C] {
+        if (auto* v = C.FindCVar("r_scene_last_seeded")) return v->value;
+        return std::string{};
+    }();
+    const bool scene_changed = (archived_scene != scene_default);
+    if (scene_changed && !archived_scene.empty()) {
+        LOG_INFO("engine: default scene moved '{}' -> '{}'; archived camera / "
+                 "sky state from the old scene will be re-seeded",
+                 archived_scene, scene_default);
+    }
+    auto seed_cvar = [&C, scene_changed](const char* name, const char* value) {
         if (auto* v = C.FindCVar(name)) {
-            if (!v->assigned) { v->value = value; return true; }
+            const bool stale_archive =
+                (v->source == pt::console::CVarSource::Archive) && scene_changed;
+            if (!v->assigned || stale_archive) {
+                v->value    = value;
+                v->assigned = true;
+                v->source   = pt::console::CVarSource::Session;
+                return true;
+            }
         }
         return false;
     };
     const bool seed_earth = (scene_default == "earth");
     const bool seed_none  = (scene_default == "none");
+    const bool seed_city  = (scene_default == "city");
+    if (seed_city) {
+        // The city owns its own geometry, so both default seeds are off:
+        // the drilled cube would sit in the bay and the grey plane would
+        // paint over the water.
+        seed_cvar("pt_smoke_skip_prim_seed", "1");
+        seed_cvar("pt_smoke_skip_csg_seed", "1");
+        // Golden hour, and a sky that does not need a planet. hosek is the
+        // Hosek-Wilkie analytic dome -- physically-based turbidity and a
+        // real low-sun colour ramp, which is the whole look here. `physical`
+        // is deliberately NOT used: it requires r_planet_radius > 0 and
+        // would fall back to procedural with a warning in a flat scene.
+        // hosek: the Hosek-Wilkie analytic dome. Physically-based
+        // turbidity and a real low-sun colour ramp, which is where the
+        // warmth on the towers comes from -- procedural is noticeably
+        // flatter at this elevation.
+        //
+        // An earlier pass here blamed hosek for a magenta cast over the
+        // bay and switched to procedural to dodge it. That was wrong, and
+        // wrong in an instructive way: the "A/B" behind it changed the sky
+        // mode and the post chain in the same step, so it never isolated
+        // anything. Re-run properly on one variable -- and again under the
+        // exact sun the bad frame used -- hosek is clean, and probing the
+        // cooked coefficients directly finds no negative channel anywhere
+        // above the horizon. The magenta was the EDITOR SELECTION tint
+        // (PathTrace.slang's silhouette highlight, keyed on
+        // selected_prim_id) landing on the water plane, which is
+        // primitives_[1] in this scene.
+        seed_cvar("r_sky_mode", "hosek");
+        seed_cvar("r_sky_use_astronomical", "0");
+        // Low sun, and OFF the view axis rather than behind the skyline.
+        // Azimuth is 0 = north = -Z, 90 = east = +X, so 82 puts it away to
+        // the right of a camera looking up the bay at yaw 23: the towers
+        // get a raking warm face and a cool sky-lit one, which is where the
+        // colour in a golden-hour shot actually comes from. Dead back-lit
+        // would be prettier as a silhouette and would throw all of it away.
+        seed_cvar("r_sun_elevation", "6.0");
+        seed_cvar("r_sun_azimuth", "82");
+        // Turbidity up from the default: a hazier column reddens the low
+        // sun and puts some aerial perspective between the bridge and the
+        // skyline, which is what sells the distance between them.
+        seed_cvar("r_sky_turbidity", "4.0");
+        // Down on the water south of the city, looking north up the bay:
+        // the bridge crosses the left foreground, downtown stands beyond
+        // it, and the sun track runs across the water toward the lens.
+        seed_cvar("cam_pos", "-250 72 1380");
+        seed_cvar("cam_yaw", "10");
+        seed_cvar("cam_pitch", "2.8");
+        // cam_fov is the VERTICAL angle (Camera.h hands it straight to
+        // glm::perspectiveRH_ZO), so the 60 default is ~91 degrees across
+        // at 16:9 -- an ultra-wide that shrinks a mile-distant skyline to a
+        // model on a table, which is what the first passes here looked
+        // like. 40 vertical is ~69 across: a normal lens, and enough
+        // compression that the bridge and the towers stack up.
+        seed_cvar("cam_fov", "50");
+    }
     if (seed_earth) {
 #if PT_PLANET_ENABLED
         seed_cvar("r_planet_terrain", "1");
@@ -3420,6 +3533,16 @@ bool Engine::Init() {
         seed_cvar("pt_smoke_skip_prim_seed", "1");
         seed_cvar("pt_smoke_skip_csg_seed", "1");
     }
+    // Record which scene this install's archived state now describes, so
+    // the next launch can tell whether demont.cfg still applies. Written
+    // directly rather than through seed_cvar: this is bookkeeping ABOUT
+    // the seed, so it must be written even when the seed itself deferred
+    // to a fixture, and it must not consult its own staleness test.
+    if (auto* v = C.FindCVar("r_scene_last_seeded")) {
+        v->value    = scene_default;
+        v->assigned = true;
+        v->source   = pt::console::CVarSource::Session;
+    }
     // --- end Planetary P4 -------------------------------------------------
     bool skip_csg_seed = false;
     if (auto* v = C.FindCVar("pt_smoke_skip_csg_seed")) skip_csg_seed = v->GetBool();
@@ -3446,6 +3569,14 @@ bool Engine::Init() {
         SeedDefaultPrimitives();
     } else {
         LOG_INFO("engine: skipping default analytic-prim seed (pt_smoke_skip_prim_seed=1)");
+    }
+
+    // The city seeds AFTER the two default seeds rather than inside the
+    // dispatch above, so its clear-then-fill cannot be undone by a
+    // SeedDefaultPrimitives that a fixture re-enabled. It writes both
+    // sdf_prims_ and primitives_, neither of which needs a device.
+    if (seed_city) {
+        SeedCityScene();
     }
 
     // Boot the requested backend so the window renders something on
@@ -5624,6 +5755,338 @@ void Engine::SeedDefaultPrimitives() {
     add_plane (4,  0.0f, 1.0f,  0.0f, 0.0f, AnalyticPrim::Lambert,    rgb(0.55f, 0.55f, 0.55f));
     primitives_dirty_ = true;
     accum_dirty_      = true;
+}
+
+// --- the `city` scene ------------------------------------------------------
+//
+// A bay city at golden hour: a downtown core on a peninsula, a suspension
+// bridge across the channel west of it, and open water to the horizon.
+// Every dimension is metres (1 world unit = 1 m, the engine's standing
+// convention) and every building stands on the land top at kLandTop, so
+// the layout reads as a plan rather than as a pile of tuned constants.
+//
+// The cluster budget is the design constraint -- see the note on the
+// declaration in Engine.h. Districts are grids, not buildings.
+void Engine::SeedCityScene() {
+    namespace R = pt::renderer;
+
+    sdf_prims_.clear();
+    primitives_.clear();
+
+    // Ground level of the built land. Water is at y = 0, so the peninsula
+    // stands 4 m proud of it and every building base sits here.
+    constexpr float kLandTop = 4.0f;
+
+    // SdfPrim::material deliberately shares the AnalyticPrim numbering
+    // (0 Lambert, 1 Metal, 2 Dielectric) so an SDF hit feeds the same
+    // BSDF path as an analytic one -- see the note on SdfPrim. Naming
+    // them through AnalyticPrim keeps that shared numbering honest
+    // instead of restating two bare integers here.
+    constexpr std::uint32_t kLambert = std::uint32_t(AnalyticPrim::Lambert);
+    constexpr std::uint32_t kMetal   = std::uint32_t(AnalyticPrim::Metal);
+
+    // Commit a cluster, rejecting it loudly rather than silently shipping
+    // a stale AABB -- the sphere trace is AABB-bounded, so a bad bound is
+    // an invisible building, which is far harder to diagnose than a log
+    // line at seed time.
+    auto commit = [this](std::uint32_t id, R::SdfPrim& p, const char* what) {
+        if (!R::ComputeSdfAabb(p)) {
+            LOG_WARN("[city] cluster '{}' (id={}) has a degenerate AABB; skipped", what, id);
+            return;
+        }
+        sdf_prims_[id] = p;
+    };
+
+    // A single shape, placed absolutely. `center` is the leaf's local
+    // origin: the shape SDF is evaluated against (p - center).
+    auto add_shape = [&](std::uint32_t id, R::SdfShape shape,
+                         std::array<float, 4> params,
+                         std::array<float, 3> center,
+                         std::uint32_t material,
+                         std::array<float, 3> albedo, float roughness,
+                         const char* what) {
+        R::SdfPrim p{};
+        p.node_count = 1;
+        p.material   = material;
+        p.albedo[0]  = albedo[0]; p.albedo[1] = albedo[1]; p.albedo[2] = albedo[2];
+        p.roughness  = roughness;
+        p.ior        = 1.5f;
+        R::SdfNode& n = p.nodes[0];
+        n.op    = R::SDF_OP_LEAF;
+        n.shape = shape;
+        for (int i = 0; i < 4; ++i) n.params[i] = params[i];
+        for (int i = 0; i < 3; ++i) n.center[i] = center[i];
+        commit(id, p, what);
+    };
+
+    // WHY DISTRICTS ARE UNIONS AND NOT SDF_OP_REPEAT_LIMITED.
+    //
+    // A repeated box lattice is the natural way to say "city block", and
+    // it was the first thing tried here. It renders NOTHING: ops 5..9
+    // (displace-noise / twist / bend / repeat / repeat-limited) are
+    // PROCEDURAL ops, and sdfClusterTrace skips any cluster holding one
+    // unless the build sets PT_SDF_PROCEDURAL_OPS=ON -- off by default
+    // because, per the engine's own log line, procedural-op presence
+    // alone costs ~6 ms/frame on the default scene. Turning that on for
+    // every scene to buy this one a lattice is the wrong trade.
+    //
+    // SDF_OP_SMOOTH_UNION is op 1, so it is NOT gated, and with k <= 0 it
+    // early-outs to a plain min(). Districts are therefore explicit boxes
+    // unioned inside a cluster: kMaxNodes is 8 and a left-leaning union
+    // chain over N leaves costs 2N-1 nodes, so four buildings fit per
+    // cluster and the skyline lands in a few dozen clusters instead of a
+    // few hundred -- which is what the linear cluster scan needs.
+    constexpr int kBoxesPerCluster = 4;      // 4 leaves + 3 unions = 7 nodes
+
+    // Deterministic value hash. This is a DEFAULT scene, so a fixture may
+    // one day be pointed at it and every run on every host has to produce
+    // the same skyline -- which rules out std::rand and anything that
+    // depends on float evaluation order. Lattice index in, [0,1) out.
+    auto hash01 = [](int a, int b, int salt) {
+        std::uint32_t h = std::uint32_t(a) * 73856093u
+                        ^ std::uint32_t(b) * 19349663u
+                        ^ std::uint32_t(salt) * 83492791u;
+        h ^= h >> 13; h *= 0x85ebca6bu; h ^= h >> 16;
+        return float(h & 0x00FFFFFFu) / float(0x01000000u);
+    };
+
+    struct Box { float hx, hy, hz, cx, cy, cz; };   // half-extents, centre
+
+    // Union a batch of boxes into ONE cluster. Nodes go out in POST-ORDER
+    // -- every node's children have smaller indices, which is what the
+    // ascending-index walk in sdfClusterDist assumes -- as a left-leaning
+    // chain: L0 L1 U(0,1) L2 U(2,3) L3 U(4,5), root last.
+    auto add_box_batch = [&](std::uint32_t id, const std::vector<Box>& boxes,
+                             std::uint32_t material,
+                             std::array<float, 3> albedo, float roughness,
+                             const char* what) {
+        if (boxes.empty()) return;
+        R::SdfPrim p{};
+        p.material  = material;
+        p.albedo[0] = albedo[0]; p.albedo[1] = albedo[1]; p.albedo[2] = albedo[2];
+        p.roughness = roughness;
+        p.ior       = 1.5f;
+
+        std::uint32_t n = 0;      // next free node slot
+        std::uint32_t acc = 0;    // index of the accumulated sub-tree root
+        for (std::size_t i = 0; i < boxes.size(); ++i) {
+            const Box& b = boxes[i];
+            const std::uint32_t leaf = n++;
+            R::SdfNode& ln = p.nodes[leaf];
+            ln.op    = R::SDF_OP_LEAF;
+            ln.shape = R::SDF_SHAPE_BOX;
+            ln.params[0] = b.hx; ln.params[1] = b.hy; ln.params[2] = b.hz;
+            ln.center[0] = b.cx; ln.center[1] = b.cy; ln.center[2] = b.cz;
+            if (i == 0) { acc = leaf; continue; }
+            const std::uint32_t u = n++;
+            R::SdfNode& un = p.nodes[u];
+            un.op        = R::SDF_OP_SMOOTH_UNION;
+            un.child_a   = acc;
+            un.child_b   = leaf;
+            un.params[0] = 0.0f;              // k <= 0 -> hard min()
+            acc = u;
+        }
+        p.node_count = n;
+        commit(id, p, what);
+    };
+
+    // Per-cluster tint around a district's base colour. One albedo covers
+    // the four buildings in a cluster -- SdfPrim carries a single albedo --
+    // so the variation lands in blocks of four, which is closer to how a
+    // real street of the same era and material actually reads than
+    // per-building noise would be. Multiplicative so a dark base stays
+    // dark; the floor keeps a channel from collapsing to black.
+    auto tint = [&hash01](std::array<float, 3> base, std::uint32_t k, float amt) {
+        std::array<float, 3> out{};
+        for (int c = 0; c < 3; ++c) {
+            const float j = hash01(int(k), c, 91) - 0.5f;
+            out[c] = std::clamp(base[c] * (1.0f + amt * j), 0.04f, 1.0f);
+        }
+        return out;
+    };
+
+    // A district: a lattice of towers whose heights come from the hash
+    // above, tapered toward the rim so the skyline has a profile instead
+    // of a wall. Batched four to a cluster; returns the next free id.
+    auto emit_district = [&](std::uint32_t base_id,
+                             int nx, int nz, float pitch,
+                             float ox, float oz,
+                             float h_min, float h_max, float foot,
+                             std::uint32_t material,
+                             std::array<float, 3> albedo, float roughness,
+                             int salt, const char* what) {
+        std::vector<Box> batch;
+        std::uint32_t id = base_id;
+        const float inv_r = 1.0f / std::sqrt(float(nx * nx + nz * nz) + 1.0f);
+        for (int ix = -nx; ix <= nx; ++ix) {
+            for (int iz = -nz; iz <= nz; ++iz) {
+                // Radial taper: full height at the core, h_min at the rim.
+                const float r     = std::sqrt(float(ix * ix + iz * iz)) * inv_r;
+                const float taper = std::max(0.0f, 1.0f - r * r);
+                const float t     = hash01(ix, iz, salt);
+                const float h     = h_min + (h_max - h_min) * taper * (0.35f + 0.65f * t);
+                const float fx    = foot * (0.72f + 0.42f * hash01(ix, iz, salt + 1));
+                const float fz    = foot * (0.72f + 0.42f * hash01(ix, iz, salt + 2));
+                // Jitter each plot inside its block so the result reads as
+                // a street plan rather than as graph paper.
+                const float jx = (hash01(ix, iz, salt + 3) - 0.5f) * pitch * 0.20f;
+                const float jz = (hash01(ix, iz, salt + 4) - 0.5f) * pitch * 0.20f;
+                batch.push_back(Box{fx, 0.5f * h, fz,
+                                    ox + float(ix) * pitch + jx,
+                                    kLandTop + 0.5f * h,
+                                    oz + float(iz) * pitch + jz});
+                if (int(batch.size()) == kBoxesPerCluster) {
+                    const float rj = roughness * (0.7f + 0.6f * hash01(int(id), 7, salt));
+                    add_box_batch(id, batch, material, tint(albedo, id, 0.34f),
+                                  rj, what);
+                    ++id;
+                    batch.clear();
+                }
+            }
+        }
+        add_box_batch(id, batch, material, tint(albedo, id, 0.34f), roughness, what);
+        ++id;
+        return id;
+    };
+
+    // A hero tower stands ON the land, so the box centre is the land top
+    // plus the half-height. Spelling that out keeps the call sites below
+    // quoting a BUILDING HEIGHT rather than a centre.
+
+    auto tower_h = [&](std::uint32_t id, float hx, float height, float hz,
+                       float ox, float oz, std::uint32_t material,
+                       std::array<float, 3> albedo, float roughness,
+                       const char* what) {
+        const float half_h = 0.5f * height;
+        add_shape(id, R::SDF_SHAPE_BOX, {hx, half_h, hz, 0.0f},
+                  {ox, kLandTop + half_h, oz}, material, albedo, roughness, what);
+    };
+
+    // --- land -------------------------------------------------------------
+    // The city peninsula, and across a 600 m channel to the west the
+    // headland the bridge lands on. The channel is what makes the bridge a
+    // CROSSING: an earlier pass ran the span parallel to the shore, which
+    // reads as a pier.
+    //
+    // The peninsula is sized to the BUILT AREA, not generously around it.
+    // A slab much larger than its city reads as a table with models on it,
+    // which is exactly how the first pass looked.
+    //
+    // Both slabs run far below the waterline so no camera near the surface
+    // can catch an underside; only the top 4 m stands above water.
+    add_shape(10, R::SDF_SHAPE_BOX, {800.0f, 400.0f, 740.0f, 0.0f},
+              {250.0f, kLandTop - 400.0f, 0.0f},
+              kLambert, {0.46f, 0.43f, 0.37f}, 0.0f, "peninsula");
+    add_shape(11, R::SDF_SHAPE_BOX, {600.0f, 400.0f, 1100.0f, 0.0f},
+              {-1650.0f, kLandTop + 30.0f - 400.0f, 0.0f},
+              kLambert, {0.38f, 0.38f, 0.31f}, 0.0f, "west headland");
+
+    // --- districts --------------------------------------------------------
+    // Ids are allocated in RANGES, not one per district: a district expands
+    // into as many clusters as it needs (ceil(towers / 4)), and each
+    // emit_district returns the next free id.
+    //
+    // The core is glass -- Metal at low roughness, which is what lets the
+    // low sun rake across it -- and the outer districts are painted
+    // concrete on the Lambert path so the eye has somewhere to rest.
+    std::uint32_t id = 100;
+    id = emit_district(id, 4, 4, 66.0f,  250.0f,    0.0f,  46.0f, 330.0f, 16.0f,
+                       kMetal,   {0.40f, 0.50f, 0.58f}, 0.09f, 11, "downtown core");
+    id = emit_district(id, 4, 2, 70.0f,  250.0f, -480.0f,  20.0f, 110.0f, 14.0f,
+                       kLambert, {0.60f, 0.54f, 0.46f}, 0.0f,  23, "north blocks");
+    id = emit_district(id, 4, 2, 70.0f,  250.0f,  470.0f,  20.0f, 120.0f, 14.0f,
+                       kLambert, {0.57f, 0.52f, 0.46f}, 0.0f,  29, "south blocks");
+    id = emit_district(id, 2, 3, 66.0f,  800.0f,   60.0f,  18.0f, 140.0f, 13.0f,
+                       kMetal,   {0.50f, 0.47f, 0.44f}, 0.24f, 53, "east waterfront");
+    id = emit_district(id, 3, 4, 68.0f, -260.0f,  150.0f,  16.0f, 104.0f, 12.0f,
+                       kLambert, {0.55f, 0.50f, 0.45f}, 0.0f,  37, "bridge approach");
+    id = emit_district(id, 5, 1, 62.0f,  250.0f,  690.0f,  14.0f,  46.0f, 13.0f,
+                       kLambert, {0.58f, 0.53f, 0.47f}, 0.0f,  67, "south waterfront");
+    id = emit_district(id, 2, 3, 74.0f, -1650.0f,  120.0f,  12.0f,  54.0f, 12.0f,
+                       kLambert, {0.48f, 0.46f, 0.40f}, 0.0f,  71, "headland town");
+    LOG_INFO("[city] districts occupy cluster ids 100..{}", id - 1u);
+
+    // --- hero towers ------------------------------------------------------
+    // Individually placed, and taller than anything the district hash will
+    // produce, so the skyline has a silhouette rather than a flat top.
+    tower_h(30, 22.0f, 412.0f, 22.0f,  208.0f,  -66.0f,
+            kMetal, {0.50f, 0.56f, 0.62f}, 0.06f, "hero: bay tower");
+    tower_h(31, 13.0f, 336.0f, 13.0f,  324.0f, -128.0f,
+            kMetal, {0.62f, 0.56f, 0.46f}, 0.14f, "hero: spire");
+    tower_h(32, 18.0f, 288.0f, 18.0f,  152.0f,   84.0f,
+            kMetal, {0.38f, 0.46f, 0.55f}, 0.08f, "hero: glass slab");
+    add_shape(33, R::SDF_SHAPE_ROUNDED_BOX, {20.0f, 128.0f, 20.0f, 8.0f},
+              {298.0f, kLandTop + 128.0f, 118.0f},
+              kMetal, {0.56f, 0.52f, 0.47f}, 0.18f, "hero: rounded tower");
+
+    // --- the bridge -------------------------------------------------------
+    // A suspension span across the channel, running along X from the city's
+    // west shore (x = -1000) to the headland (x = -2000). International
+    // orange -- the one saturated thing in frame, and the reason the eye
+    // has somewhere to land between the water and the skyline.
+    //
+    // No main catenary: SdfNode carries a centre but no rotation, so a
+    // sloped cable is not expressible as a leaf and a curved one is not
+    // expressible at all. The vertical hangers ARE, and at this distance
+    // they are what actually reads as "suspension".
+    constexpr float kBridgeZ    =  120.0f;   // channel crossing line
+    constexpr float kBridgeMidX =  -800.0f;
+    constexpr float kDeckY      = 66.0f;
+    constexpr float kTowerTop   = 226.0f;
+    const std::array<float, 3> kOrange{0.74f, 0.22f, 0.08f};
+
+    add_shape(40, R::SDF_SHAPE_BOX, {10.0f, 0.5f * kTowerTop, 10.0f, 0.0f},
+              {kBridgeMidX - 175.0f, 0.5f * kTowerTop, kBridgeZ},
+              kMetal, kOrange, 0.34f, "bridge tower W");
+    add_shape(41, R::SDF_SHAPE_BOX, {10.0f, 0.5f * kTowerTop, 10.0f, 0.0f},
+              {kBridgeMidX + 175.0f, 0.5f * kTowerTop, kBridgeZ},
+              kMetal, kOrange, 0.34f, "bridge tower E");
+    add_shape(42, R::SDF_SHAPE_BOX, {300.0f, 2.4f, 13.0f, 0.0f},
+              {kBridgeMidX, kDeckY, kBridgeZ},
+              kMetal, kOrange, 0.40f, "bridge deck");
+    {
+        // Hangers, blocked by the same gate as the districts: a repeated
+        // capsule would be skipped, so these are explicit boxes unioned
+        // four to a cluster. Sixteen across the span reads as suspension
+        // and costs four clusters, where a 41-hanger run would cost eleven.
+        std::vector<Box> hangers;
+        std::uint32_t hid = 43;
+        for (int i = -8; i <= 8; ++i) {
+            if (i == 0) continue;                     // clear of mid-span
+            hangers.push_back(Box{0.55f, 21.0f, 0.55f,
+                                  kBridgeMidX + float(i) * 17.0f,
+                                  kDeckY + 21.0f, kBridgeZ});
+            if (hangers.size() == 4u) {
+                add_box_batch(hid++, hangers, kMetal, kOrange, 0.45f, "bridge hangers");
+                hangers.clear();
+            }
+        }
+        add_box_batch(hid, hangers, kMetal, kOrange, 0.45f, "bridge hangers");
+    }
+
+    // --- water ------------------------------------------------------------
+    // The one analytic primitive in the scene. AnalyticPrim::Water is a
+    // shaded plane -- normal-mapped waves, Beer's-law absorption, Schlick
+    // Fresnel, Snell refraction -- and it is a PLANE, so it runs to the
+    // horizon without costing a cluster or an AABB.
+    {
+        AnalyticPrim w{};
+        w.type       = AnalyticPrim::Plane;
+        w.material   = AnalyticPrim::Water;
+        w.pos_or_n[0] = 0.0; w.pos_or_n[1] = 1.0; w.pos_or_n[2] = 0.0;
+        w.prev_pos_or_n[0] = 0.0; w.prev_pos_or_n[1] = 1.0; w.prev_pos_or_n[2] = 0.0;
+        w.radius_or_d = 0.0;                       // plane through y = 0
+        w.albedo[0] = 0.02f; w.albedo[1] = 0.06f; w.albedo[2] = 0.09f;
+        w.roughness = 0.0f;
+        w.ior       = 1.333f;                      // sea water
+        primitives_[1] = w;
+    }
+
+    primitives_dirty_ = true;
+    sdf_prims_dirty_  = true;
+    accum_dirty_      = true;
+    LOG_INFO("[city] seeded {} SDF cluster(s) + {} analytic prim(s)",
+             sdf_prims_.size(), primitives_.size());
 }
 
 void Engine::ReloadEnvMap(const std::string& path) {
