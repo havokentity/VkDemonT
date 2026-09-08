@@ -799,6 +799,26 @@ private:
     // ground-plane scene (Lambert red, gold metal, glass dielectric).
     void SeedDefaultPrimitives();
 
+    // Seed the `city` scene: a bay-side skyline on the SDF path plus one
+    // analytic Water plane, sized in metres and lit for golden hour.
+    //
+    // WHY SDF AND NOT MESHES. The mesh path carries exactly one material
+    // for the whole bake -- CsgScene::BakedMesh is positions/normals/
+    // indices with no per-triangle material lane, and LoadGltf returns a
+    // single primitive with a single base colour. A city built there is
+    // one flat colour. SdfPrim carries material + albedo + roughness +
+    // ior PER CLUSTER, so the skyline gets glass, concrete and painted
+    // steel out of the box.
+    //
+    // WHY SO FEW CLUSTERS. PathTrace.slang LINEAR-SCANS the cluster list
+    // for every ray at every bounce -- there is no BVH over SDF clusters
+    // the way there is over analytic prims. Cost is therefore O(clusters)
+    // per ray, so the scene is built from ~20 clusters, not ~500
+    // buildings: SDF_OP_REPEAT_LIMITED turns one box leaf into a whole
+    // block grid for the price of one cluster, which is the entire
+    // reason a raymarched city is affordable here at all.
+    void SeedCityScene();
+
     // Command-line args captured from main() via SetCommandLineArgs.
     // argv_ is a borrowed pointer; argc_ is 0 if SetCommandLineArgs
     // never ran (e.g. unit tests instantiating Engine directly).
