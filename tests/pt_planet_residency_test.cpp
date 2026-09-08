@@ -241,6 +241,14 @@ struct FlightResult {
     // Worst case: the largest number of consecutive uncovered climb ticks.
     int         climb_uncovered_run   = 0;
     bool        climb_quiescent       = false;
+    // Orbit-return leg. `descent_uncovered` counts ticks on the way back
+    // DOWN where the published cover did not cover the selector's own
+    // desired set -- the ground the user is looking at while it is open.
+    int         descent_uncovered     = 0;
+    int         descent_uncovered_run = 0;
+    int         descent_ticks_run     = 0;
+    std::size_t orbit_desired         = 0;
+    std::size_t orbit_published       = 0;
 };
 
 struct FlightPlan {
@@ -307,6 +315,34 @@ struct FlightPlan {
     // (which it cannot, so the substitution is refused and the ground goes
     // dark).
     double zoom_top_m           = kAltStart_m;
+    // --- FLYING OUT PAST THE ATMOSPHERE AND BACK IN SOMEWHERE ELSE -----
+    //
+    // Not the teleport case. The camera flies the whole way: up through
+    // the altitude where the from-orbit cull (#326) starts dropping every
+    // chunk, laterally at that altitude -- which covers enormous ground,
+    // because a degree of longitude is a degree whatever your height --
+    // and back down over terrain the streamer has never measured.
+    //
+    // ENABLING THE CULL IS THE POINT. Every other case in this file
+    // leaves LodParams::backstop_radius_m at 0, which makes
+    // BackstopGapSubPixel return false on its first line, so the cull has
+    // never run in a test. The ENGINE sets it unconditionally while
+    // terrain streams (Engine.cpp, lod.backstop_radius_m =
+    // kBackstopRadius), so the shipping selector and the tested selector
+    // have been two different functions above ~1000 km.
+    bool   orbit_return        = false;
+    double orbit_alt_m         = 2.0e6;   // above where the cull bites
+    int    orbit_climb_ticks   = 80;
+    int    orbit_cross_ticks   = 80;
+    int    orbit_descent_ticks = 160;
+    // Longitude travelled per tick while out at altitude. 0.0025 rad over
+    // 80 ticks is ~0.2 rad, about 1300 km of ground -- far enough that
+    // nothing on arrival was ever measured.
+    double orbit_lon_step      = 0.0025;
+    // Bake worker threads. The engine now auto-selects half the machine's
+    // hardware threads; this file has always hardcoded 4, which is what
+    // the engine used to default to.
+    int    worker_count        = 4;
 };
 
 // A hidden GLFW window, purely so the Vulkan device has a surface to
@@ -371,7 +407,7 @@ FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
     cfg.dem_path.clear();
     cfg.site_lat_rad   = 27.9881 * 3.14159265358979323846 / 180.0;   // Everest
     cfg.site_lon_rad   = 86.9250 * 3.14159265358979323846 / 180.0;
-    cfg.worker_count   = 4;
+    cfg.worker_count   = plan.worker_count;
     cfg.blas_budget_ms = plan.blas_budget_ms;
     cfg.lod.tau_px       = plan.tau_px;
     cfg.lod.hysteresis   = 1.4;
@@ -379,6 +415,13 @@ FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
     cfg.lod.max_level    = plan.max_level;
     cfg.lod.chunk_budget = plan.chunk_budget;
     cfg.lod.cone_spread  = kConeSpread;
+    if (plan.orbit_return) {
+        // What the engine passes while terrain streams. Without these two
+        // the from-orbit cull is a no-op -- BackstopGapSubPixel returns
+        // false on its first line when backstop_radius_m is 0 -- and the
+        // whole altitude band this case exists to fly is untested.
+        cfg.lod.backstop_radius_m = pt::planet::kBackstopRadius;
+    }
     cfg.lod.freeze       = false;
 
     pt::engine::PlanetTerrain terrain;
@@ -617,6 +660,51 @@ FlightResult FlyThePacedPath(pt::rhi::BackendType backend,
         }
         in_climb = false;
         fr.last_climb_desired = terrain.Stats().desired;
+    }
+    if (plan.orbit_return) {
+        // The planet centre has to travel with the params: the cull
+        // measures the camera's GEOCENTRIC distance, and a centre left at
+        // the origin would put a 2000 km camera 6371 km from where it
+        // really is and never engage.
+        cfg.lod.planet_center_w = site.CenterWorld();
+        lon_step = 0.0;
+        // Up. Smoothly, because the selector has hysteresis and a jump
+        // would exercise a different path than flying does.
+        for (int i = 0; i < plan.orbit_climb_ticks; ++i) {
+            const double t = (plan.orbit_climb_ticks > 1)
+                ? double(i) / (plan.orbit_climb_ticks - 1) : 1.0;
+            tick(kAltBottom_m + (plan.orbit_alt_m - kAltBottom_m) * t);
+        }
+        // Across, at altitude. This is the part a teleport does not model:
+        // the camera is moving the whole time and the selector is tracking
+        // it, so whatever the cull has done to the desired set is done
+        // gradually and repeatedly rather than once.
+        lon_step = plan.orbit_lon_step;
+        for (int i = 0; i < plan.orbit_cross_ticks; ++i) tick(plan.orbit_alt_m);
+        fr.orbit_desired   = terrain.Stats().desired;
+        fr.orbit_published = terrain.Stats().published;
+        // Back down, over ground nothing has measured. Coverage is
+        // asserted on every tick of the way in -- this is the stretch the
+        // user is looking at when they say the terrain does not load.
+        lon_step = 0.0;
+        int run = 0;
+        for (int i = 0; i < plan.orbit_descent_ticks; ++i) {
+            const double t = (plan.orbit_descent_ticks > 1)
+                ? double(i) / (plan.orbit_descent_ticks - 1) : 1.0;
+            tick(plan.orbit_alt_m + (kAltBottom_m - plan.orbit_alt_m) * t);
+            fr.descent_ticks_run = i + 1;
+            const auto& st = terrain.Stats();
+            // "Uncovered" is the selector wanting ground the published
+            // cover does not stand on. published < desired is not enough
+            // on its own -- a coarse stand-in legitimately covers many
+            // desired leaves with one chunk -- so the streamer's own
+            // completeness flag is what is read here.
+            const bool open = (st.published == 0 && st.desired > 0);
+            if (open) { ++fr.descent_uncovered; ++run;
+                        fr.descent_uncovered_run =
+                            std::max(fr.descent_uncovered_run, run); }
+            else run = 0;
+        }
     }
     if (plan.teleport) {
         // A quarter of the way round the planet in one frame, at the SAME
@@ -1201,4 +1289,66 @@ int main(int argc, char** argv) {
     std::printf("  overlapping covers       %d\n", g_flight.overlap_failures);
     std::printf("  unbalanced covers        %d\n", g_flight.imbalance_failures);
     return res;
+}
+
+TEST_CASE("paced residency: flying out past the atmosphere and back in elsewhere") {
+    // THE BUG. "Terrain doesn't load in a different place if I go up above
+    // the atmosphere and come back in."
+    //
+    // Not a teleport -- the camera flies the whole way. Up through the
+    // altitude where the from-orbit cull starts dropping chunks, laterally
+    // at that altitude (a degree of longitude is a degree whatever your
+    // height, so this covers ~1300 km of ground), then back down over
+    // terrain nothing has ever measured.
+    //
+    // WHY NOTHING IN THIS FILE COULD SEE IT. Every other case leaves
+    // LodParams::backstop_radius_m at 0, and that is the first thing
+    // BackstopGapSubPixel tests -- so the cull returns false immediately and
+    // has never executed in a test. The engine sets it unconditionally while
+    // terrain streams. Above roughly 1000 km the shipping selector and the
+    // tested selector have therefore been two different functions, and this
+    // case is the first to fly the band where they differ.
+    FlightPlan plan;
+    plan.orbit_return   = true;
+    plan.settle_first   = true;    // start from a full arena, as a session does
+    plan.descent_ticks  = 0;
+    plan.climb_ticks    = 0;
+    plan.chunk_budget   = 512;
+    plan.max_level      = 12;
+    plan.tau_px         = 1.5;
+    plan.blas_budget_ms = 2.0;     // the shipping interactive default
+    plan.frame_sleep_ms = 4;
+    plan.recover_until_converged = true;
+    // 16, matching what the engine now auto-selects on this machine.
+    // Measured here at 436 recovery ticks against 378 with 4, so bake
+    // throughput is NOT what this case is bound by -- worth stating,
+    // because it is the obvious thing to reach for and it is wrong.
+    plan.worker_count   = 16;
+
+    const FlightResult f = FlyThePacedPath(pt::rhi::BackendType::Vulkan, plan);
+    if (!f.ran) {
+        MESSAGE("SKIPPED: " << f.skip_reason);
+        return;
+    }
+    MESSAGE("at altitude: desired=" << f.orbit_desired
+            << " published=" << f.orbit_published);
+    MESSAGE("descent: " << f.descent_ticks_run << " ticks, "
+            << f.descent_uncovered << " with nothing published (longest run "
+            << f.descent_uncovered_run << ")");
+    MESSAGE("after: resident=" << f.final_resident
+            << " desired=" << f.final_desired
+            << " converged=" << (f.converged ? 1 : 0)
+            << " recovery_ticks=" << f.recovery_ticks
+            << " quiescent=" << (f.ended_quiescent ? 1 : 0));
+
+    // THE CLAIM. Coming back down, the ground is never left entirely
+    // undrawn: the backstop is an analytic sphere the shader always has, but
+    // the terrain cover itself must not collapse to nothing while the
+    // selector still wants a thousand chunks.
+    CHECK(f.descent_uncovered_run < 30);
+    // And the streamer must CATCH UP rather than wedge. `ended_quiescent`
+    // means it ran out of work while still behind, which is what stuck
+    // looks like when it is not merely slow.
+    CHECK_FALSE(f.ended_quiescent);
+    CHECK(f.converged);
 }

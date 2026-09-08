@@ -97,7 +97,7 @@ bool PlanetTerrain::Init(pt::rhi::Device* device, const TerrainConfig& cfg) {
     // was: Select() is handed the same number it was handed before
     // retention existed.
     leaf_budget_  = static_cast<std::uint32_t>(
-        std::clamp(cfg_.lod.chunk_budget, 8, 8192));
+        std::clamp(cfg_.lod.chunk_budget, 8, pt::planet::kMaxLeafBudget));
     chunk_budget_ = static_cast<std::uint32_t>(
         pt::planet::WholeCutSlots(static_cast<std::size_t>(leaf_budget_)));
     const std::size_t vert_bytes =
@@ -134,11 +134,13 @@ bool PlanetTerrain::Init(pt::rhi::Device* device, const TerrainConfig& cfg) {
     baker_.Start(std::clamp(cfg_.worker_count, 1, 16));
     baker_.SetSources(&field_, site_);
 
-    LOG_INFO("planet: terrain online -- site {:.4f}N {:.4f}E, budget {} leaves "
+    LOG_INFO("planet: terrain online -- site {:.4f}N {:.4f}E, GPU {} MB, {} workers, budget {} leaves "
              "+ {} retained ancestors = {} arena slots "
              "({:.0f} MB vertex arena + {:.1f} MB index arena), levels {}..{}, "
              "tau {:.2f} px",
              cfg_.site_lat_rad * 180.0 / kPi, cfg_.site_lon_rad * 180.0 / kPi,
+             device_->DeviceLocalMemoryBytes() / (1024u * 1024u),
+             std::clamp(cfg_.worker_count, 1, 16),
              leaf_budget_, chunk_budget_ - leaf_budget_,
              chunk_budget_, static_cast<double>(vert_bytes) / (1024.0 * 1024.0),
              static_cast<double>(index_arena_.ByteSize()) / (1024.0 * 1024.0),
@@ -186,7 +188,33 @@ bool PlanetTerrain::BuildChunkBlas(Resident& r) {
     // P0 (#254) added the field for this.
     d.flags            = pt::rhi::AccelBuildFlags::PreferFastBuild;
     d.debug_name       = "terrain_chunk";
-    const auto blas = device_->CreateBLAS(d);
+    // DEFERRED, not blocking. CreateBLAS submits and then waits on a
+    // fence, and that submission queues behind whatever the frame has
+    // already handed the GPU -- measured at 0.077 ms on an idle 640x400
+    // fixture and 7.6 ms in a real session with the path tracer, DLSS and
+    // a denoiser running. Against blas_budget_ms that admits exactly ONE
+    // chunk per frame, which is what left a return from orbit with
+    // hundreds of chunks baked, slotted and unbuilt while the ground
+    // stayed open for as many frames: blas_builds and tlas_updates came
+    // back from a real session at 1426 and 1427, a ratio of one build per
+    // dirty frame.
+    //
+    // The chunk is resident the moment this returns and PUBLISHED only
+    // once the build has landed -- ChooseCover filters on AccelReady.
+    // Residency and publication were already separate here (see
+    // TerrainResidency.h), so "submitted but not yet signalled" is a state
+    // the design already had room for rather than a new one.
+    //
+    // A SETTLE STILL BLOCKS, and that is a correctness requirement rather
+    // than caution. Settle() runs to a fixed point and the capture fires
+    // the moment it reports converged -- and `converged` is a statement
+    // about RESIDENCY, which a deferred chunk satisfies while its build is
+    // still in flight. The capture would then trace structures the GPU has
+    // not finished writing, which is undefined rather than merely early.
+    // Blocking there also keeps every golden bit-identical: the settling
+    // path executes exactly the calls it executed before this change.
+    const auto blas = settling_ ? device_->CreateBLAS(d)
+                                : device_->CreateBLASDeferred(d);
     if (blas.id == 0) return false;
     r.blas = blas;
     ++stats_.blas_builds;
@@ -325,8 +353,22 @@ void PlanetTerrain::RetireUncovered(const std::set<ChunkKey>& desired) {
 
 void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
                                 const pt::planet::LodParams& lod) {
+    // The cover may only contain chunks the TLAS can legally reference. A
+    // deferred BLAS build is submitted but not necessarily finished, and
+    // tracing a structure that is still building is undefined behaviour,
+    // not a glitchy frame. So readiness gates PUBLICATION, not residency:
+    // the chunk keeps its arena slot and its vertex data throughout and
+    // joins the cover on the first frame its fence has signalled.
+    //
+    // Handing an unready chunk to ComputeResidencyCover would be wrong in
+    // a second, quieter way as well: the walk would count it as covering
+    // its ground and retire the coarse ancestor standing in for it, which
+    // is precisely the hole this policy exists to prevent.
     std::set<ChunkKey> res_keys;
-    for (const auto& [k, r] : resident_) { (void)r; res_keys.insert(k); }
+    for (const auto& [k, r] : resident_) {
+        if (!device_->AccelReady(r.blas)) continue;
+        res_keys.insert(k);
+    }
 
     auto cover = pt::planet::ComputeResidencyCover(desired, res_keys);
 
@@ -503,6 +545,10 @@ void PlanetTerrain::ChooseCover(const std::set<ChunkKey>& desired,
 bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
                            const glm::dvec3& anchor) {
     if (!Ready()) return false;
+    // Reclaim the fences and transient buffers of builds that have landed,
+    // which is also what lets their chunks become publishable. Never
+    // blocks -- it is a vkGetFenceStatus poll per build in flight.
+    device_->PollAccelBuilds();
     FlushRetired(false);
 
     // --- 1. Drain finished bakes FIRST ------------------------------------
@@ -514,14 +560,30 @@ bool PlanetTerrain::Update(const pt::planet::LodParams& lod,
     // 1074-chunk sets that way, which a chunk count nearly hid and the
     // residency digest made obvious.
     std::vector<TerrainChunkData> fresh;
-    // 64 per frame paces an interactive session, where a thousand-chunk
-    // drain in one frame would be a visible hitch. A settling round drains
-    // EVERYTHING instead, and that is a determinism requirement rather than
-    // a throughput one: a 64-chunk prefix of the pool's completion order is
-    // a wall-clock quantity, and every decision downstream of it -- which
-    // chunks become resident this round, and therefore which arena slot
-    // each one gets -- inherits that. See Settle() in the header.
-    baker_.Drain(fresh, settling_ ? std::numeric_limits<int>::max() : 64);
+    // DRAIN THE WHOLE ROUND, not a fixed prefix of it.
+    //
+    // This was 64, chosen so a thousand-chunk drain could not hitch an
+    // interactive frame. What a drain actually costs is a map insert and
+    // a couple of vector moves per chunk -- the expensive parts, the bake
+    // and the acceleration-structure build, are paced separately and are
+    // not reached from here. So the cap was not bounding the cost it was
+    // named for; it was bounding how fast a completed bake round could
+    // reach the selector, and the selector descends ONE LEVEL per round.
+    // Arriving over ground nothing has measured therefore paid the cap
+    // once per level. Measured on the orbit-return case: 479 recovery
+    // ticks at 64, 378 at 1024, with everything else held.
+    //
+    // Sized against the arena rather than picked: a round can never
+    // usefully deliver more than the arena can hold, and one that big is
+    // the cold-start round, which is not an interactive frame anyway.
+    //
+    // A settling round still drains EVERYTHING, and that is a determinism
+    // requirement rather than a throughput one: any prefix of the pool's
+    // completion order is a wall-clock quantity, and every decision
+    // downstream of it -- which chunks become resident this round, and so
+    // which arena slot each one gets -- would inherit that. See Settle().
+    const int drain_cap = static_cast<int>(chunk_budget_);
+    baker_.Drain(fresh, settling_ ? std::numeric_limits<int>::max() : drain_cap);
     for (auto& d : fresh) {
         tree_.NoteChunk(d);
         baked_[d.key] = std::move(d);

@@ -50,3 +50,11 @@ captures/
 __pycache__/
 *.pyc
 golden-result.json
+
+# Locally baked high-resolution planet grids (tools/fetch_planet_dem.py,
+# tools/fetch_planet_albedo.py). The committed earth_lite pair is the
+# 2048x1024 derivative a source repository can carry; a finer bake is
+# 134 MB at --width 8192 and is not committable. The engine prefers one
+# of these when it finds it -- see the DEM preference in Engine.cpp.
+assets/planet/earth_8k.*
+assets/planet/earth_hi.*

@@ -1614,11 +1614,22 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     const bool enable_sucf        = has_sucf && feat_sucf;
     // VK_KHR_pipeline_library has no feature struct; presence is enough.
     const bool enable_pipeline_library = has_pipeline_library;
+    // RTX Mega Geometry. Step 0 detected and logged this and stopped
+    // there; enabling it is what lets the cluster build entry points
+    // resolve. Gated on the feature bit as well as the extension: a
+    // driver may advertise the extension and report the feature false.
+    const bool enable_clas = has_clas && feat_clas;
+    clas_enabled_   = enable_clas;
+    clas_max_verts_ = clas_max_verts;
+    clas_max_tris_  = clas_max_tris;
 #if defined(VK_KHR_ray_tracing_pipeline)
     if (enable_rt_pipeline) dexts.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
 #endif
 #if defined(VK_KHR_pipeline_library)
     if (enable_pipeline_library) dexts.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    if (enable_clas) dexts.push_back(VK_NV_CLUSTER_ACCELERATION_STRUCTURE_EXTENSION_NAME);
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     if (enable_rt_maint1) dexts.push_back(VK_KHR_RAY_TRACING_MAINTENANCE_1_EXTENSION_NAME);
@@ -1786,6 +1797,12 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtp_feat{};
     rtp_feat.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rtp_feat.rayTracingPipeline = VK_TRUE;
+#if defined(VK_NV_cluster_acceleration_structure)
+    VkPhysicalDeviceClusterAccelerationStructureFeaturesNV clas_feat{};
+    clas_feat.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CLUSTER_ACCELERATION_STRUCTURE_FEATURES_NV;
+    clas_feat.clusterAccelerationStructure = VK_TRUE;
+#endif
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR rtm1_feat{};
@@ -1831,6 +1848,9 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
     }
 #if defined(VK_KHR_ray_tracing_pipeline)
     if (enable_rt_pipeline) chain(&rtp_feat, reinterpret_cast<void**>(&rtp_feat.pNext));
+#endif
+#if defined(VK_NV_cluster_acceleration_structure)
+    if (enable_clas) chain(&clas_feat, reinterpret_cast<void**>(&clas_feat.pNext));
 #endif
 #if defined(VK_KHR_ray_tracing_maintenance1)
     if (enable_rt_maint1) chain(&rtm1_feat, reinterpret_cast<void**>(&rtm1_feat.pNext));
@@ -1929,6 +1949,37 @@ VulkanDevice::VulkanDevice(const NativeWindowHandle& nw) {
             vkGetDeviceProcAddr(device_, "vkDestroyAccelerationStructureKHR"));
         pfn_CmdBuildAccelStructs_ = reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
             vkGetDeviceProcAddr(device_, "vkCmdBuildAccelerationStructuresKHR"));
+#if defined(VK_NV_cluster_acceleration_structure)
+        // RTX Mega Geometry. Two entry points carry the whole feature:
+        // one size query and one indirect build that can produce MANY
+        // cluster structures from a single command. That "many per
+        // command" is the entire reason it exists here -- the current
+        // path is one vkCmdBuildAccelerationStructuresKHR, one submit
+        // and one fence PER CHUNK.
+        if (clas_enabled_) {
+            pfn_GetClusterAccelSizes_ = reinterpret_cast<
+                PFN_vkGetClusterAccelerationStructureBuildSizesNV>(
+                vkGetDeviceProcAddr(
+                    device_,
+                    "vkGetClusterAccelerationStructureBuildSizesNV"));
+            pfn_CmdBuildClusterAccel_ = reinterpret_cast<
+                PFN_vkCmdBuildClusterAccelerationStructureIndirectNV>(
+                vkGetDeviceProcAddr(
+                    device_,
+                    "vkCmdBuildClusterAccelerationStructureIndirectNV"));
+            if (pfn_GetClusterAccelSizes_ == nullptr ||
+                pfn_CmdBuildClusterAccel_ == nullptr) {
+                LOG_WARN("Vulkan: VK_NV_cluster_acceleration_structure was "
+                         "enabled but its entry points did not resolve -- "
+                         "cluster builds stay off.");
+                clas_enabled_ = false;
+            } else {
+                LOG_INFO("Vulkan: cluster acceleration structures ready "
+                         "(max {} verts / {} tris per cluster)",
+                         clas_max_verts_, clas_max_tris_);
+            }
+        }
+#endif
         pfn_GetAccelStructAddr_ = reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
             vkGetDeviceProcAddr(device_, "vkGetAccelerationStructureDeviceAddressKHR"));
         if (pfn_CreateAccelStruct_ == nullptr || pfn_CmdBuildAccelStructs_ == nullptr) {
@@ -2798,6 +2849,11 @@ void VulkanDevice::DestroyDevice() {
             if (s) vkDestroySemaphore(device_, s, nullptr);
         }
         sem_render_done_.clear();
+        // Deferred acceleration-structure builds hold a fence and a
+        // command buffer from this pool. Wait them out BEFORE the pool is
+        // destroyed -- freeing a command buffer the GPU is still executing
+        // is undefined, and so is destroying the pool underneath it.
+        DrainPendingAccelBuilds();
         if (cmd_pool_ != VK_NULL_HANDLE) {
             // Null the handle: destroying the pool already frees every
             // command buffer allocated from it, and DestroyAccelEntry
@@ -4279,7 +4335,8 @@ bool VulkanDevice::BuildAccelerationStructure(
     AccelEntry& entry,
     VkAccelerationStructureTypeKHR type,
     VkDeviceSize as_size,
-    VkDeviceSize scratch_size) {
+    VkDeviceSize scratch_size,
+    PendingAccelBuild* defer) {
 
     // 1. Storage buffer for the acceleration structure itself.
     BufferEntry storage{};
@@ -4349,6 +4406,7 @@ bool VulkanDevice::BuildAccelerationStructure(
     si.commandBufferCount = 1;
     si.pCommandBuffers    = &once;
     bool as_build_ok = true;
+    bool deferred     = false;
     {
         const VkResult sr = vkQueueSubmit(graphics_queue_, 1, &si, build_fence);
         if (sr != VK_SUCCESS) {
@@ -4357,6 +4415,17 @@ bool VulkanDevice::BuildAccelerationStructure(
                       "failed: {} ({}). Acceleration-structure build aborted.",
                       static_cast<int>(sr), VkResultToString(sr));
             as_build_ok = false;
+        } else if (defer != nullptr) {
+            // DEFERRED: hand the fence, the command buffer and the scratch
+            // to the caller and return. Nothing here waits, so nothing here
+            // may free what the in-flight build is still reading. The stall
+            // counter is deliberately NOT bumped -- the point of this path is
+            // that it does not stall, and counting it would make
+            // AccelGpuStallCount stop meaning what #254 made it mean.
+            defer->fence   = build_fence;
+            defer->cmd     = once;
+            defer->scratch = scratch;
+            deferred       = true;
         } else {
             // One blocking wait, deliberately kept: CreateBLAS's inputs
             // are engine-owned CPU arrays that must not outlive the
@@ -4375,8 +4444,10 @@ bool VulkanDevice::BuildAccelerationStructure(
             }
         }
     }
-    vkDestroyFence(device_, build_fence, nullptr);
-    vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
+    if (!deferred) {
+        vkDestroyFence(device_, build_fence, nullptr);
+        vkFreeCommandBuffers(device_, cmd_pool_, 1, &once);
+    }
 
     if (!as_build_ok) {
         // Tear down everything this function allocated -- the caller
@@ -4398,7 +4469,11 @@ bool VulkanDevice::BuildAccelerationStructure(
         entry.scratch         = scratch;
         entry.scratch_address = scratch_addr;
         entry.scratch_usable  = scratch_usable;
-    } else {
+        // An updatable structure keeps its scratch anyway, so a deferred
+        // build has nothing extra to hold; drop the duplicate handle so
+        // RetirePendingBuild cannot free a buffer the entry still owns.
+        if (deferred) defer->scratch = BufferEntry{};
+    } else if (!deferred) {
         DestroyBufferImpl(scratch);
     }
     entry.buffer       = storage.buffer;
@@ -4412,7 +4487,8 @@ bool VulkanDevice::BuildAccelerationStructure(
     return true;
 }
 
-AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
+AccelStructHandle VulkanDevice::CreateBLASImpl(const BLASDesc& d,
+                                              PendingAccelBuild* defer) {
     if (!rt_supported_ || d.vertex_count == 0 || d.index_count == 0) return {0};
     PT_ZONE_SCOPED_N("VulkanDevice::CreateBLAS");
     pt::mem::TagScope scope(pt::MemTag::GpuBuffers);
@@ -4472,19 +4548,109 @@ AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
     if (!BuildAccelerationStructure(build_info, &range, entry,
                                     VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
                                     sizes.accelerationStructureSize,
-                                    sizes.buildScratchSize)) {
+                                    sizes.buildScratchSize, defer)) {
         DestroyBufferImpl(vbuf);
         DestroyBufferImpl(ibuf);
         return {0};
     }
-    // BLAS contains its own copy now; AS-input buffers can go.
-    DestroyBufferImpl(vbuf);
-    DestroyBufferImpl(ibuf);
+    // The BLAS has its own copy ONLY once the build has run. On the
+    // blocking path that has already happened, so the AS-input buffers go
+    // now exactly as before. On the deferred path the GPU has not read
+    // them yet -- they move to the pending record and are freed when the
+    // fence signals.
+    if (defer != nullptr) {
+        defer->vbuf = vbuf;
+        defer->ibuf = ibuf;
+    } else {
+        DestroyBufferImpl(vbuf);
+        DestroyBufferImpl(ibuf);
+    }
 
     std::lock_guard lock(resource_mutex_);
     auto id = next_id_++;
     accels_.emplace(id, entry);
     return AccelStructHandle{ id };
+}
+
+AccelStructHandle VulkanDevice::CreateBLAS(const BLASDesc& d) {
+    return CreateBLASImpl(d, nullptr);
+}
+
+AccelStructHandle VulkanDevice::CreateBLASDeferred(const BLASDesc& d) {
+    PendingAccelBuild pending{};
+    const AccelStructHandle h = CreateBLASImpl(d, &pending);
+    if (h.id == 0) {
+        // The impl tore down everything it allocated on failure, and a
+        // failed submit never filled the record -- but a fence created
+        // before the failure would leak, so retire whatever is there.
+        RetirePendingBuild(pending);
+        return h;
+    }
+    if (pending.fence == VK_NULL_HANDLE) {
+        // No fence means the build did not actually defer (the RT path is
+        // off, or a future change made it synchronous). The structure is
+        // already complete, so reporting it ready is correct rather than
+        // optimistic.
+        return h;
+    }
+    pending.handle_id = h.id;
+    pending_builds_.push_back(pending);
+    pending_build_ids_.insert(h.id);
+    return h;
+}
+
+void VulkanDevice::RetirePendingBuild(PendingAccelBuild& p) {
+    if (p.fence != VK_NULL_HANDLE) {
+        vkDestroyFence(device_, p.fence, nullptr);
+        p.fence = VK_NULL_HANDLE;
+    }
+    if (p.cmd != VK_NULL_HANDLE && cmd_pool_ != VK_NULL_HANDLE) {
+        vkFreeCommandBuffers(device_, cmd_pool_, 1, &p.cmd);
+    }
+    p.cmd = VK_NULL_HANDLE;
+    DestroyBufferImpl(p.scratch);
+    DestroyBufferImpl(p.vbuf);
+    DestroyBufferImpl(p.ibuf);
+}
+
+void VulkanDevice::PollAccelBuilds() {
+    if (pending_builds_.empty()) return;
+    // vkGetFenceStatus never blocks, which is the entire point: this runs
+    // every frame and must cost nothing when the answer is "not yet".
+    std::size_t keep = 0;
+    for (std::size_t i = 0; i < pending_builds_.size(); ++i) {
+        PendingAccelBuild& p = pending_builds_[i];
+        const VkResult st = vkGetFenceStatus(device_, p.fence);
+        if (st == VK_NOT_READY) {
+            if (keep != i) pending_builds_[keep] = p;
+            ++keep;
+            continue;
+        }
+        if (st == VK_ERROR_DEVICE_LOST) device_lost_ = true;
+        // Signalled, or the device is gone and nothing will ever signal.
+        // Either way the resources are ours again.
+        RetirePendingBuild(p);
+        pending_build_ids_.erase(p.handle_id);
+    }
+    pending_builds_.resize(keep);
+}
+
+bool VulkanDevice::AccelReady(AccelStructHandle h) const {
+    if (h.id == 0) return false;
+    return pending_build_ids_.find(h.id) == pending_build_ids_.end();
+}
+
+void VulkanDevice::DrainPendingAccelBuilds() {
+    if (pending_builds_.empty()) return;
+    std::vector<VkFence> fences;
+    fences.reserve(pending_builds_.size());
+    for (const auto& p : pending_builds_) fences.push_back(p.fence);
+    // One wait for all of them rather than a loop of waits.
+    vkWaitForFences(device_, static_cast<std::uint32_t>(fences.size()),
+                    fences.data(), VK_TRUE, UINT64_MAX);
+    for (auto& p : pending_builds_) RetirePendingBuild(p);
+    pending_builds_.clear();
+    pending_build_ids_.clear();
 }
 
 // Translate an RHI instance array into Vulkan instance descriptors.
@@ -4841,6 +5007,20 @@ void VulkanDevice::DestroyAccelStruct(AccelStructHandle h) {
                       "failed: {} ({}). Proceeding with destroy.",
                       static_cast<int>(r), VkResultToString(r));
         }
+    }
+    // Retire any deferred build for THIS handle before the structure goes.
+    // The device-wide wait above has already guaranteed it finished, so
+    // this only reclaims the fence, the command buffer and the transient
+    // input buffers -- and, more importantly, drops the id from the
+    // readiness index. Leaving it there would strand the id forever and
+    // report a future structure that reuses it as permanently not-ready.
+    for (std::size_t k = 0; k < pending_builds_.size(); ++k) {
+        if (pending_builds_[k].handle_id != h.id) continue;
+        RetirePendingBuild(pending_builds_[k]);
+        pending_build_ids_.erase(h.id);
+        pending_builds_.erase(pending_builds_.begin() +
+                              static_cast<std::ptrdiff_t>(k));
+        break;
     }
     DestroyAccelEntry(it->second);
     accels_.erase(it);
@@ -5435,6 +5615,26 @@ void VulkanDevice::Resize(int /*w*/, int /*h*/) {
 
 std::size_t VulkanDevice::CurrentAllocatedBytes() const {
     return 0;
+}
+
+std::size_t VulkanDevice::DeviceLocalMemoryBytes() const {
+    if (phys_device_ == VK_NULL_HANDLE) return 0;
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(phys_device_, &mp);
+    // The LARGEST device-local heap rather than their sum. A discrete
+    // board reports one big DEVICE_LOCAL heap plus, with Resizable BAR,
+    // a small DEVICE_LOCAL|HOST_VISIBLE window carved out of the same
+    // physical memory -- adding those double-counts the BAR aperture.
+    // Taking the maximum names the one heap a streaming arena will
+    // actually live in.
+    VkDeviceSize largest = 0;
+    for (std::uint32_t i = 0; i < mp.memoryHeapCount; ++i) {
+        if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        largest = std::max(largest, mp.memoryHeaps[i].size);
+    }
+    return static_cast<std::size_t>(largest);
 }
 
 // ---- SVGF/NRD denoiser --------------------------------------------------

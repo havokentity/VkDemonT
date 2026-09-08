@@ -277,6 +277,34 @@ std::size_t WholeCutSlots(std::size_t leaf_budget) noexcept {
     return leaf_budget + (leaf_budget - 6) / 3;
 }
 
+int AutoLeafBudget(std::size_t vram_bytes) noexcept {
+    // A board that will not say how much memory it has is treated as a
+    // small one. Guessing high here is the one failure mode that ends in
+    // an allocation failure at start-up rather than in a coarser surface.
+    if (vram_bytes == 0) return kDefaultLeafBudget;
+
+    const double share = static_cast<double>(vram_bytes) * kVramFraction;
+    // Invert slots = leaves + (leaves - 6) / 3, i.e. slots ~= 4/3 leaves.
+    // Solving exactly would be false precision against a per-slot figure
+    // that is itself an estimate, so take the 3/4 and let the clamps
+    // below decide anything close to a boundary.
+    const double slots  = share / static_cast<double>(kSlotBytesEstimate);
+    const double leaves = slots * 0.75;
+
+    if (leaves <= static_cast<double>(kDefaultLeafBudget)) {
+        return kDefaultLeafBudget;
+    }
+    if (leaves >= static_cast<double>(kAutoLeafCeiling)) return kAutoLeafCeiling;
+    // Round DOWN to a power of two. Not for any arithmetic reason -- the
+    // budget is just a count -- but so that two boards of nearly the same
+    // size land on the same number, and a report of "8192 leaves" means
+    // the same thing on both. A budget that drifted with the megabyte
+    // would make every cross-machine comparison a special case.
+    int b = kDefaultLeafBudget;
+    while (b * 2 <= static_cast<int>(leaves) && b < kAutoLeafCeiling) b *= 2;
+    return b;
+}
+
 ResidencyCover ComputeResidencyCover(const std::set<ChunkKey>& desired,
                                      const std::set<ChunkKey>& resident) {
     ResidencyCover r{};

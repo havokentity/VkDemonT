@@ -66,6 +66,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
+#include "renderer/Astronomy.h"
 #include "renderer/Planet/CubedSphere.h"
 #include "renderer/Planet/ElevationField.h"
 #include "renderer/Planet/TerrainChunk.h"
@@ -76,6 +77,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -2830,4 +2832,342 @@ TEST_CASE("the reference-grid memo answers for the field it was filled from") {
     // an all-zero field would satisfy every equality above.
     CHECK(distinct_chunks >= 14u);
     CHECK(engaged_total > 1000u);
+}
+
+// --- The re-request storm (#341) -------------------------------------------
+//
+// PlanetTerrain::Update rebuilds its request list from scratch every frame
+// and asks for everything that is not yet in `baked_`. AsyncChunkBaker::
+// Request then ASSIGNS that list over the queue. Neither side knows what is
+// already in flight or already sitting in `done_`, so a chunk that has been
+// popped by a worker -- or finished and is waiting behind the 64-per-frame
+// drain cap -- is queued again, and again, once per frame until its result
+// finally reaches `baked_`.
+//
+// This case drives the engine's own loop verbatim: drain 64, note what
+// landed, re-ask for the rest, repeat. The claim is the only one that makes
+// the pool's throughput mean anything -- a bake pool asked for N distinct
+// chunks must do N bakes.
+TEST_CASE("a chunk in flight is not queued a second time") {
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    AsyncChunkBaker baker;
+    baker.Start(4);
+    baker.SetSources(&field, site);
+
+    // Enough work that the pool is still busy when the next "frame" asks
+    // again, and more than the 64-per-frame drain cap so results genuinely
+    // queue up behind it -- which is the half of the loop that turns a
+    // duplicate or two into a storm.
+    std::vector<ChunkKey> want;
+    for (int f = 0; f < 6; ++f) {
+        for (std::uint32_t i = 0; i < 8; ++i) {
+            for (std::uint32_t j = 0; j < 8; ++j) {
+                want.push_back(ChunkKey{static_cast<std::uint8_t>(f), 3, i, j});
+            }
+        }
+    }
+    baker.Request(want);
+
+    std::set<ChunkKey> baked;
+    std::size_t delivered = 0;
+    for (int frame = 0; frame < 4000; ++frame) {
+        std::vector<TerrainChunkData> fresh;
+        baker.Drain(fresh, 64);               // Update's own cap
+        delivered += fresh.size();
+        for (const auto& d : fresh) baked.insert(d.key);
+        if (baked.size() == want.size() && baker.Idle()) break;
+        std::vector<ChunkKey> req;            // Update's step 4, verbatim
+        for (const ChunkKey& k : want) {
+            if (baked.find(k) == baked.end()) req.push_back(k);
+        }
+        baker.Request(req);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    baker.Stop();
+
+    REQUIRE(baked.size() == want.size());
+    // THE CLAIM. Every delivered result is a bake that ran; asking for 384
+    // distinct chunks must not cost more than 384 of them.
+    CHECK(delivered == want.size());
+}
+
+// --- Sizing the leaf budget to the board -----------------------------------
+//
+// The budget used to be a flat 1024 whatever the card was, which on a large
+// board coarsened the surface to fit an arena that had used 110 MB of it.
+// AutoLeafBudget spends a fraction of the device-local heap instead. What
+// matters about it is not the exact figure -- the per-slot cost it divides
+// by is an estimate -- but that it is MONOTONE, BOUNDED and never returns
+// something the arena cannot hold.
+TEST_CASE("the automatic leaf budget is bounded and monotone in VRAM") {
+    // A board that will not report its memory must not be guessed upward.
+    CHECK(AutoLeafBudget(0) == kDefaultLeafBudget);
+
+    // Small boards never fall BELOW the historical default: a coarser
+    // planet than the one that shipped is not an improvement, and the
+    // arena at 1024 leaves is 110 MB, which any card running this engine
+    // has.
+    CHECK(AutoLeafBudget(1ull << 20) == kDefaultLeafBudget);        // 1 MB
+    CHECK(AutoLeafBudget(512ull << 20) == kDefaultLeafBudget);      // 512 MB
+    // 2 GB already affords more than the default -- 2048 leaves is a
+    // 2731-slot arena at 481 MB, inside the quarter-heap this spends. The
+    // floor is a floor, not a plateau.
+
+    // Monotone, and capped. Neither is decoration: a non-monotone answer
+    // would make a bigger card render a coarser planet, and an uncapped one
+    // would hand the selector a cut the render thread cannot re-balance in
+    // a frame.
+    std::size_t prev = 0;
+    for (int gb = 1; gb <= 128; ++gb) {
+        const auto vram = static_cast<std::size_t>(gb) * (1ull << 30);
+        const int  b    = AutoLeafBudget(vram);
+        CHECK(b >= kDefaultLeafBudget);
+        CHECK(b <= kAutoLeafCeiling);
+        CHECK(b <= kMaxLeafBudget);
+        CHECK(static_cast<std::size_t>(b) >= prev);
+        prev = static_cast<std::size_t>(b);
+    }
+    // The ceiling is actually reached on a large board -- otherwise the
+    // bound above would be vacuous.
+    CHECK(AutoLeafBudget(128ull << 30) == kAutoLeafCeiling);
+
+    // Powers of two, so two boards of nearly the same size report the same
+    // number and a cross-machine comparison is not a special case.
+    for (int gb = 1; gb <= 64; ++gb) {
+        const int b = AutoLeafBudget(static_cast<std::size_t>(gb) * (1ull << 30));
+        CHECK((b & (b - 1)) == 0);
+    }
+
+    // AND IT MUST FIT. The arena PlanetTerrain::Init allocates is
+    // WholeCutSlots(budget) slots of kSlotBytesEstimate, and the whole
+    // point of dividing by that cost is that the result can be paid for.
+    // Asserted against the fraction the sizing claims to spend, on the
+    // board size where the answer is largest that is not the ceiling.
+    for (int gb = 1; gb <= 128; ++gb) {
+        const auto vram = static_cast<std::size_t>(gb) * (1ull << 30);
+        const int  b    = AutoLeafBudget(vram);
+        if (b == kDefaultLeafBudget || b == kAutoLeafCeiling) continue;
+        const std::size_t bytes =
+            WholeCutSlots(static_cast<std::size_t>(b)) * kSlotBytesEstimate;
+        CHECK(static_cast<double>(bytes) <=
+              static_cast<double>(vram) * kVramFraction);
+    }
+
+    // A 32 GB board -- the target this was sized for -- lands on the
+    // ceiling rather than somewhere arbitrary, so the shipped default is a
+    // stated number and not an emergent one.
+    CHECK(AutoLeafBudget(32ull << 30) == kAutoLeafCeiling);
+}
+
+// --- The sun has to be EARTH-fixed, not site-fixed --------------------------
+//
+// The engine's world frame is anchored at the reference site: +Y is the up
+// at THAT point on the ellipsoid, nowhere else. The astronomical sun used to
+// be built by computing an altitude and azimuth for one observer and feeding
+// them into that frame as though +Y were the observer's up, which is exactly
+// right on a planar scene and nails the lit hemisphere to the reference site
+// on a spherical one -- fly far enough and it is permanently night, with no
+// terminator to reach.
+//
+// RenderFrame now builds the direction in ECEF instead, from the sub-solar
+// point, and rotates it into world with the site's own ecef_to_world. This
+// case pins the property that makes that correct: ONE world direction whose
+// elevation, measured against the local up ANYWHERE on the globe, is the
+// astronomical elevation for that place. If it holds, flying east runs into
+// the sunrise; if it does not, the sun travels with the camera.
+//
+// The construction here is a transcription of the engine's, which is what
+// makes this a pin rather than a proof -- but the equality it asserts is
+// against equatorialToHorizon, an independent path through the same
+// astronomy, so a sign error or a swapped axis in either one fails it.
+TEST_CASE("the astronomical sun direction is earth-fixed rather than site-fixed") {
+    const double kDeg = 3.14159265358979323846 / 180.0;
+
+    // Sites the world frame might be anchored at, including a pole (where
+    // the east vector degenerates) and the antimeridian.
+    const double sites[][2] = {
+        { 27.9881,  86.9250},   // Everest, the engine's default site
+        {  0.0,      0.0    },  // the ECEF origin direction
+        {-33.8688, 151.2093},   // southern hemisphere, far east
+        { 89.9,    -179.9   },  // near the pole, across the antimeridian
+    };
+    // Observers spread over the whole globe, evaluated in EVERY site frame.
+    const double obs[][2] = {
+        { 27.9881,  86.9250},   // the site itself
+        { 27.9881, -93.0750},   // 180 deg away in longitude
+        {-27.9881,  86.9250},   // mirrored across the equator
+        { 51.4779,   0.0    },   // Greenwich
+        {-45.0,    -170.0   },
+        { 78.2,     15.6    },   // high arctic
+        {  0.0,     90.0    },
+    };
+    // Two dates six months apart, and hours across a full rotation, so the
+    // sub-solar point sweeps both hemispheres and every longitude.
+    const double jds[] = {
+        2461218.0,   // 2026-06-21ish, northern solstice
+        2461218.25, 2461218.5, 2461218.75,
+        2461401.0,   // ~six months later, southern solstice
+        2461401.375,
+    };
+
+    int checked = 0;
+    double worst = 0.0;
+    for (const auto& st : sites) {
+        const PlanetSite site = PlanetSite::FromGeodetic(st[0] * kDeg, st[1] * kDeg);
+        for (double jd : jds) {
+            const auto sun_eq = pt::astro::sunPosition(jd);
+            // The engine's construction, transcribed.
+            const double sub_lon = (sun_eq.ra_deg - pt::astro::gmstDegrees(jd)) * kDeg;
+            const double sub_lat = sun_eq.dec_deg * kDeg;
+            const glm::dvec3 sun_ecef(std::cos(sub_lat) * std::cos(sub_lon),
+                                      std::cos(sub_lat) * std::sin(sub_lon),
+                                      std::sin(sub_lat));
+            const glm::dvec3 sun_world =
+                glm::normalize(site.ecef_to_world * sun_ecef);
+
+            for (const auto& ob : obs) {
+                // Where that observer sits in THIS site's world frame.
+                const glm::dvec3 p_world =
+                    site.EcefToWorld(GeodeticToEcef(ob[0] * kDeg, ob[1] * kDeg));
+                const glm::dvec3 up = site.WorldUp(p_world);
+                const double elev_dot =
+                    std::asin(std::clamp(glm::dot(sun_world, up), -1.0, 1.0)) / kDeg;
+                const double elev_astro =
+                    pt::astro::equatorialToHorizon(sun_eq, ob[0], ob[1], jd).altitude_deg;
+                const double err = std::abs(elev_dot - elev_astro);
+                worst = std::max(worst, err);
+                // WorldUp is the GEOCENTRIC up while equatorialToHorizon
+                // takes a geodetic latitude, and the two normals differ by
+                // up to 11.5 arcmin (0.192 deg) at mid-latitudes. That is
+                // the whole budget here -- it is smaller than the sun's own
+                // 16 arcmin angular radius, so it cannot move the disc off
+                // a pixel it belongs on -- and nothing else is permitted.
+                CHECK(err < 0.20);
+                ++checked;
+            }
+        }
+    }
+    CHECK(checked == 4 * 6 * 7);
+    // NOT VACUOUS. If the sun were site-fixed the elevation would be the
+    // same at every observer, so the spread across observers has to be
+    // large. Measured at one site and date.
+    const PlanetSite ev = PlanetSite::FromGeodetic(27.9881 * kDeg, 86.9250 * kDeg);
+    const double jd = 2461218.25;
+    const auto eq = pt::astro::sunPosition(jd);
+    const double slon = (eq.ra_deg - pt::astro::gmstDegrees(jd)) * kDeg;
+    const double slat = eq.dec_deg * kDeg;
+    const glm::dvec3 sw = glm::normalize(ev.ecef_to_world *
+        glm::dvec3(std::cos(slat) * std::cos(slon),
+                   std::cos(slat) * std::sin(slon), std::sin(slat)));
+    double lo = 1e9, hi = -1e9;
+    for (const auto& ob : obs) {
+        const glm::dvec3 up =
+            ev.WorldUp(ev.EcefToWorld(GeodeticToEcef(ob[0] * kDeg, ob[1] * kDeg)));
+        const double e = std::asin(std::clamp(glm::dot(sw, up), -1.0, 1.0)) / kDeg;
+        lo = std::min(lo, e); hi = std::max(hi, e);
+    }
+    // Somewhere in that set it is day and somewhere it is night, which is
+    // the entire point: a terminator exists and can be flown to.
+    CHECK(hi > 10.0);
+    CHECK(lo < -10.0);
+    MESSAGE("elevation spread across observers: " << lo << " .. " << hi
+            << " deg, worst astro disagreement " << worst << " deg");
+}
+
+// --- Coming back from orbit (diagnostic) -----------------------------------
+//
+// "When I go outside the planet and come back there is no more terrain as I
+// come closer, it gets black."
+//
+// The from-orbit cull (#326) is a per-VIEW gate: above the altitude where a
+// chunk's height over the backstop shifts the limb by less than a few pixels,
+// EVERY chunk is dropped and the analytic backstop stands in for the whole
+// body. "the from-orbit cull drops every chunk from orbit" already pins that
+// as intended.
+//
+// What nothing measured is the SHAPE of the demand on the way back down.
+// This case prints it. It is a measurement, not yet a claim about what the
+// right shape would be.
+TEST_CASE("descending from orbit: what the selector asks for, and when" *
+          doctest::skip(true)) {
+    ElevationField field = MakeProceduralField();
+    const PlanetSite site = PlanetSite::FromGeodetic(0.0, 0.0);
+    const double R = kBackstopRadius;
+
+    MESSAGE("altitude_m   desired_leaves   deepest_level");
+    for (double alt : {3000000.0, 2000000.0, 1500000.0, 1200000.0, 1000000.0,
+                       800000.0, 600000.0, 400000.0, 200000.0, 100000.0,
+                       60000.0, 20000.0, 4000.0, 1000.0, 100.0}) {
+        // Straight up from the site, which is where world +Y points.
+        const glm::dvec3 cam(0.0, alt, 0.0);
+        TerrainQuadtree tree;
+        LodParams p;
+        p.cone_spread       = CullFixtureCone();
+        p.camera_w          = cam;
+        p.planet_center_w   = site.CenterWorld();
+        p.backstop_radius_m = R;
+        p.max_level         = 9;
+        p.chunk_budget      = 4096;
+        Converge(tree, field, site, p);
+        int deepest = -1;
+        for (const ChunkKey& k : tree.Desired()) {
+            deepest = std::max(deepest, int(k.level));
+        }
+        MESSAGE(alt << "   " << tree.Desired().size() << "   " << deepest);
+    }
+}
+
+// --- A coarse cover survives an arbitrarily deep frontier ------------------
+//
+// Descending from orbit crosses the from-orbit cull's release in ONE step:
+// the case above measures 21 leaves at level 1 above it and ~2000 at level 8
+// below it. The obvious worry is that the coarse chunks still in the arena
+// cannot be PUBLISHED under a frontier seven levels finer, because the index
+// arena only has stitch variants for a one-level step and TerrainResidency
+// refuses a substitution that would open a two-level one.
+//
+// They can, and this pins it. The cover walk partitions each node's area
+// among its children and stops at the coarsest resident ancestor, so a
+// uniform coarse cover is published whole -- the two-level rule constrains
+// NEIGHBOURS inside the published set, and a uniform set has no such step in
+// it at all. So a descent from orbit is covered by construction for as long
+// as the coarse chunks stay resident, and anything that goes dark there went
+// dark because they did NOT stay resident, not because they could not be
+// drawn.
+//
+// Both sets are COMPLETE partitions of the sphere. The first version of this
+// case got that wrong -- it compared a full coarse cover against a deep set
+// tiling only a corner of each face, so "incomplete" was a property of the
+// fixture rather than of the streamer, and it read as a confirmed bug.
+TEST_CASE("a uniform coarse cover publishes whole under any deeper frontier") {
+    auto full_tiling = [](int level) {
+        std::set<ChunkKey> s;
+        const std::uint32_t n = 1u << level;
+        for (int f = 0; f < 6; ++f) {
+            for (std::uint32_t i = 0; i < n; ++i) {
+                for (std::uint32_t j = 0; j < n; ++j) {
+                    s.insert(ChunkKey{static_cast<std::uint8_t>(f),
+                                      static_cast<std::uint8_t>(level), i, j});
+                }
+            }
+        }
+        return s;
+    };
+    const std::set<ChunkKey> coarse = full_tiling(1);
+    REQUIRE(coarse.size() == 24u);
+    for (int deep_level = 2; deep_level <= 6; ++deep_level) {
+        CAPTURE(deep_level);
+        const auto c = ComputeResidencyCover(full_tiling(deep_level), coarse);
+        // The whole coarse set is published, nothing is refused, and every
+        // desired leaf's area is covered -- at a gap of one level and at a
+        // gap of five.
+        CHECK(c.published == coarse);
+        CHECK(c.refused == 0u);
+        CHECK(c.substitutions == coarse.size());
+        CHECK(c.complete);
+        // And nothing resident is retirable: every coarse chunk is earning
+        // its slot by standing in for ground its children cannot cover yet.
+        CHECK(c.retirable.empty());
+    }
 }
