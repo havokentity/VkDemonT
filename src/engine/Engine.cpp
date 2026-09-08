@@ -2974,6 +2974,32 @@ bool Engine::Init() {
         // paint over the water.
         seed_cvar("pt_smoke_skip_prim_seed", "1");
         seed_cvar("pt_smoke_skip_csg_seed", "1");
+        // STAND THE PLANET DOWN. This is the half of "which scene" that is
+        // easiest to forget, because it is invisible on a fresh clone: the
+        // planet cvars are all CVAR_ARCHIVE, so an install that has ever
+        // run `earth` carries r_planet_terrain / _ground / _ocean /
+        // _spherical_frame at 1, plus the sky and air that go with them.
+        // Seeding the city's geometry without also turning those off
+        // leaves the globe rendering through the bay -- the symptom
+        // reported from a real demont.cfg was simply "it's all mountains"
+        // -- and r_planet_stand_eye then teleports the camera onto the
+        // terrain, discarding the framing this scene just set.
+        //
+        // So state the WHOLE scene, the way the earth seed does, rather
+        // than only the half that differs from the registered defaults. A
+        // seed that is a partial description is a seed that works exactly
+        // once, on a machine that has never run anything else.
+        seed_cvar("r_planet_terrain", "0");
+        seed_cvar("r_planet_spherical_frame", "0");
+        seed_cvar("r_planet_ground", "0");
+        seed_cvar("r_planet_ocean", "0");
+        seed_cvar("r_planet_stand_eye", "-1");   // >= 0 snaps to the terrain
+        // Aerial perspective and the cloud deck are both planetary here --
+        // the volumetric march wants r_planet_radius and the cloud layer
+        // resolves against the planet shell. Off deliberately, and worth
+        // revisiting as a look pass rather than inherited by accident.
+        seed_cvar("r_volumetric", "0");
+        seed_cvar("r_clouds", "0");
         // Golden hour, and a sky that does not need a planet. hosek is the
         // Hosek-Wilkie analytic dome -- physically-based turbidity and a
         // real low-sun colour ramp, which is the whole look here. `physical`
