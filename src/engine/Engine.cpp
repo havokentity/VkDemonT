@@ -2318,6 +2318,18 @@ namespace cvar {
             "grey ellipsoid. The city renders its final geometry on frame "
             "one and is what the path tracer actually looks good doing.",
             CVAR_ARCHIVE);
+    PT_CVAR(r_scene_last_seeded,     "",
+            "Bookkeeping, not a knob: the r_scene_default value whose seed "
+            "last wrote this install's camera / sun / sky state, recorded "
+            "so a later run can tell whether the archived demont.cfg "
+            "belongs to the scene it is about to open. When it does not, "
+            "the seed re-frames instead of deferring to it -- without "
+            "this, moving the default scene leaves every existing install "
+            "pointing wherever the OLD scene left the camera while a fresh "
+            "clone looks correct. Empty means the archive predates this "
+            "bookkeeping, which is treated as a scene change. Setting it "
+            "by hand only changes whether the next launch re-frames.",
+            CVAR_ARCHIVE);
     // --- END planetary P4 terrain cvars (#258) ----------------------------
     PT_CVAR(r_moon_size,             "1.0",      "Moon angular-size multiplier. 1.0 = our default 0.55deg half-angle (already 2x the real 0.27deg, for visibility at typical 60-FOV 1080p). 5+ = dramatic 'big moon' shots; 0.5 = real lunar size (very small). Astronomical distance variation (perigee/apogee) is also applied on top -- supermoons render ~14% bigger than micro-moons.", CVAR_ARCHIVE);
     PT_CVAR(r_sun_size,              "1.0",      "Sun angular-size multiplier. 1.0 = real ~0.55deg half-angle. Astronomical Earth-Sun distance (perihelion/aphelion) modulates this ~3.4% across the year. Bump for cinematic shots.", CVAR_ARCHIVE);
@@ -2670,7 +2682,14 @@ bool Engine::Init() {
     if (skip_cfg_load) {
         LOG_INFO("engine: --no-cfg given -- skipping demont.cfg + autoexec.cfg + favorites.cfg + console_history.txt + camera_bookmarks.cfg load");
     } else {
+        // Everything demont.cfg assigns is stamped CVarSource::Archive so
+        // the scene seed below can tell restored state from an opinion
+        // about THIS run. autoexec.cfg is deliberately outside the scope:
+        // a user's startup script IS an opinion, and outranks the seed the
+        // same way a fixture does.
+        pt::console::Console::Get().SetAssignSource(pt::console::CVarSource::Archive);
         exec_if_exists("demont.cfg");      // archived cvars from last quit
+        pt::console::Console::Get().SetAssignSource(pt::console::CVarSource::Session);
         exec_if_exists("autoexec.cfg");    // user-supplied startup script (overrides above)
         // Favourites are a parallel persistence file -- NOT a console
         // script. Loaded directly into Console::favorites_ via
@@ -2911,9 +2930,38 @@ bool Engine::Init() {
     // this seed. Measuring the "feature deleted" signal for the golden
     // tolerances is what surfaced it -- terrain-off came out pixel-identical
     // to terrain-on, because terrain had never actually been turned off.
-    auto seed_cvar = [&C](const char* name, const char* value) {
+    //
+    // ... and `assigned` alone is not enough either, because demont.cfg
+    // sets it too. An archived value belongs to whichever scene was
+    // default when the user last quit, so once the default MOVES, every
+    // existing install carries a camera aimed at the old scene and the
+    // seed politely declines to fix it -- a fresh clone frames the new
+    // scene correctly and every machine that has run the engine before
+    // opens on empty water. That is why CVar::source exists: a value the
+    // ARCHIVE set, for a scene that is no longer the one being seeded, is
+    // not an opinion about this scene and the seed overrides it. A value
+    // this run assigned -- fixture, autoexec, --extra, console -- still
+    // wins, unchanged.
+    const std::string archived_scene = [&C] {
+        if (auto* v = C.FindCVar("r_scene_last_seeded")) return v->value;
+        return std::string{};
+    }();
+    const bool scene_changed = (archived_scene != scene_default);
+    if (scene_changed && !archived_scene.empty()) {
+        LOG_INFO("engine: default scene moved '{}' -> '{}'; archived camera / "
+                 "sky state from the old scene will be re-seeded",
+                 archived_scene, scene_default);
+    }
+    auto seed_cvar = [&C, scene_changed](const char* name, const char* value) {
         if (auto* v = C.FindCVar(name)) {
-            if (!v->assigned) { v->value = value; return true; }
+            const bool stale_archive =
+                (v->source == pt::console::CVarSource::Archive) && scene_changed;
+            if (!v->assigned || stale_archive) {
+                v->value    = value;
+                v->assigned = true;
+                v->source   = pt::console::CVarSource::Session;
+                return true;
+            }
         }
         return false;
     };
@@ -3035,6 +3083,16 @@ bool Engine::Init() {
     } else if (seed_none) {
         seed_cvar("pt_smoke_skip_prim_seed", "1");
         seed_cvar("pt_smoke_skip_csg_seed", "1");
+    }
+    // Record which scene this install's archived state now describes, so
+    // the next launch can tell whether demont.cfg still applies. Written
+    // directly rather than through seed_cvar: this is bookkeeping ABOUT
+    // the seed, so it must be written even when the seed itself deferred
+    // to a fixture, and it must not consult its own staleness test.
+    if (auto* v = C.FindCVar("r_scene_last_seeded")) {
+        v->value    = scene_default;
+        v->assigned = true;
+        v->source   = pt::console::CVarSource::Session;
     }
     // --- end Planetary P4 -------------------------------------------------
     bool skip_csg_seed = false;

@@ -47,6 +47,13 @@ enum CVarValueFlag : std::uint32_t {
     CVAR_VALUE_LINUX = 1u << 2,
 };
 
+// Provenance of a cvar's current value. See CVar::source.
+enum class CVarSource : std::uint8_t {
+    None = 0,     // still the registered default -- nobody has assigned it
+    Archive,      // restored from demont.cfg at startup, untouched since
+    Session,      // assigned this run: console, autoexec, CLI, or fixture
+};
+
 struct CVar {
     std::string name;
     std::string value;
@@ -105,6 +112,25 @@ struct CVar {
     // by the seed. It took a measurement that came out suspiciously
     // identical to notice.
     bool assigned = false;
+
+    // WHERE that assignment came from.
+    //
+    // `assigned` alone conflates two very different things: an opinion
+    // expressed about THIS run (a console line, autoexec, a --<cvar>=
+    // override, a golden fixture) and state restored from the last quit's
+    // demont.cfg. The scene seed has to treat them differently. A fixture
+    // that placed its own camera must keep it -- that is exactly what
+    // `assigned` was added for. But an ARCHIVED camera belongs to whichever
+    // scene was default when it was written, and it silently wins over the
+    // seed of a scene it has never seen: change the default scene and every
+    // existing install opens the new one pointing wherever the old one left
+    // off, which is generally at nothing at all. A fresh clone looks right
+    // and every machine that has ever run the engine looks broken, which is
+    // the worst version of this bug to try to diagnose from a report.
+    //
+    // Archive means "restored from demont.cfg and untouched since".
+    // Session means something this run assigned it, and always wins.
+    CVarSource source = CVarSource::None;
 
     // Coerced accessors.  All values are stored as strings; these parse on
     // demand and gracefully return defaults on parse failure.
@@ -177,6 +203,15 @@ public:
 
     // Force a CVar value past READONLY (engine use only).
     bool SetCVarOverride(std::string_view name, std::string_view value);
+
+    // Provenance stamped on every cvar assignment from here on. The engine
+    // wraps its demont.cfg exec in CVarSource::Archive and drops back to
+    // Session immediately after, so `source` records which side of that
+    // line a value came from. Defaults to Session, so any caller that does
+    // not care -- every one but the cfg loader -- gets the right answer
+    // without opting in. See CVar::source.
+    void        SetAssignSource(CVarSource s) noexcept { assign_source_ = s; }
+    CVarSource  AssignSource() const noexcept { return assign_source_; }
 
     // Cross-cvar dependency warnings (issue #161) are suppressed when
     // a cfg replay is in progress -- the dependency cvar might be set
@@ -323,6 +358,10 @@ private:
 
     std::map<std::string, CVar, std::less<>>    cvars_;
     std::map<std::string, Command, std::less<>> commands_;
+
+    // Stamped onto CVar::source by every assignment path. Session by
+    // default so only the demont.cfg loader has to opt in.
+    CVarSource assign_source_ = CVarSource::Session;
 
     struct PendingExec {
         std::string line;

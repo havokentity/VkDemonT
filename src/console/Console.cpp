@@ -205,6 +205,7 @@ bool Console::SetCVarOverride(std::string_view name, std::string_view value) {
     if (v == nullptr) return false;
     v->value.assign(value);
     v->assigned = true;
+    v->source   = assign_source_;
     if (v->on_change) v->on_change(*v);
     return true;
 }
@@ -698,6 +699,7 @@ ExecuteResult Console::Execute(std::string_view line) {
                 RecordTxnPreValue(v->name, old_value);
                 v->value = new_value;
                 v->assigned = true;
+                v->source   = assign_source_;
                 // Don't fire on_change for an inactive value -- the
                 // engine handler would just try to switch backends
                 // we can't actually use.
@@ -721,6 +723,7 @@ ExecuteResult Console::Execute(std::string_view line) {
         RecordTxnPreValue(v->name, old_value);
         v->value = std::move(new_value);
         v->assigned = true;
+        v->source   = assign_source_;
         if (v->on_change) v->on_change(*v);
 
         // Track as last-executed line for fav-save (cvar mutations are
